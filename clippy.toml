@@ -1,0 +1,19 @@
+allow-print-in-tests = true
+allow-unwrap-in-tests = true
+allow-dbg-in-tests = true
+allow-expect-in-tests = true
+
+too-many-arguments-threshold = 5
+too-many-lines-threshold = 80
+trivial-copy-size-limit = 128
+enum-variant-size-threshold = 200
+
+# Project-specific doc identifiers.
+doc-valid-idents = [
+  "JSON",
+  "JSONL",
+  "TOML",
+  "UTF-8",
+  "ASCII",
+  "..",
+]
