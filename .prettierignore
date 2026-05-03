@@ -1,0 +1,5 @@
+# Tool-managed by `pgc spec` — prettier could reflow status tables in
+# ways the parser does not tolerate.
+**/*.ladder.md
+
+target/

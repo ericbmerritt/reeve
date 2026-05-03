@@ -1,0 +1,18 @@
+[package]
+name = "reeve-runtime"
+description = "Reeve runtime: actix supervisor tree, agent actors, maildir watcher, audit log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+reeve-types = { workspace = true }
+reeve-transport = { workspace = true }
+reeve-adapter = { workspace = true }
