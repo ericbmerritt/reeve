@@ -1,0 +1,16 @@
+[package]
+name = "reeve-transport"
+description = "Reeve transport: canonical JSON, signed envelopes, maildir state machine, ledgers"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+reeve-types = { workspace = true }
