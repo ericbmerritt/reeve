@@ -20,6 +20,45 @@ multiple-versions = "deny"
 wildcards = "deny"
 highlight = "all"
 
+# The Linux-only `secret-service` crate (used by reeve-runtime keychain
+# integration on `cfg(all(unix, not(target_os = "macos")))`) pulls in the
+# `zbus` D-Bus stack. zbus's proc-macro chain depends on a newer
+# `toml`/`winnow` than our direct `toml` dependency, and zbus's
+# `uds_windows` transitive pulls `tempfile` with default features, which
+# re-enables `getrandom` and the `wasip2`/`wasip3` `wit-bindgen` chain.
+#
+# These duplicates are not reachable from any code path we control: they
+# are mutual-exclusion mismatches between independent transitive trees.
+# Each entry below is a known-tolerated duplicate, scoped narrowly. If a
+# duplicate falls out of the lock (e.g., zbus updates to align with the
+# `toml` ecosystem), the corresponding entry should be removed.
+skip = [
+  # tempfile (default-features re-enabled by zbus -> uds_windows) ->
+  # wasip2/wasip3 -> getrandom 0.4. Our direct rand_core takes
+  # getrandom 0.2.
+  { name = "getrandom", version = "=0.2.17" },
+  { name = "getrandom", version = "=0.4.2" },
+  # zbus_macros / zvariant_derive -> proc-macro-crate -> toml_edit 0.25.
+  # Our `toml` crate uses 0.22.
+  { name = "toml_datetime", version = "=0.6.11" },
+  { name = "toml_datetime", version = "=1.1.1+spec-1.1.0" },
+  { name = "toml_edit", version = "=0.22.27" },
+  { name = "toml_edit", version = "=0.25.11+spec-1.1.0" },
+  # Each toml_edit version vendors its own pinned winnow: toml_edit 0.22
+  # (used by our direct `toml` dependency) pins winnow 0.7, while
+  # toml_edit 0.25 (used by zbus's proc-macro-crate transitive dep) pins
+  # winnow 1.0. Sharing a single winnow version requires coordinated
+  # toml_edit upgrades we don't control.
+  { name = "winnow", version = "=0.7.15" },
+  { name = "winnow", version = "=1.0.2" },
+  # wasip2 (=0.57) and wasip3 (=0.51) are separately-generated wit-target
+  # crates, each pinning the wit-bindgen version that was current when they
+  # were emitted. Sharing a single wit-bindgen version requires coordinated
+  # regeneration of both crates, which is outside our control.
+  { name = "wit-bindgen", version = "=0.51.0" },
+  { name = "wit-bindgen", version = "=0.57.1" },
+]
+
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"

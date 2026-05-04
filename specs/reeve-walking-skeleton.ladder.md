@@ -2,7 +2,7 @@
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| ✅ complete     | 2026-05-05 | 2026-05-05 |
 
 Tags: bootstrap
 
@@ -28,7 +28,7 @@ Cargo workspace and crate split that everything else builds on. Six crates: `ree
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| 🟡 in-progress  | 2026-05-05 |            |
 
 Tags: security, identity
 
