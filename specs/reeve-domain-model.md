@@ -92,7 +92,12 @@ trade-off workable.
 
 ### Persona
 
-A persona is the definition of a role.
+A persona is both a defined role and a live actor (see `reeve-persona-actor.md`
+for the actor model). As a role, the persona declares the system prompt and
+resolution rules that materialize into agents at spawn. As an actor, the persona
+has its own address (`persona:<name>`) and dispatcher, accepting proposals from
+running agents — memory promotion, tuning promotion, skill refinement — that
+persona-curator agents evaluate at forge tier.
 
 Fields:
 
@@ -108,6 +113,8 @@ Fields:
 - skill set (list of skill names and pinned versions)
 - memory scope subscriptions (which persona memory store this persona reads and
   writes)
+- subsystem defaults (compression / eviction / promotion / cognition policy
+  thresholds for instances spawned from this persona)
 
 Lifecycle:
 
@@ -118,8 +125,23 @@ Lifecycle:
   versions
 - never deleted: prior versions are preserved for audit and rollback
 
-A persona is not an agent. A persona has zero or more running agents at any
-time.
+Personas are versioned on disk per the layout in `reeve-disk-substrate.md`: each
+persona is a directory of numbered version files with a `current` pointer and a
+`versions.toml` manifest. Rollback is repointing the `current` file.
+
+**Downward materialization.** When a persona spawns an agent, the persona's
+current state materializes into the new agent: defaults, memory selection rules,
+skill set. From that point forward the agent reads from its own state, not the
+persona's. Subsequent persona changes do not propagate to running agents
+automatically.
+
+**Upward proposals.** Agents construct signed messages addressed to
+`persona:<name>` proposing new memory, tuning, skills, or registered failures.
+The persona's dispatcher routes them to its persona-curator agent for
+evaluation. Direct writes from non-curator agents are rejected. The persona's
+state advances only when a persona-curator agent commits a write at forge tier.
+
+A persona has zero or more running agents at any time.
 
 ### Skill
 
@@ -151,88 +173,69 @@ authority.
 
 ### Memory Entry
 
-A memory entry is a single durable fact stored in a memory scope.
+A memory entry is a single durable item in a memory scope. The full memory model
+— including the per-agent tiers (working context, short-term, long-term) and the
+composer satellite that retrieves across scopes — is in
+`reeve-memory-composer.md` and `reeve-actor-interior.md` § Memory Tiers Within
+the Agent. This section defines the persistent entry artifact at the cross-agent
+scopes (persona and project).
 
 Fields:
 
 - entry ID
-- scope (project, persona name, operator name)
+- scope (project, persona name)
 - version (monotonic per entry)
 - content (markdown)
-- author (operator identity, agent identity, or `forge`)
-- core flag (true if loaded into the agent's system prompt at spawn for personas
-  subscribed to this scope; false if reachable only via query)
+- author (operator identity, agent identity, or persona-curator agent)
+- structural markers (load-bearing, tentative, resolved, deprecated)
 - created_at, last_referenced_at
-- core load count (incremented when loaded into an agent at spawn)
-- query reference count (incremented when retrieved by an agent's `memory.read`
-  or returned in `memory.search` results)
+- usage counters: retrieval count, integration count, exposure count, reference
+  count
 
 Scopes:
 
 - **Project memory** — lives at `<repo>/.reeve/memory/`. Committable and
   reviewable as code.
 - **Persona memory** — lives at `~/.local/share/reeve/personas/<name>/memory/`.
-- **Operator memory** — lives at
-  `~/.local/share/reeve/operators/<name>/memory/`.
 
-#### Presentation
+A persona's running agents see persona memory as one of the four stores the
+composer queries (alongside the agent's short-term, the agent's long-term, and
+project memory). Promotion paths between tiers are governed by usage counters,
+weighted to favor integration / exposure / reference signals over raw retrieval
+(see `reeve-memory-composer.md` § Usage Counters). Items that pass the
+composer's filter but never pass the curator's do not advance.
 
-Memory is presented to agents in two layers.
-
-**Cold-start core.** Entries marked `core` in subscribed scopes are loaded into
-the agent's system prompt at spawn. The cold-start core is what makes fresh
-agents smart on arrival; it is intended to be small and per-persona-relevant,
-not the whole store. Core membership can be set by any agent with `write_memory`
-capability — the same permissive model as memory writes generally — and the
-forge team is the typical promoter, acting on observed reference patterns. The
-operator monitors core changes in the panopticon's review surface and reverts
-any that aren't desired.
-
-**Queryable store.** The full set of active entries in subscribed scopes is
-reachable through memory tools — `memory.search` and `memory.read` at minimum —
-that the runtime exposes when the persona's capability profile permits memory
-access. Agents pull from the store on demand for context that is not in their
-cold-start core.
-
-#### Reference counting
-
-The two paths produce different signals. Cold-start core load counts are uniform
-across spawns of personas subscribed to the entry's scope and carry little
-curation signal. Query reference counts are per-agent per-entry and are the
-empirical signal the forge team uses for curation: frequently-queried entries
-are high-value; loaded-but-never-queried entries are dead weight.
+Project and persona memory entries are versioned on disk per the layout in
+`reeve-disk-substrate.md`: each entry is a directory of numbered version files
+with a `current` pointer; rollback is repointing.
 
 #### Update propagation
 
-Memory writes (revisions, new entries) go to the store. A running agent's view
-of memory comes from two places: its cold-start core, loaded at spawn and frozen
-for the agent's lifetime, and its queries, resolved against the current store at
-the moment of query. An agent that queries an entry after a revision sees the
-revised content. An agent whose cold-start core contains an entry that is later
-revised continues to see the spawn-time version until it queries the store, or
-until it exits and a new agent of its persona spawns. There is no in-flight push
-of core updates into running agents.
-
-This means operators who require immediate propagation of a memory change rely
-on the short agent lifecycle: the next spawn picks up the new core. For
-long-lived leads, this is a delay; for short-lived subordinates, it is
-effectively immediate.
+Memory writes (revisions, new entries) take effect immediately for queries.
+Running agents that query the entry after a revision see the revised content.
+Items already integrated into a running agent's working context (or
+short-term/long-term memory) continue to reflect the integration-time state
+until the curator next refreshes them through a query. The bus tape is the
+source of truth for the events that drove integration; the integrated state is a
+derivative.
 
 #### Write semantics
 
-Memory writes by any agent with `write_memory` capability take effect
-immediately. Each write produces a new version of the affected entry; prior
-versions are retained for rollback. The panopticon surfaces recent writes under
-a review view; the operator may revert any write to any prior version. There is
-no proposed-then-approved workflow.
+Project memory writes by any agent with `write_memory` capability take effect
+immediately. Each write produces a new version; prior versions are retained for
+rollback. The panopticon surfaces recent writes under a review view; the
+operator may revert any write to any prior version.
 
-The trade-off is permissive by default. Writes accumulate without ceremony,
-queries return the latest version, and the cold-start core picks up new content
-on next spawn. Bad writes can pollute future agent spawns until the operator
-reverts them. The supervised observability of the panopticon plus versioned
-rollback are what make this trade-off workable; the tool optimizes for low
-friction in memory accumulation with reactive quality control rather than gated
-approval.
+Persona memory writes are deliberative. An agent does not write directly to its
+persona; it sends a `propose-memory` message to `persona:<name>`. The persona's
+dispatcher routes the proposal to a persona-curator agent, which evaluates and
+either commits a write at forge tier, defers, or rejects. See
+`reeve-persona-actor.md`.
+
+The trade-off is permissive by default for project memory and within-agent
+tiers, deliberative for persona memory. Bad writes can pollute future spawns
+until reverted; the supervised observability of the panopticon plus versioned
+rollback are what make the trade-off workable.
 
 Operators who want a specific scope to be operator-only configure it by denying
 `write_memory` to all personas that subscribe to it; agents can still read, but
@@ -240,10 +243,10 @@ only the operator can write.
 
 Lifecycle:
 
-- active → reachable via the queryable store; loaded into agent cold-start core
-  at spawn if marked `core`
+- active → reachable via composer queries; promoted across tiers based on usage
+  counters
 - revised → new version replaces prior; prior versions retained for rollback
-- retired → no longer loaded or returned in queries; retained for audit
+- retired → no longer surfaced in queries; retained for audit
 
 ### Team
 
@@ -389,10 +392,23 @@ Fields:
 The disposition policy version is recorded in every authority decision so that
 historical decisions are reconstructable.
 
-### Model
+### Model Resources
 
-A model is a logical AI model with a known set of capabilities. The model is
-what a persona thinks it wants; how that model is reached is a separate concern.
+The runtime uses three distinct model resources, each with very different
+operational properties (see `reeve-actor-interior.md` § Model Resources for the
+operational rationale). Per-agent cost is dominated by cognition; embedding and
+small-generative contribute small bounded amounts.
+
+#### Cognition
+
+The main LLM. Per-agent invocation, demand-driven by the curator. Expensive,
+slow, episodic. Provider-portable through the adapter layer. Not addressable
+from outside an agent — external messages route to the curator; the curator
+decides if and when to invoke cognition.
+
+A cognition model is a logical AI model with a known set of capabilities. It is
+what a persona thinks it wants; how that model is reached is a separate concern
+(Route and Adapter, below).
 
 Fields:
 
@@ -404,7 +420,47 @@ Fields:
 - knowledge cutoff
 - deprecated flag
 
-A model is not callable on its own. Reaching it requires a route and an adapter.
+A cognition model is not callable on its own. Reaching it requires a route and
+an adapter.
+
+#### Embedding Model
+
+A shared runtime resource used by the memory composer for retrieval and by the
+curator for deduplication. Not generative — converts text to vectors. Fast,
+small, runs locally by default. One service serves all agents; per-persona
+embedding selection is configurable.
+
+Fields:
+
+- name
+- producer
+- vector dimension
+- declared input languages or domains
+- deprecated flag
+
+The embedding model does not follow instructions and is not vulnerable to prompt
+injection in the generative sense. Retrieval poisoning and semantic collision
+are addressed at the curator's integration layer, not at the embedding model.
+
+#### Small Generative Model
+
+A shared runtime service for the curator's fallback work: drift detection,
+ambiguous cognition policy classification, consolidation passes, natural-
+language consolidation compression. Called rarely. Can run locally or hosted.
+Batches requests across all agents; rate-limited per agent. If unavailable, the
+curator degrades gracefully — drift detection pauses, ambiguous decisions take
+per-message-class defaults, consolidation pauses; the mechanical core continues
+unaffected.
+
+Fields:
+
+- name
+- producer
+- declared capabilities: structured output, instruction following
+- deprecated flag
+
+Output is structured (typed responses with confidence). Never applied as
+authoritative state change — the curator disposes.
 
 ### Route
 
@@ -511,6 +567,23 @@ under a tree. Restart-on-failure is provided by the actor framework; a panicking
 actor is restarted by its supervisor without quiescing the runtime, and peer
 actors are unaffected by panics in their own isolated state.
 
+Inside the agent boundary, the supervised actor decomposes into three tiers plus
+contributing satellites — see `reeve-actor-interior.md` for the full model:
+
+- **Brainstem** — mandatory infrastructure that runs continuously: cost meter,
+  status writer, bus tape writer.
+- **Curator** — the agent's locus of agency. Maintains a working context,
+  integrates inputs, decides when to invoke cognition. Mostly mechanical
+  bookkeeping with a small-model fallback for residual cases.
+- **Cognition** — a stateless function the curator invokes when policy says
+  deliberation is warranted. Not addressable from outside the agent.
+- **Satellites** — contributing components that observe or feed the curator (the
+  memory composer is the first).
+
+Inbound messages addressed to the agent route through the agent's dispatcher
+(see Dispatcher, below) and reach the curator by default; messages with explicit
+`target: <subsystem>` reach that subsystem after authority checks.
+
 Identity:
 
 - agent name (assigned at spawn, unique within the running runtime)
@@ -524,17 +597,25 @@ agent unless failover overrides it):
 - skill names and versions
 - capability profile name and version
 - classifier policy name and version
-- memory generation: a snapshot identifier of which memory entries were loaded
-  into the cold-start core
-- resolved model, route, and adapter ID (selected at spawn by model resolution;
-  updated on failover)
+- memory generation: a snapshot identifier of which memory entries materialized
+  from persona at spawn into the agent's initial working context
+- subsystem defaults snapshot (compression / eviction / promotion / cognition
+  policy thresholds, materialized from the persona)
+- resolved cognition model, route, and adapter ID (selected at spawn by model
+  resolution; updated on failover)
 
 Per-agent runtime state:
 
-- conversation thread (durable, append-only)
+- working context (typed structured representation cognition reads; see
+  `reeve-actor-interior.md` § The Working Context)
+- short-term and long-term memory tiers (per-agent indexes derived from the bus
+  tape; see `reeve-memory-composer.md` § The Stores)
+- bus tape (durable, append-only structured event stream — the agent's internal
+  observation layer; see Bus Tape entity below)
+- conversation thread (a filtered, operator-readable view derived from the bus
+  tape)
 - current task scope (declared, possibly updated during the session)
 - cost meter
-- recent activity buffer
 - inbox state (file watcher, replay/delivery ledger entries)
 - status (idle, working, awaiting input, error, exiting)
 
@@ -588,8 +669,9 @@ that any persona in the roster may be spawned by any other member with
 
 ### Conversation Thread
 
-A conversation thread is the durable, ordered record of messages an agent has
-sent and received.
+A conversation thread is the operator-readable, filtered view of an agent's
+activity — derived from the agent's bus tape and emphasizing message-shaped
+exchanges and key cognition events.
 
 Fields:
 
@@ -601,21 +683,26 @@ Entry types:
 - inbound message (from a verified sender, with trust tier and disposition
   recorded)
 - outbound message (to another agent or operator)
-- model call (with prompt, response, token counts)
+- cognition invocation (with snapshot reference, prompt, response, token counts)
 - tool invocation (with arguments and output)
 - authority decision (with disposition)
-- system event (compaction, memory load, lifecycle change)
+- system event (memory load, lifecycle change, eviction, promotion,
+  consolidation)
 
 Conversation threads are durable. They are stored in the agent's `log/`
-directory and are append-only during the agent's lifetime.
+directory and are append-only during the agent's lifetime. The bus tape is the
+source of truth for events; the conversation thread is a derived, filtered view
+that omits low-level subsystem chatter (curator integration steps, dedup checks,
+composer candidate offers that did not result in integration).
 
-Compaction replaces the agent's working context with a summary of prior thread
-entries when a context-size threshold is reached. The primary trigger is
-size-based (token budget on the working context); a secondary duration-based
-trigger is available but rarely fires, since most agents are short-lived.
-Compaction does not rewrite the durable thread on disk — the full thread remains
-append-only and audit-true. The compaction event itself is recorded in the
-thread as a system event with a reference to the generated summary.
+Compression is continuous and structural on the curator's hot path: when a tool
+call resolves an open question, the question and the discussion that produced it
+collapse into a structured pointer item in the working context. The conversation
+thread on disk remains append-only — compression is a working-context concern,
+not a thread-rewriting concern. Where natural-language consolidation produces a
+compressed representation, that event is recorded in the thread as a system
+event with a reference to the compressed item; the original entries are not
+rewritten.
 
 ### Task Scope
 
@@ -793,12 +880,49 @@ Cost meters are updated synchronously after each model API call returns. When a
 meter crosses its ceiling, the runtime refuses subsequent model calls for the
 affected scope and surfaces the event to the operator.
 
+### Bus Tape
+
+The bus tape is the agent's internal, structured event stream. Every event of
+consequence inside the agent boundary is taped — every cognition invocation,
+every small-model fallback invocation, every embedding call, every curator
+integration, every dispatcher decision, every eviction, every compression, every
+promotion, every authority rejection. See `reeve-actor-interior.md` § The Bus
+Tape for the full model.
+
+Fields per entry:
+
+- timestamp (UUIDv7-derived)
+- producer subsystem (curator, brainstem, satellite name, dispatcher)
+- event type
+- structured payload
+- version qualifiers (model provider and version, prompt adapter version,
+  embedding model version, scoring policy version, threshold values in effect,
+  curator code version)
+
+The tape is durable, append-only, stored in the agent's `log/` directory.
+Internal events use Tokio channels for fast in-process delivery; the bus tape is
+the durable observation tap. The panopticon reads it. Subsystems that need to
+react to other subsystems' activity subscribe to it.
+
+The agent's decision history is causally reconstructable from the tape. Given
+taped snapshots, policy versions, model invocations, structured outputs, and
+integration events, an operator can inspect why the agent reached a state or
+invoked cognition. Byte-exact replay is not guaranteed across provider changes,
+model version updates, or external side effects, but the causal chain of
+decisions is recoverable.
+
+The bus tape is per-agent. The runtime-wide audit log (below) is a separate
+aggregate of cross-agent security and operational events; it is populated from
+per-agent tape entries promoted by dispatcher decisions and from runtime events
+outside any single agent.
+
 ### Audit Log
 
-The audit log is the runtime's canonical record of security-relevant and
-operationally-relevant events: authority decisions, model API calls, tool
+The audit log is the runtime's cross-agent canonical record of security-relevant
+and operationally-relevant events: authority decisions, model API calls, tool
 invocations, transport events (verification, quarantine, delivery), classifier
-dispositions, lifecycle transitions, and cost-ceiling trips.
+dispositions, lifecycle transitions, cost-ceiling trips, configuration
+revisions, persona writes.
 
 The log is stored as a JSON Lines file under the runtime data directory:
 append-only, recoverable, and easily exportable for compliance or post-mortem
@@ -873,13 +997,23 @@ identity.
 
 Values:
 
+- forge
 - operator
 - agent
 - external
 - untrusted (failed verification or unrecognized sender)
 
-Trust tier is assigned by the runtime at message verification. It is not a field
-in the message envelope.
+Trust tier is assigned by the runtime at message verification against the key
+registry. It is not a field in the message envelope.
+
+**Forge tier** sits above operator tier and is required for durable tuning of
+subsystem state at instance scope, persona writes, skill updates, classifier
+policy revisions, and other configuration mutations. Forge is a tier, not a team
+— any identity (operator, agent, external) holding keys registered at this tier
+can act at it. Persona-curator agents typically hold forge keys; operators may
+also hold them directly. The runtime checks signatures against the registry; it
+does not care about the holder's identity beyond what tier their keys are
+registered at.
 
 ### Replay Ledger
 
@@ -1192,11 +1326,13 @@ The following are non-obvious constraints the runtime imposes. Several appear
 inline in the entity sections above; they are consolidated here so implementers
 can find them without re-reading the document end to end.
 
-**Cold-start core is frozen for an agent's lifetime.** A memory revision
-propagates to running agents only when those agents query the store, not as an
-in-flight push to their cold-start core. Operators who require immediate
-propagation rely on short agent turnover — fast for subordinates, slow for
-long-lived leads.
+**Materialized state does not auto-refresh in running agents.** A persona
+revision (or a memory revision) propagates to a running agent only when the
+agent's curator queries the relevant store. Items already integrated into the
+working context, short-term, or long-term memory continue to reflect the
+integration-time state until refreshed. Operators who require immediate
+propagation use the propagation operation (see `reeve-persona-actor.md`) to push
+instance-tuning messages to all running agents of the affected persona.
 
 **The conversation thread records intent and runtime decisions, not external
 world state.** A tool invocation logged as completed means only that the runtime
