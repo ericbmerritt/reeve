@@ -16,10 +16,13 @@ clap = { version = "4", features = ["derive"] }
 
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 ed25519-dalek = { version = "2", default-features = false, features = ["fast", "std", "zeroize", "rand_core"] }
+libc = { version = "0.2", default-features = false }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
+tempfile = { version = "3", default-features = false }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
+toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
 uuid = { version = "1", default-features = false, features = ["std", "serde"] }
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 
