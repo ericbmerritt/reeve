@@ -64,7 +64,11 @@ Before picking up any phase, read in order:
 3. The sibling spec(s) most relevant to the phase:
    - **Identity, envelope, transport (phases 2–4):**
      `reeve-transport-security.md` + `reeve-domain-model.md`
-   - **Adapter, runtime, agent (phases 5–7):** `reeve-domain-model.md`
+   - **Adapter, runtime, agent (phases 5–7):** `reeve-domain-model.md`. For
+     phase 7, also `reeve-actor-interior.md` for the architectural target the
+     simple v1 curator will eventually grow into, and `reeve-persona-actor.md`
+     for the live-persona model that informs how the lead persona TOML is loaded
+     today (statically) versus later (as a live actor's defaults).
    - **TUI (phase 8):** `reeve-tui-design.md` + `reeve-tui-screens.md`
 4. `reeve-walking-skeleton.ladder.md` — the phase-by-phase plan
 
