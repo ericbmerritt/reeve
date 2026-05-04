@@ -101,9 +101,10 @@ invocation, message, authority decision, and memory reference is recorded and
 inspectable. Observability is the precondition for the authority model, not an
 add-on.
 
-**Fresh agents over fat contexts.** Reeve scales work by spawning short-lived
-subordinates, not by growing one agent's context. Personas are reusable; agents
-are cheap and disposable.
+**Curators, not turnover.** Reeve scales context with curation, not agent
+turnover. Each agent has a curator that maintains a working context, evicts
+items that have served their purpose, and decides when to invoke cognition.
+Long-lived agents stay tractable because the curator continuously edits.
 
 **Memory is curated, not raw history.** What agents start with is the distilled
 signal — facts, heuristics, preferences — versioned and revertable, never a dump
@@ -123,11 +124,15 @@ to extend itself.
 tree. It starts once and persists. The TUI connects to it; closing the TUI does
 not stop the runtime.
 
-**Persona.** A defined role: system prompt, default model assignment, capability
-profile, and skill set. A persona is configuration. It does not run. The same
-persona can have many running instances simultaneously. Personas are versioned.
-Each edit produces a new version, and the next agent spawned from that persona
-picks it up.
+**Persona.** A defined role and a live actor. As a role, the persona declares
+system prompt, default model assignment, capability profile, and skill set. As
+an actor, the persona has its own address (`persona:<name>`) and accepts
+proposals from running agents — memory promotion, tuning promotion, skill
+refinement. Direct writes from agents are rejected; proposals flow through
+_persona-curator agents_ that evaluate at forge tier. The same persona can have
+many running instances simultaneously, each materializing from the persona's
+current state at spawn. Personas are versioned on disk; rollback is repointing
+the `current` file. See `reeve-persona-actor.md`.
 
 **Skill.** A discrete capability a persona can apply: review a PR, write tests,
 refactor a module, investigate a flaky test. Skills are composable units — name,
@@ -143,27 +148,30 @@ capability it already has. Skills cannot grant authority; personas declare it. A
 persona without skills is still a fully addressable, fully authorized role;
 skills sharpen behavior but are not required for an agent to function.
 
-**Memory.** Persistent, curated knowledge presented to agents in two layers: a
-small _cold-start core_ loaded into the system prompt at spawn (so fresh agents
-are smart on arrival), and a larger _queryable store_ the agent pulls from on
-demand. Three scopes: _project memory_ — facts about a specific codebase, lives
-in the repository as commitable markdown; _persona memory_ — heuristics that
-travel with a persona across projects; _operator memory_ — recurring operator
-preferences and context. Memory is curated, not raw history. Entries are
-versioned and revertable. Memory updates land in the store and are visible to
-running agents on next query; cold-start core is frozen for an agent's lifetime,
-picked up fresh on next spawn.
+**Memory.** Tiered, curated knowledge. Within an agent: _working context_ (what
+cognition currently sees), _short-term_ (recently evicted from working context,
+hot, time-bounded), _long-term_ (promoted, durable for the agent's lifetime).
+Across agents: _persona memory_ (heuristics that travel with a persona) and
+_project memory_ (facts about a specific codebase, committable markdown in
+`<repo>/.reeve/`). The memory composer (a satellite) queries all four stores
+when query state changes materially, scores candidates, and offers them to the
+curator; the curator integrates. Promotion is governed by integration / exposure
+/ reference signals, not raw retrieval. Entries are versioned and revertable.
+See `reeve-memory-composer.md`.
 
 **Agent.** A running instance of a persona. Has its own name, address, keypair,
-conversation thread, current task scope, and cost meter. An agent records the
-versions of the persona, skills, and memory generation it was instantiated from,
-so that everything it does is attributable to a specific configuration. An agent
-is an actor. One persona can have fifty running agents in parallel — each
-addressing a different task, each with its own conversation, each independently
-inspectable. Agents are supervised: if one fails it is restarted, preserving
-durable conversation, configuration, and event history. Restart does not pretend
-that an interrupted tool call completed successfully; the call is recorded as
-failed and the agent reasons about the failure on resumption.
+durable bus tape, current task scope, and cost meter. An agent records the
+versions of the persona, skills, and memory generation it was instantiated from.
+Inside the agent live three tiers: a _brainstem_ (mandatory infrastructure: cost
+meter, status writer, bus tape writer), a _curator_ (the locus of agency that
+maintains a working context and decides when to invoke cognition), and
+_cognition_ (a stateless function the curator invokes when policy says
+deliberation is warranted). Contributing _satellites_ (the memory composer is
+the first) run alongside the curator. The LLM is not the agent; the curator is.
+Cognition is interchangeable. One persona can have many running agents in
+parallel — each addressing a different task, each independently inspectable.
+Agents are supervised: a panicking actor is restarted without quiescing the
+runtime. See `reeve-actor-interior.md`.
 
 **Lead.** The persona the chat interface attaches to by default — the operator's
 first point of contact. Any persona can be designated the lead; team
@@ -387,45 +395,41 @@ inspectable.
 
 ## Context and Memory
 
-Context windows are finite. Real coding work is not. Reeve takes three positions
-on context management.
+Context windows are finite. Real coding work is not. Reeve's answer is curation,
+not turnover.
 
-**Fresh agents over fat contexts.** Instead of growing one agent's context
-indefinitely, Reeve spawns short-lived subordinate agents with bounded scope.
-The lead persona holds the long-running coordination context; subordinates
-absorb large surfaces — file reads, tool output, web content — and return
-distilled results. An agent that finishes its task exits. This is the cheaper
-way to scale work: more agents, not bigger contexts. The persona/agent split
-makes this natural — personas are reusable definitions; agents are cheap,
-disposable instances.
+Each agent has a curator (see `reeve-actor-interior.md` for the full model) that
+maintains a working context, integrates inputs, evicts items that have served
+their purpose, and decides when to invoke cognition. The curator is mechanical
+for routine bookkeeping; a small-model fallback handles the residual cases. The
+result: a long-lived agent whose apparent memory span is its full lifetime,
+whose per-invocation input cost is bounded by the curated snapshot rather than
+session history.
 
-**Compaction when scope demands continuity.** Some tasks require continuous
-context that exceeds the model's window. The runtime supports compaction: a
-long-running conversation is distilled into a summary that replaces the verbose
-history while preserving decisions, state, and rationale. Compaction is opt-in
-per agent and configurable per persona.
+Memory has tiers within an agent — working context (what cognition currently
+sees), short-term (recently evicted, hot), long-term (promoted, durable) — plus
+persona and project memory above. The memory composer (a satellite) queries the
+four stores when query state changes materially, scores candidates, and offers
+them to the curator. The curator integrates; the composer never does.
 
-**Memory as background distillation.** The runtime maintains memory through
-background distillation: when an agent finishes work, it writes additions or
-revisions to the appropriate memory store. Compaction is real-time; memory is
-post-hoc; both are the same operation applied at different timescales.
+Compression is continuous and structural on the curator's hot path: when a tool
+call resolves an open question, the question and the discussion that produced it
+collapse into a structured pointer item. Where natural-language synthesis is
+genuinely required, it runs as a background consolidation pass through the
+small-model fallback, not on the hot path.
 
-Memory curation is genuinely hard. Quality drift, write conflicts across
-parallel agents, and the routing question — does this fact belong to the
-project, the persona, or the operator? — are not solved by the architecture
-alone. Reeve's default is permissive: agents with `write_memory` capability
-write directly to the store and the writes take effect immediately. The
-panopticon surfaces recent writes for operator review; any write can be reverted
-to a prior version. The trade-off is lower friction in exchange for reactive
-quality control — bad writes can pollute future spawns until the operator
-reverts them, and the supervised observability plus versioned rollback are what
-make that trade-off acceptable. Memory is observable; it is also editable and
-revertable.
+Persona memory is curated by _persona-curator agents_ — agents whose job is to
+evaluate proposals from running instances at forge tier. Reeve's default for
+memory writes is permissive with reactive quality control: agents propose;
+persona-curator agents evaluate and write; the panopticon surfaces recent writes
+for operator review; any write can be reverted to a prior version. Bad writes
+can pollute future spawns until the operator reverts them; the supervised
+observability plus versioned rollback are what make that trade-off acceptable.
 
-A fresh-spawned agent is not starting from zero. It starts with the persona
-definition, relevant project and persona memory, the operator's preferences, and
-its specific task scope. That is enough context to be effective without carrying
-forward every conversation that came before.
+A fresh-spawned agent is not starting from zero. The persona's current state
+materializes into the new agent at spawn — defaults, memory selection rules,
+skill set — so the curator begins with an informed working context rather than
+an empty one.
 
 ## Shipped Defaults
 
@@ -515,7 +519,7 @@ coding agents.
 
 ## Further Reading
 
-This overview is the front door. Seven sibling documents carry the depth.
+This overview is the front door. Eleven sibling documents carry the depth.
 
 - **Positioning** — strategic context: who Reeve is for, where it sits relative
   to coding agents and orchestration tools, what it owns and what it does not,
@@ -524,6 +528,20 @@ This overview is the front door. Seven sibling documents carry the depth.
   identifiers, configuration layer, runtime layer, security layer, state
   ownership, subsystem boundaries, and invariants. Read this next if you are
   implementing or reasoning about Reeve internals.
+- **Actor Interior** — what is inside an agent: the brainstem (mandatory
+  infrastructure), the curator (locus of agency), cognition as a stateless
+  function, contributing satellites, the working context, the bus tape, the
+  dispatcher with subsystem addressing, and the three model resources.
+- **Persona as Live Actor** — the persona has its own address and dispatcher.
+  Downward materialization at spawn, upward proposals from agents,
+  persona-curator agents that evaluate at forge tier, and the three operations
+  (instance tuning, default promotion, propagation).
+- **Memory Composer** — the first contributing satellite. Mechanical retrieval
+  pipeline (lexical plus embedding) across short-term, long-term, persona, and
+  project stores; candidate lifecycle and usage counters; suppression windows.
+- **Versioned Disk Substrate** — versioning as a property of the disk format:
+  numbered version files, `current` pointer, manifest. Rollback as repointing.
+  Disk + bus tape + panopticon as the three sources of truth, no metrics layer.
 - **Transport Security Model** — message provenance, signed envelopes, the
   maildir state machine, replay and delivery ledgers, identity and key model,
   trust tiers.
@@ -542,6 +560,8 @@ This overview is the front door. Seven sibling documents carry the depth.
 
 A reasonable order: Positioning to understand what Reeve is for and what it is
 not; then Domain Model since it grounds the vocabulary the others use; then
-Transport Security and Gatekeeper in either order; then Shipped Teams; then TUI
-Design and Screens together when you are ready to think about the operator
-surface.
+Actor Interior, Persona as Live Actor, Memory Composer, and Versioned Disk
+Substrate together for the architecture inside an actor and across the actor
+fleet; then Transport Security and Gatekeeper in either order; then Shipped
+Teams; then TUI Design and Screens together when you are ready to think about
+the operator surface.
