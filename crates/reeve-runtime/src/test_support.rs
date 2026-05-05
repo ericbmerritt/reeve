@@ -1,11 +1,50 @@
 //! Shared test fixtures for reeve-runtime integration tests.
 
+use std::path::Path;
+
 use reeve_transport::sign::sign_envelope;
 use reeve_types::{
     Envelope, EnvelopeSignature, IdentityId, KeyId, Keypair, MessageId, Nonce, PayloadHash,
     SchemaVersion, NONCE_LEN, PAYLOAD_HASH_LEN, SIGNATURE_LEN,
 };
 use time::OffsetDateTime;
+
+/// Set a file's mtime to year 2000 — far past any realistic retention
+/// threshold. Used for tests that just need an "old enough" timestamp
+/// and don't care about precise boundary semantics. For exact-boundary
+/// tests, see [`set_mtime_at`].
+///
+/// Unix-only — gated `#[cfg(unix)]`.
+#[cfg(unix)]
+pub(crate) fn set_ancient_mtime(path: &Path) {
+    let status = std::process::Command::new("touch")
+        .args(["-t", "200001010000.00", path.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "touch failed for {path:?}");
+}
+
+/// Set a file's mtime to a specific UTC timestamp via `touch -d` (RFC 3339).
+///
+/// **Caller must zero sub-second components** (`ts.replace_nanosecond(0).unwrap()`)
+/// to avoid round-trip drift between `OffsetDateTime` nanosecond precision and
+/// `touch -d`'s second-precision parsing. A `debug_assert!` enforces this.
+///
+/// Unix-only — gated `#[cfg(unix)]`.
+#[cfg(unix)]
+pub(crate) fn set_mtime_at(path: &Path, ts: OffsetDateTime) {
+    use time::format_description::well_known::Rfc3339;
+    debug_assert!(
+        ts.nanosecond() == 0,
+        "set_mtime_at requires sub-second components zeroed via replace_nanosecond(0)"
+    );
+    let formatted = ts.format(&Rfc3339).expect("format failed");
+    let status = std::process::Command::new("touch")
+        .args(["-d", &formatted, path.to_str().unwrap()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "touch -d failed for {path:?}");
+}
 
 /// Create a temporary directory with mode 0o700 on Unix, or a plain tempdir
 /// on non-Unix. Used in tests that must satisfy the registry and ledger mode

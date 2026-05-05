@@ -1,8 +1,8 @@
 //! Per-agent inbox directory layout per `specs/reeve-walking-skeleton.ladder.md`
 //! phase 4 task 1 and `specs/reeve-transport-security.md` § Delivery Model.
 //!
-//! Provisions `agents/<identity_id>/inbox/{tmp,new,cur,quarantine}` for any
-//! registered identity. The directory name is `identity_id.to_string()` — a
+//! Provisions `agents/<identity_id>/inbox/{tmp,new,cur,quarantine,archive}` for
+//! any registered identity. The directory name is `identity_id.to_string()` — a
 //! hyphenated `UUIDv7` — which is filesystem-safe, globally unique, and directly
 //! derivable from the registry without a separate name-to-id lookup. Human-
 //! readable mapping (`identity_id` ↔ `display_name`) is already available through
@@ -18,7 +18,9 @@
 //! The provisioned layout feeds two downstream consumers: the watcher (Task 13),
 //! which inotify/kqueue-watches `new/` and moves messages into `cur/`, and the
 //! verification pipeline (Task 12), which inspects signatures and routes
-//! rejected messages into `quarantine/`.
+//! rejected messages into `quarantine/`. The `archive/` directory holds files
+//! rotated out of `cur/` by [`crate::watcher::Watcher::rotate_cur`] after they
+//! age past the configured retention threshold.
 
 use std::fs;
 use std::io;
@@ -40,6 +42,7 @@ const TMP_SUBDIR: &str = "tmp";
 const NEW_SUBDIR: &str = "new";
 const CUR_SUBDIR: &str = "cur";
 const QUARANTINE_SUBDIR: &str = "quarantine";
+const ARCHIVE_SUBDIR: &str = "archive";
 
 /// The shared `agents/` parent under a Reeve data directory. Owns the layout
 /// root and provisions per-identity inbox trees beneath it.
@@ -78,6 +81,7 @@ impl InboxLayout {
     /// - `agents/<identity_id>/inbox/new/` — completed messages awaiting pickup
     /// - `agents/<identity_id>/inbox/cur/` — durably delivered messages
     /// - `agents/<identity_id>/inbox/quarantine/` — verification failures
+    /// - `agents/<identity_id>/inbox/archive/` — post-retention cur/ housekeeping
     ///
     /// All directories are created with mode `0o700` on Unix. Idempotent:
     /// repeated calls for the same identity succeed when the directories already
@@ -154,6 +158,7 @@ pub struct AgentInbox {
     new: PathBuf,
     cur: PathBuf,
     quarantine: PathBuf,
+    archive: PathBuf,
 }
 
 impl AgentInbox {
@@ -162,12 +167,14 @@ impl AgentInbox {
         let new = root.join(NEW_SUBDIR);
         let cur = root.join(CUR_SUBDIR);
         let quarantine = root.join(QUARANTINE_SUBDIR);
+        let archive = root.join(ARCHIVE_SUBDIR);
         Self {
             root,
             tmp,
             new,
             cur,
             quarantine,
+            archive,
         }
     }
 
@@ -197,6 +204,14 @@ impl AgentInbox {
     /// `agents/<id>/inbox/quarantine/`.
     pub fn quarantine(&self) -> &Path {
         &self.quarantine
+    }
+
+    /// Post-retention archive for `cur/` rotation housekeeping:
+    /// `agents/<id>/inbox/archive/`. Files moved here by [`Watcher::rotate_cur`]
+    /// have aged past the configured retention threshold and are no longer
+    /// needed in the active `cur/` buffer.
+    pub fn archive(&self) -> &Path {
+        &self.archive
     }
 }
 
@@ -300,10 +315,11 @@ impl std::error::Error for InboxError {
 /// All directories that `provision` must create and mode-check, in order.
 ///
 /// Includes `agent_dir` (`agents/<id>/`, the per-identity container) before
-/// `inbox_root` (`agents/<id>/inbox/`) and the four maildir subdirs.
-/// Provisioning the container explicitly ensures its mode is enforced even
-/// when it was pre-created by an external tool with a permissive umask.
-fn dirs_to_provision(agent_dir: &Path, inbox_root: &Path) -> [PathBuf; 6] {
+/// `inbox_root` (`agents/<id>/inbox/`) and the maildir subdirs
+/// (`tmp/`, `new/`, `cur/`, `quarantine/`, `archive/`). Provisioning the
+/// container explicitly ensures its mode is enforced even when it was
+/// pre-created by an external tool with a permissive umask.
+fn dirs_to_provision(agent_dir: &Path, inbox_root: &Path) -> [PathBuf; 7] {
     [
         agent_dir.to_path_buf(),
         inbox_root.to_path_buf(),
@@ -311,6 +327,7 @@ fn dirs_to_provision(agent_dir: &Path, inbox_root: &Path) -> [PathBuf; 6] {
         inbox_root.join(NEW_SUBDIR),
         inbox_root.join(CUR_SUBDIR),
         inbox_root.join(QUARANTINE_SUBDIR),
+        inbox_root.join(ARCHIVE_SUBDIR),
     ]
 }
 
@@ -384,12 +401,44 @@ mod tests {
         assert!(inbox.new_dir().is_dir(), "new missing");
         assert!(inbox.cur().is_dir(), "cur missing");
         assert!(inbox.quarantine().is_dir(), "quarantine missing");
+        assert!(inbox.archive().is_dir(), "archive missing");
 
         assert_eq!(mode_of(inbox.root()), 0o700, "root mode wrong");
         assert_eq!(mode_of(inbox.tmp()), 0o700, "tmp mode wrong");
         assert_eq!(mode_of(inbox.new_dir()), 0o700, "new mode wrong");
         assert_eq!(mode_of(inbox.cur()), 0o700, "cur mode wrong");
         assert_eq!(mode_of(inbox.quarantine()), 0o700, "quarantine mode wrong");
+        assert_eq!(mode_of(inbox.archive()), 0o700, "archive mode wrong");
+    }
+
+    // I_archive_2: open_existing (via provision) rejects archive/ with mode 0o755
+    // — WrongDirectoryMode is returned rather than silently accepting the bad mode.
+    #[cfg(unix)]
+    #[test]
+    fn provision_rejects_archive_with_wrong_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let data_dir = make_secure_tempdir();
+        let layout = open_layout(data_dir.path());
+        let id = IdentityId::new().unwrap();
+
+        // Provision the inbox fully, then chmod archive/ to 0o755.
+        let inbox = layout.provision(id).unwrap();
+        fs::set_permissions(inbox.archive(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        // A second provision call must detect the mode mismatch on archive/.
+        let err = layout.provision(id).unwrap_err();
+        let InboxError::WrongDirectoryMode {
+            actual, expected, ..
+        } = err
+        else {
+            panic!("expected WrongDirectoryMode, got {err:?}");
+        };
+        assert_eq!(actual, 0o755, "actual mode should be 0o755");
+        assert_eq!(
+            expected, INBOX_DIR_MODE,
+            "expected mode should be INBOX_DIR_MODE"
+        );
     }
 
     // I1-ext: agents/<id>/ container directory has mode 0o700.
@@ -712,6 +761,7 @@ mod tests {
         assert!(inbox.new_dir().is_dir());
         assert!(inbox.cur().is_dir());
         assert!(inbox.quarantine().is_dir());
+        assert!(inbox.archive().is_dir());
     }
 
     // Provisioning two agents, deleting one's tree, leaves the other intact.
@@ -743,5 +793,6 @@ mod tests {
         assert!(inbox_b.new_dir().is_dir());
         assert!(inbox_b.cur().is_dir());
         assert!(inbox_b.quarantine().is_dir());
+        assert!(inbox_b.archive().is_dir());
     }
 }

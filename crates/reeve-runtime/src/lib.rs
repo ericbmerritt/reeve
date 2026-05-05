@@ -26,4 +26,4 @@ pub use verify::{
     emit_quarantine_audit, EnvelopeIds, QuarantineReason, Verdict, VerificationError,
     VerificationPipeline, DEFAULT_CLOCK_SKEW, MAX_ENVELOPE_BYTES,
 };
-pub use watcher::{FilenameError, ProcessOutcome, Watcher, WatcherError};
+pub use watcher::{FilenameError, ProcessOutcome, RotationOutcome, Watcher, WatcherError};

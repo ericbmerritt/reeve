@@ -46,6 +46,14 @@
 //! This crate surfaces that as [`WatcherError::CrossFilesystemRename`] rather
 //! than attempting a fallback copy.
 //!
+//! ## cur/ rotation
+//!
+//! [`Watcher::rotate_cur`] is a periodic housekeeping operation that moves
+//! files older than a caller-supplied retention threshold from `cur/` into
+//! `archive/`. The decision is mtime-based; archival is silent (no audit
+//! event — see the method's doc for the reasoning). The cadence is the
+//! caller's responsibility; Phase 6's runtime daemon owns the timer.
+//!
 //! ## Sender filename contract
 //!
 //! Senders are expected to use collision-resistant filenames (e.g., UUIDs or
@@ -85,7 +93,7 @@ use std::sync::Arc;
 use notify::event::{CreateKind, EventKind};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use reeve_types::{IdentityId, KeyId, MessageId};
-use time::OffsetDateTime;
+use time::{Duration, OffsetDateTime};
 
 use crate::audit::{AuditError, AuditEvent, AuditLog};
 use crate::fs_util::set_nofollow;
@@ -207,6 +215,21 @@ pub enum ProcessOutcome {
     InvalidFilename { reason: FilenameError },
 }
 
+/// Outcome of a [`Watcher::rotate_cur`] call: counts of what happened to each
+/// entry in `cur/` during the rotation pass.
+///
+/// No audit event is emitted by `rotate_cur`; see the method's
+/// `## No audit event` section for the rationale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotationOutcome {
+    /// Number of files moved from `cur/` to `archive/` (aged past retention).
+    pub archived: usize,
+    /// Number of files left in `cur/` (not yet old enough).
+    pub retained: usize,
+    /// Number of entries skipped: symlinks, non-regular-files, or dotfiles.
+    pub skipped: usize,
+}
+
 /// Errors that stop or degrade the watcher's ability to operate. System
 /// failures — not pipeline verdicts — live here. A `Quarantine` verdict is
 /// `Ok(ProcessOutcome::Quarantined { .. })`, never an error.
@@ -289,10 +312,10 @@ impl Watcher {
     /// expose configurable skew tolerance if needed; for the walking skeleton
     /// the default is appropriate.
     // NOTE: deferred — see specs/reeve-walking-skeleton.ladder.md (Phase 4
-    // Task 14 — cur/ rotation). cur/ and quarantine/ directory modes are
-    // validated at InboxLayout::provision but not re-checked when Watcher::new
-    // acquires an AgentInbox handle. A post-provision chmod could silently
-    // weaken the integrity boundary.
+    // Task 14 — cur/ rotation). cur/, quarantine/, and archive/ directory
+    // modes are validated at InboxLayout::provision but not re-checked when
+    // Watcher::new acquires an AgentInbox handle. A post-provision chmod
+    // could silently weaken the integrity boundary.
     pub fn new(
         registry: &Arc<IdentityRegistry>,
         replay: &Arc<ReplayLedger>,
@@ -478,6 +501,159 @@ impl Watcher {
             })
             .map_err(WatcherError::Audit)?;
         Ok(ProcessOutcome::InvalidFilename { reason })
+    }
+
+    /// Rotate aged files from `inbox/cur/` to `inbox/archive/`.
+    ///
+    /// Iterates every entry in `cur/` and, for each regular non-dotfile,
+    /// compares the file's mtime against `now`. If `now - mtime >= retention`
+    /// the file is atomically moved to `archive/<filename>` via
+    /// [`rename_disambiguating_enoent`]. Files younger than the threshold are
+    /// left in place. If a file vanishes between enumeration and rename
+    /// (concurrent mover), it is silently not counted in archived.
+    ///
+    /// Symlinks, non-regular-file entries, and dotfiles (names beginning with
+    /// `.`) are skipped and counted in [`RotationOutcome::skipped`].
+    ///
+    /// `now` is injected so tests are not dependent on the wall clock. Phase 6
+    /// (the runtime daemon) will supply `OffsetDateTime::now_utc()` and choose
+    /// the operational `retention` value; this method is the pure mechanism.
+    ///
+    /// `retention` must be non-negative. A NEGATIVE value triggers a
+    /// debug-build panic via `debug_assert!`; in release builds, a negative
+    /// retention archives every file in `cur/` (including any with mtimes
+    /// in the future) — silently. A zero retention is accepted and archives
+    /// every file whose `mtime <= now`; files with future mtimes (e.g.,
+    /// from clock skew) are RETAINED. Phase 6 callers should validate
+    /// retention upstream of this method.
+    ///
+    /// ## No audit event
+    ///
+    /// Archival is housekeeping, not a security event. No `AuditEvent` variant
+    /// is emitted here — operators observe ground truth via file presence in
+    /// `archive/`. This is deliberate per the Phase 4 Task 14 spec.
+    ///
+    /// ## Collision behaviour
+    ///
+    /// If `archive/<filename>` already exists, the atomic rename will overwrite
+    /// it. This matches the `cur/`-collision behaviour documented in the watcher
+    /// module comment; no additional collision handling is added here.
+    ///
+    /// ## Dotfile accumulation hazard
+    ///
+    /// `rotate_cur` skips dotfiles (names beginning with `.`). The watcher
+    /// does not currently reject dotfile names at the `validate_filename`
+    /// boundary (only `.` and `..` are reserved). A legitimate sender that
+    /// uses a dotfile name (e.g., `.gitkeep`) will deliver the file to
+    /// `cur/` where it can never be archived by this method. Operator-
+    /// initiated cleanup is required. A future filename-policy refinement
+    /// could close this by treating dotfile names as `FilenameError::Reserved`
+    /// at the inbox boundary.
+    ///
+    /// # Threat-model notes
+    ///
+    /// `mtime` is not a tamper-resistant signal. A same-UID actor with write
+    /// access to `cur/` can call `utimensat` (or `touch`) to either suppress
+    /// rotation (mtime forward) or force premature archival (mtime backward).
+    /// This is consistent with the watcher's existing same-UID residual risk
+    /// (see module-level threat model). Already-delivered messages still
+    /// reside in `archive/`; the agent's runtime view of `cur/` may be
+    /// truncated faster than expected. The runtime accepts this residual.
+    ///
+    /// Same-UID actors can also leverage the mtime-force vector together
+    /// with archive overwrite: by setting mtime backwards on a `cur/` file
+    /// whose name matches an existing `archive/<filename>`, an attacker
+    /// triggers a rename that silently overwrites the prior archived bytes.
+    /// This is the documented overwrite behavior (see "If `archive/...`
+    /// already exists" below); the mtime-force vector amplifies it from
+    /// "rare collision" to "deliberate evidence destruction" in the
+    /// adversarial case. Same-UID residual remains the boundary.
+    ///
+    /// # Serialization
+    ///
+    /// Concurrent `rotate_cur` calls against the same `(inbox)` are safe
+    /// (POSIX rename is atomic; the `Ok(false)` benign-race path is handled),
+    /// but archived counters may be inflated under concurrency. Phase 6
+    /// callers should serialize per-agent rotation passes (e.g., one timer
+    /// per agent in the actor tree).
+    pub fn rotate_cur(
+        &self,
+        inbox: &AgentInbox,
+        retention: Duration,
+        now: OffsetDateTime,
+    ) -> Result<RotationOutcome, WatcherError> {
+        debug_assert!(
+            retention >= Duration::ZERO,
+            "retention must be non-negative"
+        );
+        let mut outcome = RotationOutcome {
+            archived: 0,
+            retained: 0,
+            skipped: 0,
+        };
+
+        let entries = fs::read_dir(inbox.cur()).map_err(|source| WatcherError::Io {
+            path: inbox.cur().to_path_buf(),
+            source,
+        })?;
+
+        for entry_result in entries {
+            let entry = entry_result.map_err(|source| WatcherError::Io {
+                path: inbox.cur().to_path_buf(),
+                source,
+            })?;
+            let path = entry.path();
+
+            // Dotfiles are skipped unconditionally.
+            let file_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) if n.starts_with('.') => {
+                    outcome.skipped += 1;
+                    continue;
+                }
+                Some(n) => n.to_owned(),
+                None => {
+                    outcome.skipped += 1;
+                    continue;
+                }
+            };
+
+            // Use symlink_metadata so we never follow a symlink.
+            let metadata = fs::symlink_metadata(&path).map_err(|source| WatcherError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                outcome.skipped += 1;
+                continue;
+            }
+
+            // Extract the mtime. On platforms where modified() can fail we
+            // surface that as WatcherError::Io so the caller sees it rather
+            // than silently retaining or archiving the file.
+            let mtime_system = metadata.modified().map_err(|source| WatcherError::Io {
+                path: path.clone(),
+                source,
+            })?;
+
+            // Convert SystemTime → OffsetDateTime. The conversion cannot
+            // fail on any platform that supports SystemTime (since UNIX_EPOCH
+            // to now is always representable), but the API returns a Result.
+            let mtime = OffsetDateTime::from(mtime_system);
+            let age = now - mtime;
+
+            if age >= retention {
+                let dest = inbox.archive().join(&file_name);
+                if rename_disambiguating_enoent(&path, &dest)? {
+                    outcome.archived += 1;
+                }
+                // else: file already moved by a concurrent actor — not counted.
+            } else {
+                outcome.retained += 1;
+            }
+        }
+
+        Ok(outcome)
     }
 
     /// Iterates `inbox/new/`, skipping symlinks and non-files. Calls
@@ -729,10 +905,14 @@ mod tests {
         }
     }
 
-    fn place_in_new(inbox: &AgentInbox, filename: &str, bytes: &[u8]) -> PathBuf {
-        let path = inbox.new_dir().join(filename);
+    fn place_in(dir: &Path, filename: &str, bytes: &[u8]) -> PathBuf {
+        let path = dir.join(filename);
         fs::write(&path, bytes).unwrap();
         path
+    }
+
+    fn place_in_new(inbox: &AgentInbox, filename: &str, bytes: &[u8]) -> PathBuf {
+        place_in(inbox.new_dir(), filename, bytes)
     }
 
     fn audit_lines(audit_dir: &tempfile::TempDir) -> Vec<serde_json::Value> {
@@ -1433,6 +1613,234 @@ mod tests {
         assert!(
             matches!(result, Ok(false)),
             "missing source file should return Ok(false), got {result:?}",
+        );
+    }
+
+    // Helper: place a regular file in `cur/` with a real system mtime (now).
+    // Returns the path of the created file.
+    fn place_in_cur(inbox: &AgentInbox, filename: &str) -> PathBuf {
+        place_in(inbox.cur(), filename, b"placeholder")
+    }
+
+    // R1: rotate_cur moves files older than retention to archive/, leaves
+    // younger files in cur/. "old" gets an ancient mtime via set_ancient_mtime;
+    // "mid" and "fresh" keep the real system mtime (≈ now).
+    #[test]
+    fn r1_rotates_old_files() {
+        let ctx = build_ctx();
+        let real_now = OffsetDateTime::now_utc();
+        let retention = Duration::hours(1);
+
+        let old = place_in_cur(&ctx.inbox, "old.json");
+        crate::test_support::set_ancient_mtime(&old);
+
+        let mid = place_in_cur(&ctx.inbox, "mid.json");
+        let fresh = place_in_cur(&ctx.inbox, "fresh.json");
+
+        let outcome = ctx
+            .watcher
+            .rotate_cur(&ctx.inbox, retention, real_now)
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1, "one file should be archived");
+        assert_eq!(outcome.retained, 2, "two files should be retained");
+        assert_eq!(outcome.skipped, 0, "no files should be skipped");
+
+        assert!(!old.exists(), "old file should have been moved out of cur/");
+        assert!(
+            ctx.inbox.archive().join("old.json").exists(),
+            "old file should be in archive/",
+        );
+        assert!(mid.exists(), "mid file should remain in cur/");
+        assert!(fresh.exists(), "fresh file should remain in cur/");
+    }
+
+    // R2: rotate_cur on an empty cur/ returns all-zero outcome.
+    #[test]
+    fn r2_empty_cur_returns_zero() {
+        let ctx = build_ctx();
+        let now = OffsetDateTime::now_utc();
+
+        let outcome = ctx
+            .watcher
+            .rotate_cur(&ctx.inbox, Duration::hours(1), now)
+            .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.retained, 0);
+        assert_eq!(outcome.skipped, 0);
+    }
+
+    // R3: symlinks in cur/ are skipped (not archived), regular files are processed.
+    #[cfg(unix)]
+    #[test]
+    fn r3_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let ctx = build_ctx();
+
+        // A regular file with an ancient mtime — old enough to archive at any sane `now`.
+        let old = place_in_cur(&ctx.inbox, "regular.json");
+        crate::test_support::set_ancient_mtime(&old);
+
+        // A symlink in cur/ — should be skipped regardless of age.
+        let target = ctx.inbox.tmp().join("link_target.json");
+        fs::write(&target, b"target content").unwrap();
+        let link = ctx.inbox.cur().join("link.json");
+        symlink(&target, &link).unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        let outcome = ctx
+            .watcher
+            .rotate_cur(&ctx.inbox, Duration::hours(1), now)
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1, "regular file should be archived");
+        assert_eq!(outcome.skipped, 1, "symlink should be skipped");
+        assert!(link.exists(), "symlink should remain untouched");
+        assert!(!old.exists(), "regular file should have been moved");
+        assert!(ctx.inbox.archive().join("regular.json").exists());
+    }
+
+    // R4: no files old enough to archive → archived=0, retained=N.
+    // All files have mtime ≈ real_now; pass now = real_now so age ≈ 0 < 1h.
+    #[test]
+    fn r4_no_eligible_files_archives_zero() {
+        let ctx = build_ctx();
+        let now = OffsetDateTime::now_utc();
+
+        place_in_cur(&ctx.inbox, "a.json");
+        place_in_cur(&ctx.inbox, "b.json");
+
+        let outcome = ctx
+            .watcher
+            .rotate_cur(&ctx.inbox, Duration::hours(1), now)
+            .unwrap();
+
+        assert_eq!(outcome.archived, 0);
+        assert_eq!(outcome.retained, 2);
+        assert_eq!(outcome.skipped, 0);
+    }
+
+    // R5: missing archive/ directory causes Err(WatcherError::Io).
+    // Uses ancient mtime (via touch) to ensure file is old enough to trigger
+    // the rename attempt, which then fails because archive/ is gone.
+    #[test]
+    fn r5_missing_archive_dir_returns_io_error() {
+        let ctx = build_ctx();
+
+        // Place an old file in cur/ — ancient mtime guarantees age > any retention.
+        let old = place_in_cur(&ctx.inbox, "old.json");
+        crate::test_support::set_ancient_mtime(&old);
+
+        // Remove archive/ to simulate infrastructure failure.
+        fs::remove_dir_all(ctx.inbox.archive()).unwrap();
+
+        let now = OffsetDateTime::now_utc();
+        let result = ctx.watcher.rotate_cur(&ctx.inbox, Duration::hours(1), now);
+
+        assert!(
+            matches!(result, Err(WatcherError::Io { .. })),
+            "expected Err(WatcherError::Io) when archive/ is missing, got {result:?}",
+        );
+    }
+
+    // R6: file whose age equals retention exactly is archived (pins >= semantics).
+    //
+    // Injects both mtime (via touch -d) and now as parameters so that
+    // now - mtime == retention precisely. Distinguishes >= from > because a
+    // file one second younger would be retained.
+    #[cfg(unix)]
+    #[test]
+    fn r6_age_equal_to_retention_is_archived() {
+        let ctx = build_ctx();
+        let retention = Duration::hours(1);
+
+        // Fixed mtime with sub-second components zeroed to avoid touch drift.
+        let mtime = OffsetDateTime::from_unix_timestamp(1_700_000_000)
+            .unwrap()
+            .replace_nanosecond(0)
+            .unwrap();
+        // now - mtime == retention exactly: the file sits on the >= boundary.
+        let now = mtime + retention;
+
+        let path = place_in_cur(&ctx.inbox, "boundary.json");
+        crate::test_support::set_mtime_at(&path, mtime);
+
+        let outcome = ctx.watcher.rotate_cur(&ctx.inbox, retention, now).unwrap();
+
+        assert_eq!(
+            outcome.archived, 1,
+            "file at exact boundary must be archived (>=)"
+        );
+        assert_eq!(outcome.retained, 0);
+        assert_eq!(outcome.skipped, 0);
+        assert!(!path.exists(), "should be moved out of cur/");
+        assert!(ctx.inbox.archive().join("boundary.json").exists());
+    }
+
+    // R7: archive/ already contains a file with the same name; rotate_cur
+    // overwrites it with the cur/ version.
+    #[cfg(unix)]
+    #[test]
+    fn r7_pre_populated_archive_overwritten() {
+        let ctx = build_ctx();
+
+        // Pre-populate archive/ with stale content.
+        place_in(ctx.inbox.archive(), "old.json", b"original");
+
+        // Place replacement in cur/ with ancient mtime.
+        let cur_path = place_in_cur(&ctx.inbox, "old.json");
+        // Override placeholder content so we can detect overwrite.
+        fs::write(&cur_path, b"replacement").unwrap();
+        crate::test_support::set_ancient_mtime(&cur_path);
+
+        let now = OffsetDateTime::now_utc();
+        let outcome = ctx
+            .watcher
+            .rotate_cur(&ctx.inbox, Duration::hours(1), now)
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1);
+        assert!(!cur_path.exists(), "cur/ file must be gone");
+
+        let archive_content = fs::read(ctx.inbox.archive().join("old.json")).unwrap();
+        assert_eq!(
+            archive_content, b"replacement",
+            "archive/ file must contain the cur/ version",
+        );
+    }
+
+    // R8: dotfiles in cur/ are skipped; regular files with the same mtime are archived.
+    #[cfg(unix)]
+    #[test]
+    fn r8_dotfiles_are_skipped() {
+        let ctx = build_ctx();
+
+        let hidden = place_in_cur(&ctx.inbox, ".hidden.json");
+        crate::test_support::set_ancient_mtime(&hidden);
+
+        let regular = place_in_cur(&ctx.inbox, "regular.json");
+        crate::test_support::set_ancient_mtime(&regular);
+
+        let now = OffsetDateTime::now_utc();
+        let outcome = ctx
+            .watcher
+            .rotate_cur(&ctx.inbox, Duration::hours(1), now)
+            .unwrap();
+
+        assert_eq!(outcome.archived, 1, "one regular file archived");
+        assert_eq!(outcome.skipped, 1, "dotfile counted as skipped");
+        assert_eq!(outcome.retained, 0);
+
+        assert!(hidden.exists(), ".hidden.json must remain in cur/");
+        assert!(
+            ctx.inbox.archive().join("regular.json").exists(),
+            "regular.json must be in archive/",
+        );
+        assert!(
+            !ctx.inbox.archive().join(".hidden.json").exists(),
+            ".hidden.json must not appear in archive/",
         );
     }
 
