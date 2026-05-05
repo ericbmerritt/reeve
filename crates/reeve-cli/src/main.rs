@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
-use reeve_runtime::IdentityRegistry;
+use reeve_runtime::{AuditLog, IdentityRegistry};
 use reeve_types::IdentityId;
 
 mod adapter;
@@ -52,6 +52,14 @@ enum IdentityCommands {
     Enroll,
     /// Print all registered identities.
     List,
+    /// Remove the operator identity, its keychain entry, and append an audit
+    /// record. Requires --confirm to prevent accidental invocation.
+    Unenroll {
+        /// Acknowledge the destructive operation. Without this flag the
+        /// command exits with a reminder message and does nothing.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -86,6 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Identity {
             command: IdentityCommands::List,
         }) => cmd_list(),
+        Some(Commands::Identity {
+            command: IdentityCommands::Unenroll { confirm },
+        }) => cmd_unenroll(confirm),
         Some(Commands::Envelope {
             command: EnvelopeCommands::Sign { to, body },
         }) => cmd_envelope_sign(&to, &body),
@@ -127,6 +138,39 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     let registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
     identity::list(&registry, &mut io::stdout().lock())?;
     Ok(())
+}
+
+fn cmd_unenroll(confirm: bool) -> Result<(), Box<dyn std::error::Error>> {
+    let keychain = keychain::open_platform_keystore()?;
+    run_unenroll(&keychain, confirm)
+}
+
+fn run_unenroll(
+    keychain: &dyn reeve_runtime::OperatorKeyStore,
+    confirm: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = IdentityRegistry::default_data_dir()?;
+    let registry = IdentityRegistry::open(data_dir.clone())?;
+    let audit = AuditLog::open(data_dir)?;
+
+    match identity::unenroll(&registry, keychain, &audit, confirm) {
+        Ok(identity_id) => {
+            writeln!(
+                io::stdout().lock(),
+                "Unenrolled operator identity {identity_id}.",
+            )?;
+            Ok(())
+        }
+        Err(identity::UnenrollError::AuditFailed(err)) => {
+            // Unenrollment succeeded; warn on stderr and exit 0.
+            writeln!(
+                io::stderr().lock(),
+                "warning: audit append failed (unenrollment already complete): {err}",
+            )?;
+            Ok(())
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn cmd_envelope_sign(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {

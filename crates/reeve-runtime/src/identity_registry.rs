@@ -228,6 +228,31 @@ impl IdentityRegistry {
         }
     }
 
+    /// Delete the registry entry for `identity_id`. Returns
+    /// `Ok(())` on success, `Err(RegistryError::NotFound { identity_id })`
+    /// if no entry existed, `Err(RegistryError::Io { ... })` on filesystem
+    /// error.
+    ///
+    /// A single `unlink(2)` is atomic at the inode level: the file either
+    /// exists in the directory or it does not; no partial state is possible.
+    /// The trailing audit append in `unenroll()` records the event for
+    /// forensic purposes. If the audit append fails after this deletion
+    /// succeeds, the operator's identity is structurally gone but the event
+    /// is unrecorded — `unenroll()` surfaces this as
+    /// `UnenrollError::AuditFailed` and the CLI exits 0 with a stderr
+    /// warning. This gap is deliberate: the destructive operation completed;
+    /// only the forensic record is missing.
+    pub fn delete(&self, identity_id: IdentityId) -> Result<(), RegistryError> {
+        let path = self.toml_path(identity_id);
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                Err(RegistryError::NotFound { identity_id })
+            }
+            Err(source) => Err(RegistryError::Io { path, source }),
+        }
+    }
+
     /// Returns the canonical TOML file path for `identity_id` under this
     /// registry. Useful for diagnostic messages that point operators at a
     /// specific file.
@@ -252,6 +277,12 @@ impl IdentityRegistry {
 pub enum RegistryError {
     /// Underlying filesystem error (open, read, write, rename, mkdir).
     Io { path: PathBuf, source: io::Error },
+
+    /// No registry file exists for the given identity. Returned by
+    /// [`IdentityRegistry::delete`] when the target file is not found.
+    /// Callers that want idempotent removal can swallow this variant;
+    /// all other errors should propagate.
+    NotFound { identity_id: IdentityId },
 
     /// Failed to deserialize a registry file from TOML.
     Parse {
@@ -430,6 +461,7 @@ impl std::fmt::Display for RegistryError {
                 "registry file for identity {identity_id} has {count} [[keys]] entries; v1 requires exactly one",
             ),
             Self::MissingHome
+            | Self::NotFound { .. }
             | Self::SymlinkedDataDir { .. }
             | Self::SymlinkedRegistryFile { .. }
             | Self::NotARegularFile { .. }
@@ -446,6 +478,9 @@ impl std::fmt::Display for RegistryError {
 /// floor; the catch-all arm there delegates here.
 fn fmt_short(err: &RegistryError, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
     match err {
+        RegistryError::NotFound { identity_id } => {
+            write!(f, "registry has no entry for identity {identity_id}")
+        }
         RegistryError::MissingHome => {
             f.write_str("registry default_data_dir requires HOME or XDG_DATA_HOME to be set")
         }
@@ -516,7 +551,8 @@ impl std::error::Error for RegistryError {
             Self::InvalidFilename { source, .. } => Some(source),
             Self::InvalidIdentityId { source, .. } => Some(source),
             Self::NonUtf8Body { source, .. } => Some(source),
-            Self::FilenameMismatch { .. }
+            Self::NotFound { .. }
+            | Self::FilenameMismatch { .. }
             | Self::FileTooLargeStat { .. }
             | Self::FileTooLargeRead { .. }
             | Self::SymlinkedDataDir { .. }
@@ -1322,6 +1358,36 @@ valid_from = "2026-06-01T00:00:00Z"
             matches!(err, RegistryError::NonUtf8Body { .. }),
             "expected NonUtf8Body, got {err:?}",
         );
+    }
+
+    // R_delete_round_trip: write an identity, delete it, lookup → None,
+    // list → empty.
+    #[test]
+    fn delete_round_trip() {
+        let dir = tempdir().unwrap();
+        chmod_secure(dir.path());
+        let registry = IdentityRegistry::open(dir.path().to_path_buf()).unwrap();
+        let stored = fresh_stored_operator("Ada");
+        registry.write(&stored).unwrap();
+        registry.delete(stored.identity.identity_id).unwrap();
+        let looked_up = registry.lookup(stored.identity.identity_id).unwrap();
+        assert!(looked_up.is_none(), "lookup after delete must return None");
+        let listed = registry.list().unwrap();
+        assert!(listed.is_empty(), "list after delete must be empty");
+    }
+
+    // R_delete_not_found: delete an ID that was never written → NotFound.
+    #[test]
+    fn delete_not_found() {
+        let dir = tempdir().unwrap();
+        chmod_secure(dir.path());
+        let registry = IdentityRegistry::open(dir.path().to_path_buf()).unwrap();
+        let id = IdentityId::new().unwrap();
+        let err = registry.delete(id).unwrap_err();
+        let RegistryError::NotFound { identity_id } = err else {
+            panic!("expected NotFound, got {err:?}");
+        };
+        assert_eq!(identity_id, id);
     }
 
     #[test]

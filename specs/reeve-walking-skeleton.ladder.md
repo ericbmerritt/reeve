@@ -149,7 +149,7 @@ The model adapter framework and first concrete adapter. Per domain-model § Adap
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| 🟡 in-progress  | 2026-05-06 |            |
 
 Tags: runtime
 

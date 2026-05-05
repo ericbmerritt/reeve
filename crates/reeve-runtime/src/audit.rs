@@ -80,6 +80,17 @@ pub enum AuditEvent {
         at: OffsetDateTime,
     },
 
+    /// An operator identity was removed via `reeve identity unenroll`.
+    /// The corresponding `IdentityEnrolled` record remains in the log
+    /// (audit is append-only); the unenrollment record marks the end
+    /// of the prior identity's effective lifetime.
+    #[serde(rename = "identity.unenrolled")]
+    IdentityUnenrolled {
+        identity_id: IdentityId,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
     /// A message was verified and durably delivered to an agent's inbox.
     #[serde(rename = "transport.delivered")]
     TransportDelivered {
@@ -641,6 +652,10 @@ mod tests {
                 display_name: "A".repeat(255),
                 at: at(),
             },
+            AuditEvent::IdentityUnenrolled {
+                identity_id,
+                at: at(),
+            },
             AuditEvent::TransportDelivered {
                 sender_id,
                 sender_key_id,
@@ -679,6 +694,24 @@ mod tests {
                 PIPE_BUF,
             );
         }
+    }
+
+    // A_unenrolled_kind_token: IdentityUnenrolled serializes with
+    // kind == "identity.unenrolled" and exactly the fields identity_id and at.
+    #[test]
+    fn unenrolled_kind_token() {
+        let identity_id = IdentityId::new().unwrap();
+        let event = AuditEvent::IdentityUnenrolled {
+            identity_id,
+            at: at(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["kind"], "identity.unenrolled");
+        assert_eq!(json["identity_id"], identity_id.to_string());
+        assert!(json["at"].is_string(), "at field must be a string");
+        // No other fields beyond kind, identity_id, at.
+        let obj = json.as_object().unwrap();
+        assert_eq!(obj.len(), 3, "expected exactly kind + identity_id + at");
     }
 
     // A11: TransportQuarantine with empty reason round-trips cleanly.
