@@ -822,6 +822,7 @@ dependencies = [
  "secret-service",
  "security-framework",
  "serde",
+ "serde_json",
  "tempfile",
  "time",
  "toml",

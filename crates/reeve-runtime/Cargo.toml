@@ -18,7 +18,9 @@ reeve-transport = { workspace = true }
 reeve-adapter = { workspace = true }
 
 serde = { workspace = true }
+serde_json = { workspace = true }
 tempfile = { workspace = true }
+time = { workspace = true }
 toml = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
