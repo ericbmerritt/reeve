@@ -14,3 +14,8 @@ workspace = true
 
 [dependencies]
 reeve-types = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+time = { workspace = true }
+uuid = { workspace = true }
