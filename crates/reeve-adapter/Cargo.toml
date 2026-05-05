@@ -13,4 +13,9 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
-reeve-types = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+
+
+[dev-dependencies]
+tokio = { workspace = true }

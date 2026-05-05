@@ -12,7 +12,9 @@ authors = ["Eric Merritt <eric@merritt.tech>"]
 publish = false
 
 [workspace.dependencies]
+async-trait = { version = "0.1" }
 clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
 
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 notify = { version = "8" }
