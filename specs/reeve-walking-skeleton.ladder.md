@@ -57,7 +57,7 @@ First-class identity primitives and operator enrollment, the foundation under ev
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| 🟡 in-progress  | 2026-05-05 |            |
+| ✅ complete     | 2026-05-05 | 2026-05-05 |
 
 Tags: security, transport, crypto
 
@@ -86,7 +86,7 @@ The signed envelope is the message format every Reeve participant speaks. Schema
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| 🟡 in-progress  | 2026-05-05 |            |
 
 Tags: transport, security
 
