@@ -14,7 +14,9 @@ publish = false
 [workspace.dependencies]
 async-trait = { version = "0.1" }
 clap = { version = "4", features = ["derive"] }
-tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
+secrecy = { version = "0.10" }
 
 base64 = { version = "0.22", default-features = false, features = ["std"] }
 notify = { version = "8" }

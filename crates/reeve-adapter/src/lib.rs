@@ -13,8 +13,18 @@
 //! [`AdapterError`] with a structured reason.
 //!
 //! The types in this crate are Reeve's *internal* representation. Concrete
-//! adapter implementations (Task 16+) translate between these types and the
-//! wire format of a specific provider.
+//! adapter implementations translate between these types and the wire format of
+//! a specific provider.
+//!
+//! # Adapters
+//!
+//! - [`ClaudeOpus47`] — `claude-opus-4-7@anthropic-direct`: Anthropic's
+//!   Messages API with rustls TLS, no system OpenSSL dependency.
+
+mod anthropic;
+mod claude_opus_47;
+
+pub use claude_opus_47::ClaudeOpus47;
 
 use std::collections::HashSet;
 use std::fmt;
@@ -72,11 +82,19 @@ pub struct Capabilities {
     set: HashSet<Capability>,
 }
 
-fn is_set_well_formed(set: &HashSet<Capability>) -> bool {
+/// Check implication invariants for a capability set, returning the first
+/// missing prerequisite found, or `None` if the set is well-formed.
+///
+/// Currently enforced: `ParallelToolCalls` ⇒ `ToolCalling`.
+///
+/// Using `Option<Capability>` rather than `bool` ensures that if a second
+/// invariant lands, `try_with` automatically reports the correct missing
+/// capability rather than hard-coding `Capability::ToolCalling`.
+fn first_violation(set: &HashSet<Capability>) -> Option<Capability> {
     if set.contains(&Capability::ParallelToolCalls) && !set.contains(&Capability::ToolCalling) {
-        return false;
+        return Some(Capability::ToolCalling);
     }
-    true
+    None
 }
 
 /// Error returned when a [`Capabilities`] implication invariant is violated.
@@ -139,10 +157,10 @@ impl Capabilities {
     pub fn try_with(mut self, cap: Capability) -> Result<Self, CapabilityViolation> {
         let mut candidate = self.set.clone();
         candidate.insert(cap);
-        if !is_set_well_formed(&candidate) {
+        if let Some(missing) = first_violation(&candidate) {
             return Err(CapabilityViolation {
                 adding: cap,
-                missing: Capability::ToolCalling,
+                missing,
             });
         }
         self.set = candidate;
@@ -154,7 +172,7 @@ impl Capabilities {
     /// Currently enforced: `ParallelToolCalls` ⇒ `ToolCalling`.
     #[must_use]
     pub fn is_well_formed(&self) -> bool {
-        is_set_well_formed(&self.set)
+        first_violation(&self.set).is_none()
     }
 
     /// Returns `true` if the given [`Capability`] is in this set.
@@ -618,7 +636,6 @@ pub trait Adapter: Send + Sync {
     /// for the lifetime of the adapter instance. Two adapter instances
     /// returning the same `id()` are interchangeable from the runtime
     /// registry's perspective.
-    ///
     // TODO(phase-5/6): replace with a typed AdapterId { model: String,
     // route: String } when the registry lands. The current "model@route"
     // string convention is unenforced and the @ delimiter is ambiguous

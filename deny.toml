@@ -13,6 +13,10 @@ allow = [
   "Unicode-3.0",
   "Unlicense",
   "Zlib",
+  # webpki-roots (via reqwest → hyper-rustls → rustls) ships Mozilla's root
+  # certificate bundle. CDLA-Permissive-2.0 is a permissive data license; it
+  # imposes no distribution or patent restrictions on software use.
+  "CDLA-Permissive-2.0",
 ]
 confidence-threshold = 0.8
 unused-allowed-license = "allow"
@@ -64,6 +68,30 @@ skip = [
   # consumers and the version gap is not within our control.
   { name = "windows-sys", version = "=0.60.2" },
   { name = "windows-sys", version = "=0.61.2" },
+  # reqwest → rustls → ring uses windows-sys 0.52 (via its own windows-targets
+  # 0.52 tree). The notify/mio tree uses windows-sys 0.60/0.61 which pulls
+  # windows-targets 0.53. The two windows-sys trees vendor disjoint
+  # windows-targets sub-crates and cannot be unified without coordinated
+  # upstream upgrades.
+  { name = "windows-sys", version = "=0.52.0" },
+  { name = "windows-targets", version = "=0.52.6" },
+  { name = "windows-targets", version = "=0.53.5" },
+  { name = "windows_aarch64_gnullvm", version = "=0.52.6" },
+  { name = "windows_aarch64_gnullvm", version = "=0.53.1" },
+  { name = "windows_aarch64_msvc", version = "=0.52.6" },
+  { name = "windows_aarch64_msvc", version = "=0.53.1" },
+  { name = "windows_i686_gnu", version = "=0.52.6" },
+  { name = "windows_i686_gnu", version = "=0.53.1" },
+  { name = "windows_i686_gnullvm", version = "=0.52.6" },
+  { name = "windows_i686_gnullvm", version = "=0.53.1" },
+  { name = "windows_i686_msvc", version = "=0.52.6" },
+  { name = "windows_i686_msvc", version = "=0.53.1" },
+  { name = "windows_x86_64_gnu", version = "=0.52.6" },
+  { name = "windows_x86_64_gnu", version = "=0.53.1" },
+  { name = "windows_x86_64_gnullvm", version = "=0.52.6" },
+  { name = "windows_x86_64_gnullvm", version = "=0.53.1" },
+  { name = "windows_x86_64_msvc", version = "=0.52.6" },
+  { name = "windows_x86_64_msvc", version = "=0.53.1" },
 ]
 
 [sources]
