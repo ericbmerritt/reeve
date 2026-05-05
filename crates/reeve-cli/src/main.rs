@@ -1,15 +1,18 @@
 //! Reeve binary entry point.
 
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use reeve_runtime::IdentityRegistry;
 use reeve_types::IdentityId;
 
+mod adapter;
 mod envelope;
 mod identity;
+mod keychain;
 mod output;
+mod prompt;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -33,6 +36,11 @@ enum Commands {
     Envelope {
         #[command(subcommand)]
         command: EnvelopeCommands,
+    },
+    /// Manage model adapters: store API keys and test end-to-end connectivity.
+    Adapter {
+        #[command(subcommand)]
+        command: adapter::AdapterSubcommand,
     },
 }
 
@@ -84,18 +92,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Envelope {
             command: EnvelopeCommands::Verify { file },
         }) => cmd_envelope_verify(&file),
+        Some(Commands::Adapter { command }) => adapter::dispatch(command),
     }
 }
 
-#[cfg(target_os = "macos")]
 fn cmd_enroll() -> Result<(), Box<dyn std::error::Error>> {
-    let keychain = reeve_runtime::keychain::macos::MacOsKeyStore::new();
-    run_enroll(&keychain)
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn cmd_enroll() -> Result<(), Box<dyn std::error::Error>> {
-    let keychain = reeve_runtime::keychain::linux::SecretServiceKeyStore::connect()?;
+    let keychain = keychain::open_platform_keystore()?;
     run_enroll(&keychain)
 }
 
@@ -127,15 +129,8 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
 fn cmd_envelope_sign(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let keychain = reeve_runtime::keychain::macos::MacOsKeyStore::new();
-    run_envelope_sign(&keychain, to, body)
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn cmd_envelope_sign(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let keychain = reeve_runtime::keychain::linux::SecretServiceKeyStore::connect()?;
+    let keychain = keychain::open_platform_keystore()?;
     run_envelope_sign(&keychain, to, body)
 }
 
@@ -169,19 +164,5 @@ fn parse_identity_id(s: &str) -> Result<IdentityId, Box<dyn std::error::Error>> 
 }
 
 fn prompt_display_name() -> Result<String, Box<dyn std::error::Error>> {
-    // Prompts go to stderr per UNIX convention; only results go to stdout.
-    let mut stderr = io::stderr().lock();
-    write!(stderr, "Display name: ")?;
-    stderr.flush()?;
-    // Drop stderr before acquiring stdin.lock to avoid lock ordering issues on Windows.
-    drop(stderr);
-
-    let stdin = io::stdin();
-    let mut line = String::new();
-    stdin.lock().read_line(&mut line)?;
-    let name = line.trim().to_owned();
-    if name.is_empty() {
-        return Err("display name must not be empty".into());
-    }
-    Ok(name)
+    prompt::prompt_one_line("Display name: ", "display name must not be empty")
 }
