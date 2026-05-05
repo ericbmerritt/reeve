@@ -18,9 +18,14 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
+rand_core = { workspace = true }
 reeve-runtime = { workspace = true }
-reeve-tui = { workspace = true }
+reeve-transport = { workspace = true }
 reeve-types = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
+time = { workspace = true }
+uuid = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

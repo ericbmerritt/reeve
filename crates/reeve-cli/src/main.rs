@@ -1,10 +1,13 @@
 //! Reeve binary entry point.
 
 use std::io::{self, BufRead, Write};
+use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
 use reeve_runtime::IdentityRegistry;
+use reeve_types::IdentityId;
 
+mod envelope;
 mod identity;
 mod output;
 
@@ -26,6 +29,11 @@ enum Commands {
         #[command(subcommand)]
         command: IdentityCommands,
     },
+    /// Debug subcommands for signed message envelopes.
+    Envelope {
+        #[command(subcommand)]
+        command: EnvelopeCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -38,10 +46,31 @@ enum IdentityCommands {
     List,
 }
 
+#[derive(Subcommand, Debug)]
+enum EnvelopeCommands {
+    /// Sign a new envelope addressed to a recipient and write JSON to stdout.
+    Sign {
+        /// Recipient identity ID (`UUIDv7` string). Use `reeve identity list`
+        /// to find identity IDs.
+        #[arg(long)]
+        to: String,
+        /// UTF-8 text to use as the envelope payload. Note: this value is
+        /// visible in process listings on Unix.
+        #[arg(long)]
+        body: String,
+    },
+    /// Verify an envelope JSON file and print confirmation to stdout.
+    Verify {
+        /// Path to the envelope JSON file.
+        file: PathBuf,
+    },
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        // No subcommand: exit 0; clap's --help handles help requests.
         None => Ok(()),
         Some(Commands::Identity {
             command: IdentityCommands::Enroll,
@@ -49,6 +78,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Identity {
             command: IdentityCommands::List,
         }) => cmd_list(),
+        Some(Commands::Envelope {
+            command: EnvelopeCommands::Sign { to, body },
+        }) => cmd_envelope_sign(&to, &body),
+        Some(Commands::Envelope {
+            command: EnvelopeCommands::Verify { file },
+        }) => cmd_envelope_verify(&file),
     }
 }
 
@@ -90,6 +125,47 @@ fn cmd_list() -> Result<(), Box<dyn std::error::Error>> {
     let registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
     identity::list(&registry, &mut io::stdout().lock())?;
     Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_envelope_sign(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let keychain = reeve_runtime::keychain::macos::MacOsKeyStore::new();
+    run_envelope_sign(&keychain, to, body)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn cmd_envelope_sign(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let keychain = reeve_runtime::keychain::linux::SecretServiceKeyStore::connect()?;
+    run_envelope_sign(&keychain, to, body)
+}
+
+fn run_envelope_sign(
+    keychain: &dyn reeve_runtime::OperatorKeyStore,
+    to: &str,
+    body: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let recipient_id = parse_identity_id(to)?;
+    let registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
+    envelope::sign(
+        &registry,
+        keychain,
+        recipient_id,
+        body.as_bytes(),
+        &mut io::stdout().lock(),
+    )?;
+    Ok(())
+}
+
+fn cmd_envelope_verify(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
+    envelope::verify_from_path(&registry, file, &mut io::stdout().lock())?;
+    Ok(())
+}
+
+/// Parse the `--to` argv value into a typed [`IdentityId`] at the CLI boundary.
+fn parse_identity_id(s: &str) -> Result<IdentityId, Box<dyn std::error::Error>> {
+    let uuid: uuid::Uuid = s.parse()?;
+    Ok(IdentityId::try_from(uuid)?)
 }
 
 fn prompt_display_name() -> Result<String, Box<dyn std::error::Error>> {

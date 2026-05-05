@@ -797,10 +797,15 @@ name = "reeve-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "rand_core",
  "reeve-runtime",
- "reeve-tui",
+ "reeve-transport",
  "reeve-types",
+ "serde_json",
+ "sha2",
  "tempfile",
+ "time",
+ "uuid",
  "zeroize",
 ]
 
