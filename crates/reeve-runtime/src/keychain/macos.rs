@@ -1,11 +1,22 @@
-//! macOS implementation of [`OperatorKeyStore`] backed by Apple's
-//! `Security.framework` generic-password API.
+//! macOS implementation of [`OperatorKeyStore`] and [`OperatorSecretStore`]
+//! backed by Apple's `Security.framework` generic-password API.
 //!
 //! On macOS the operator's per-user login keychain is the credential vault.
 //! Each entry is a generic-password keyed on `(service, account)` where
-//! `service` is [`KEYCHAIN_SERVICE`] (`"reeve"`) and `account` is the
-//! hyphenated UUID string for the identity. The 32-byte ed25519 seed is
-//! stored as the raw password bytes so no encoding round-trip is required.
+//! `service` is [`KEYCHAIN_SERVICE`] (`"reeve"`).
+//!
+//! Identity entries use `account = <uuid>` (the hyphenated `IdentityId` string).
+//! The 32-byte ed25519 seed is stored as the raw password bytes so no encoding
+//! round-trip is required.
+//!
+//! ## Namespace separation
+//!
+//! macOS uses a `(service, account)` flat namespace. Identity seeds use
+//! `account = <uuid>`; labeled secrets use `account = secret:<label>`.
+//! The `"secret:"` prefix prevents a label that happens to be a UUID-shaped
+//! string from colliding with an identity entry.
+//!
+//! ## Zeroize discipline
 //!
 //! The `security-framework` crate's password APIs return owned `Vec<u8>` for
 //! retrieved data; this module wraps the returned vec in [`Zeroizing`] so the
@@ -16,12 +27,13 @@
 #![cfg(target_os = "macos")]
 
 use reeve_types::IdentityId;
+use secrecy::SecretString;
 use security_framework::passwords::{
     delete_generic_password, get_generic_password, set_generic_password,
 };
 use zeroize::Zeroizing;
 
-use super::{KeychainError, OperatorKeyStore, KEYCHAIN_SERVICE, SEED_LEN};
+use super::{KeychainError, OperatorKeyStore, OperatorSecretStore, KEYCHAIN_SERVICE, SEED_LEN};
 
 /// `ERR_SEC_ITEM_NOT_FOUND` from `Security/SecBase.h`. Hardcoded here so this
 /// crate does not need a direct dependency on `security-framework-sys` for
@@ -58,6 +70,52 @@ impl MacOsKeyStore {
             service: service.into(),
         }
     }
+
+    /// Map the label to its namespaced keychain account string.
+    ///
+    /// macOS uses a `(service, account)` flat namespace. Identity seeds
+    /// use `account = <uuid>`; labeled secrets use `account = secret:<label>`.
+    /// The `"secret:"` prefix prevents a label that happens to be a UUID-shape
+    /// string from colliding with an identity entry.
+    fn account_for_label(label: &str) -> String {
+        format!("secret:{label}")
+    }
+
+    /// Thin wrapper so identity and secret paths share the same
+    /// `set_generic_password` call site without duplicating error mapping.
+    fn store_password_raw(
+        &self,
+        account: &str,
+        bytes: &[u8],
+    ) -> Result<(), security_framework::base::Error> {
+        set_generic_password(&self.service, account, bytes)
+    }
+
+    /// Retrieve raw bytes for `account`. Returns `Ok(None)` when
+    /// `ERR_SEC_ITEM_NOT_FOUND` is returned by the framework.
+    fn get_password_raw(
+        &self,
+        account: &str,
+    ) -> Result<Option<Zeroizing<Vec<u8>>>, security_framework::base::Error> {
+        match get_generic_password(&self.service, account) {
+            Ok(bytes) => Ok(Some(Zeroizing::new(bytes))),
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Delete `account` from the keychain. Returns `Ok(true)` if an entry
+    /// was deleted, `Ok(false)` if no entry existed (mapping
+    /// `ERR_SEC_ITEM_NOT_FOUND` to a successful absence rather than an
+    /// error so callers can distinguish "deleted" from "wasn't there"
+    /// without a nested `match`).
+    fn delete_password_raw(&self, account: &str) -> Result<bool, security_framework::base::Error> {
+        match delete_generic_password(&self.service, account) {
+            Ok(()) => Ok(true),
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
 
 // Cannot use #[derive(Default)]: the empty-string default for String is not
@@ -74,44 +132,95 @@ impl OperatorKeyStore for MacOsKeyStore {
         identity_id: IdentityId,
         seed: &Zeroizing<[u8; SEED_LEN]>,
     ) -> Result<(), KeychainError> {
-        set_generic_password(&self.service, &identity_id.to_string(), seed.as_slice()).map_err(
-            |source| KeychainError::MacOsKeychain {
+        self.store_password_raw(&identity_id.to_string(), seed.as_slice())
+            .map_err(|source| KeychainError::MacOsKeychain {
                 identity_id,
                 source,
-            },
-        )
+            })
     }
 
     fn retrieve(
         &self,
         identity_id: IdentityId,
     ) -> Result<Zeroizing<[u8; SEED_LEN]>, KeychainError> {
-        match get_generic_password(&self.service, &identity_id.to_string()) {
-            Ok(bytes) => {
-                // Wiped on drop even if subsequent decoding fails.
-                let bytes = Zeroizing::new(bytes);
-                super::decode_seed_bytes(identity_id, &bytes)
-            }
-            Err(source) if source.code() == ERR_SEC_ITEM_NOT_FOUND => {
-                Err(KeychainError::NotFound { identity_id })
-            }
-            Err(source) => Err(KeychainError::MacOsKeychain {
+        match self
+            .get_password_raw(&identity_id.to_string())
+            .map_err(|source| KeychainError::MacOsKeychain {
                 identity_id,
                 source,
-            }),
+            })? {
+            Some(bytes) => super::decode_seed_bytes(identity_id, &bytes),
+            None => Err(KeychainError::NotFound { identity_id }),
         }
     }
 
     fn delete(&self, identity_id: IdentityId) -> Result<(), KeychainError> {
-        match delete_generic_password(&self.service, &identity_id.to_string()) {
-            Ok(()) => Ok(()),
-            Err(source) if source.code() == ERR_SEC_ITEM_NOT_FOUND => {
-                Err(KeychainError::NotFound { identity_id })
-            }
-            Err(source) => Err(KeychainError::MacOsKeychain {
+        let deleted = self
+            .delete_password_raw(&identity_id.to_string())
+            .map_err(|source| KeychainError::MacOsKeychain {
                 identity_id,
                 source,
+            })?;
+        if deleted {
+            Ok(())
+        } else {
+            Err(KeychainError::NotFound { identity_id })
+        }
+    }
+}
+
+impl OperatorSecretStore for MacOsKeyStore {
+    fn store_secret(&self, label: &str, secret: SecretString) -> Result<(), KeychainError> {
+        use secrecy::ExposeSecret as _;
+        let account = Self::account_for_label(label);
+        self.store_password_raw(&account, secret.expose_secret().as_bytes())
+            .map_err(|source| KeychainError::MacOsKeychainForLabel {
+                label: label.to_owned(),
+                source,
+            })
+    }
+
+    fn retrieve_secret(&self, label: &str) -> Result<SecretString, KeychainError> {
+        let account = Self::account_for_label(label);
+        match self.get_password_raw(&account).map_err(|source| {
+            KeychainError::MacOsKeychainForLabel {
+                label: label.to_owned(),
+                source,
+            }
+        })? {
+            None => Err(KeychainError::SecretNotFound {
+                label: label.to_owned(),
             }),
+            Some(bytes) => {
+                // Use from_utf8 (borrow, not consume) so `bytes` stays in
+                // scope for the Zeroizing drop to wipe after `to_owned()`
+                // produces the heap String for SecretString. One small
+                // intermediate String allocation is unavoidable without unsafe;
+                // this is the same trade-off secrecy uses internally.
+                let s = std::str::from_utf8(&bytes).map_err(|_| {
+                    KeychainError::InvalidSecretEncoding {
+                        label: label.to_owned(),
+                    }
+                })?;
+                Ok(SecretString::from(s.to_owned()))
+            }
+        }
+    }
+
+    fn delete_secret(&self, label: &str) -> Result<(), KeychainError> {
+        let account = Self::account_for_label(label);
+        let deleted = self.delete_password_raw(&account).map_err(|source| {
+            KeychainError::MacOsKeychainForLabel {
+                label: label.to_owned(),
+                source,
+            }
+        })?;
+        if deleted {
+            Ok(())
+        } else {
+            Err(KeychainError::SecretNotFound {
+                label: label.to_owned(),
+            })
         }
     }
 }
@@ -129,7 +238,10 @@ mod tests {
 
     use super::*;
 
-    use crate::keychain::test_helpers::{live_tests_enabled, unique_service, DeleteOnDrop};
+    use crate::keychain::test_helpers::run_secret_contract_suite;
+    use crate::keychain::test_helpers::{
+        live_tests_enabled, unique_service, DeleteOnDrop, SecretDeleteOnDrop,
+    };
     use crate::keychain::tests::run_contract_suite;
 
     #[test]
@@ -222,5 +334,55 @@ mod tests {
             ),
             "expected InvalidSeedLength {{ len: 7 }}, got {err:?}",
         );
+    }
+
+    #[test]
+    fn live_secret_contract_suite_when_enabled() {
+        if !live_tests_enabled() {
+            return;
+        }
+        let store = MacOsKeyStore::with_service(unique_service("secret_contract"));
+        run_secret_contract_suite(&store);
+    }
+
+    /// Verifies that a label-keyed entry does not collide with an identity
+    /// entry even when the label has the same textual shape as a UUID.
+    #[test]
+    fn live_secret_label_uuid_no_collision_when_enabled() {
+        use secrecy::ExposeSecret as _;
+
+        if !live_tests_enabled() {
+            return;
+        }
+        let store = MacOsKeyStore::with_service(unique_service("namespace"));
+        let id = IdentityId::new().unwrap();
+        // Use the UUID string as the secret label — the worst-case collision.
+        let uuid_label = id.to_string();
+
+        let seed = Zeroizing::new([0x77_u8; SEED_LEN]);
+        store.store(id, &seed).unwrap();
+        let _id_guard = DeleteOnDrop {
+            store: &store,
+            identity_id: id,
+        };
+
+        store
+            .store_secret(
+                &uuid_label,
+                SecretString::from("collision-probe".to_owned()),
+            )
+            .unwrap();
+        let _secret_guard = SecretDeleteOnDrop {
+            store: &store,
+            label: &uuid_label,
+        };
+
+        // Identity entry unaffected.
+        let loaded_seed = store.retrieve(id).unwrap();
+        assert_eq!(*loaded_seed, *seed);
+
+        // Secret entry is the string, not the seed bytes.
+        let loaded_secret = store.retrieve_secret(&uuid_label).unwrap();
+        assert_eq!(loaded_secret.expose_secret(), "collision-probe");
     }
 }

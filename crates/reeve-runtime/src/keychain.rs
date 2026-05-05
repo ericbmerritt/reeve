@@ -1,6 +1,6 @@
-//! OS keychain integration for operator private keys per
-//! `specs/reeve-walking-skeleton.ladder.md` phase 2 task 3 and
-//! `specs/reeve-transport-security.md` § Session Authentication.
+//! OS keychain integration for operator private keys and labeled secrets per
+//! `specs/reeve-walking-skeleton.ladder.md` phase 2 task 3 and phase 5 task 3,
+//! and `specs/reeve-transport-security.md` § Session Authentication.
 //!
 //! Domain-model invariant 5 says operator and external private keys are never
 //! stored in the agent filesystem tree. The OS credential store is *not* the
@@ -8,8 +8,14 @@
 //! the only durable home for private key bytes between sessions. This module
 //! is the single place those bytes round-trip through.
 //!
-//! The public surface is the [`OperatorKeyStore`] trait. Three implementations
-//! ship in this crate:
+//! The public surface is two traits. All three backends implement both:
+//!
+//! - [`OperatorKeyStore`] — round-trips fixed-length ed25519 seed bytes,
+//!   keyed by [`IdentityId`].
+//! - [`OperatorSecretStore`] — stores and retrieves opaque, string-shaped
+//!   secrets (API keys, OAuth tokens, etc.), keyed by a human-readable label.
+//!
+//! Three implementations ship in this crate:
 //!
 //! - [`macos::MacOsKeyStore`] — backed by Apple's Security.framework generic
 //!   password API. Active on `target_os = "macos"`.
@@ -22,9 +28,9 @@
 //!   tests; not suitable for production because seeds are lost on process
 //!   exit.
 //!
-//! The trait is the public type so callers in later phases can take
-//! `dyn OperatorKeyStore` and let tests inject the in-memory backend without
-//! `cfg(test)` gymnastics.
+//! The traits are the public types so callers in later phases can take
+//! `dyn OperatorKeyStore` or `dyn OperatorSecretStore` and let tests inject
+//! the in-memory backend without `cfg(test)` gymnastics.
 //!
 //! ## Service name
 //!
@@ -54,6 +60,26 @@ use zeroize::Zeroizing;
 pub mod linux;
 pub mod macos;
 pub mod memory;
+
+/// Well-known keychain entry labels used by Reeve subsystems.
+///
+/// Lives in `reeve-runtime` (not `reeve-adapter`) because the keychain
+/// abstraction lives here; the adapter crate stays free of OS-keyring
+/// dependencies. The CLI (Task 18) reads via `keychain.retrieve_secret(
+/// labels::ANTHROPIC_API_KEY)` and passes the `SecretString` to the
+/// adapter's constructor.
+pub mod labels {
+    /// Label under which the Anthropic API key is stored.
+    ///
+    /// The schema `reeve-{provider}-api-key` makes labels operator-readable
+    /// in macOS Keychain Access UI and gnome-keyring listings while
+    /// remaining unambiguous about provenance. Future provider keys
+    /// follow the same shape (e.g., `reeve-openai-api-key`,
+    /// `reeve-openrouter-api-key`).
+    ///
+    /// See `specs/reeve-walking-skeleton.ladder.md` Phase 5.
+    pub const ANTHROPIC_API_KEY: &str = "reeve-anthropic-api-key";
+}
 
 /// Service name used for every reeve keychain entry. The macOS generic-
 /// password `service` field and the Secret Service `service` attribute both
@@ -99,6 +125,58 @@ pub trait OperatorKeyStore: Send + Sync {
     fn delete(&self, identity_id: IdentityId) -> Result<(), KeychainError>;
 }
 
+/// Stores and retrieves opaque, string-shaped secrets in the OS keychain
+/// keyed by a label (not an [`IdentityId`]).
+///
+/// Distinct from [`OperatorKeyStore`] which handles fixed-length seed
+/// bytes for ed25519 identities. Use this trait for credentials whose
+/// shape is provider-defined (API keys, OAuth tokens, etc.).
+///
+/// # Security
+///
+/// Implementations MUST hold returned secrets in [`secrecy::SecretString`]
+/// (which zeroizes the inner allocation on drop) throughout the call.
+/// Implementations MUST NOT log, display, or debug-format the secret
+/// value or the label-bound metadata that could correlate users to
+/// services.
+///
+/// # Label discipline
+///
+/// `label` SHOULD be a static string constant from [`labels`], not
+/// runtime-derived input. Labels appear in:
+/// - macOS Keychain Access UI (account field)
+/// - gnome-keyring / `KWallet` UI (item label attribute)
+/// - error messages (`SecretNotFound`, `MacOsKeychainForLabel`,
+///   `SecretServiceForLabel`) which propagate via `Display` and may
+///   reach structured logs
+///
+/// On Linux (Secret Service backend), `label` is also embedded verbatim
+/// into the human-readable item label as `"reeve secret for {label}"`.
+/// This is permanently inscribed in the desktop keyring UI
+/// (gnome-keyring, `KWallet`) until the entry is deleted.
+/// Caller-supplied dynamic labels will leave a permanent UI trace.
+///
+/// Operator-supplied or tool-derived labels expose internal naming
+/// to anyone with same-UID access; pin them at compile time.
+pub trait OperatorSecretStore: Send + Sync {
+    /// Store `secret` under `label`. Replaces any existing entry under the
+    /// same label.
+    fn store_secret(&self, label: &str, secret: secrecy::SecretString)
+        -> Result<(), KeychainError>;
+
+    /// Retrieve the secret stored under `label`.
+    ///
+    /// Returns [`KeychainError::SecretNotFound`] if no entry exists for the
+    /// label. Returns [`KeychainError::InvalidSecretEncoding`] if an entry
+    /// exists but its bytes are not valid UTF-8 (indicates corruption or an
+    /// entry written by a foreign tool).
+    fn retrieve_secret(&self, label: &str) -> Result<secrecy::SecretString, KeychainError>;
+
+    /// Delete the entry under `label`. Returns
+    /// [`KeychainError::SecretNotFound`] if no entry existed.
+    fn delete_secret(&self, label: &str) -> Result<(), KeychainError>;
+}
+
 /// Errors surfaced by the operator key store.
 ///
 /// Variants are typed and platform-gated where the underlying error type is
@@ -112,6 +190,21 @@ pub enum KeychainError {
     /// No entry for the given identity. Returned by both
     /// [`OperatorKeyStore::retrieve`] and [`OperatorKeyStore::delete`].
     NotFound { identity_id: IdentityId },
+
+    /// No keychain entry for the given label. Returned by both
+    /// [`OperatorSecretStore::retrieve_secret`] and
+    /// [`OperatorSecretStore::delete_secret`].
+    ///
+    /// The `label` field is non-sensitive metadata — it is a service-name
+    /// style identifier (e.g., `"reeve-anthropic-api-key"`), not a user
+    /// account binding, and safe to include in error messages.
+    SecretNotFound { label: String },
+
+    /// Likely indicates an entry written by a foreign tool, an older Reeve
+    /// schema, or out-of-band corruption. Distinguished from
+    /// [`SecretNotFound`](Self::SecretNotFound) so callers do not
+    /// misinterpret corruption as "not yet configured."
+    InvalidSecretEncoding { label: String },
 
     /// A retrieved entry exists but its byte length is not [`SEED_LEN`].
     /// Likely indicates an entry written by a foreign tool, an older Reeve
@@ -140,6 +233,17 @@ pub enum KeychainError {
         source: security_framework::base::Error,
     },
 
+    /// A macOS Security.framework call for a label-keyed secret returned a
+    /// non-`errSecItemNotFound` error. Active on `target_os = "macos"` only.
+    ///
+    /// Parallel to [`MacOsKeychain`](Self::MacOsKeychain) for label-keyed
+    /// operations where no [`IdentityId`] is available.
+    #[cfg(target_os = "macos")]
+    MacOsKeychainForLabel {
+        label: String,
+        source: security_framework::base::Error,
+    },
+
     /// A Secret Service call failed. Active on Unix targets other than
     /// macOS only.
     #[cfg(all(unix, not(target_os = "macos")))]
@@ -153,6 +257,17 @@ pub enum KeychainError {
     /// Unix targets other than macOS only.
     #[cfg(all(unix, not(target_os = "macos")))]
     SecretServiceUnavailable { source: secret_service::Error },
+
+    /// A Secret Service call failed for a label-keyed secret. Active on Unix
+    /// targets other than macOS only.
+    ///
+    /// Parallel to [`SecretService`](Self::SecretService) for label-keyed
+    /// operations where no [`IdentityId`] is available.
+    #[cfg(all(unix, not(target_os = "macos")))]
+    SecretServiceForLabel {
+        label: String,
+        source: secret_service::Error,
+    },
 }
 
 /// Manual `Debug` impl. Avoids leaking D-Bus topology (socket addresses,
@@ -164,6 +279,14 @@ impl std::fmt::Debug for KeychainError {
             Self::NotFound { identity_id } => f
                 .debug_struct("NotFound")
                 .field("identity_id", identity_id)
+                .finish(),
+            Self::SecretNotFound { label } => f
+                .debug_struct("SecretNotFound")
+                .field("label", label)
+                .finish(),
+            Self::InvalidSecretEncoding { label } => f
+                .debug_struct("InvalidSecretEncoding")
+                .field("label", label)
                 .finish(),
             Self::InvalidSeedLength { identity_id, len } => f
                 .debug_struct("InvalidSeedLength")
@@ -181,6 +304,11 @@ impl std::fmt::Debug for KeychainError {
                 .debug_struct("MacOsKeychain")
                 .field("identity_id", identity_id)
                 .finish_non_exhaustive(),
+            #[cfg(target_os = "macos")]
+            Self::MacOsKeychainForLabel { label, .. } => f
+                .debug_struct("MacOsKeychainForLabel")
+                .field("label", label)
+                .finish_non_exhaustive(),
             #[cfg(all(unix, not(target_os = "macos")))]
             Self::SecretService { identity_id, .. } => f
                 .debug_struct("SecretService")
@@ -189,6 +317,11 @@ impl std::fmt::Debug for KeychainError {
             #[cfg(all(unix, not(target_os = "macos")))]
             Self::SecretServiceUnavailable { .. } => f
                 .debug_struct("SecretServiceUnavailable")
+                .finish_non_exhaustive(),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::SecretServiceForLabel { label, .. } => f
+                .debug_struct("SecretServiceForLabel")
+                .field("label", label)
                 .finish_non_exhaustive(),
         }
     }
@@ -199,6 +332,16 @@ impl std::fmt::Display for KeychainError {
         match self {
             Self::NotFound { identity_id } => {
                 write!(f, "no keychain entry for identity {identity_id}")
+            }
+            Self::SecretNotFound { label } => {
+                write!(f, "no keychain entry for label {label}")
+            }
+            Self::InvalidSecretEncoding { label } => {
+                write!(
+                    f,
+                    "keychain entry for label {label} exists but is not valid UTF-8 \
+                     — entry may be corrupt or written by a foreign tool",
+                )
             }
             Self::InvalidSeedLength { identity_id, len } => write!(
                 f,
@@ -214,6 +357,10 @@ impl std::fmt::Display for KeychainError {
             Self::MacOsKeychain { identity_id, .. } => {
                 write!(f, "macOS keychain error for identity {identity_id}")
             }
+            #[cfg(target_os = "macos")]
+            Self::MacOsKeychainForLabel { label, .. } => {
+                write!(f, "macOS keychain error for label {label}")
+            }
             #[cfg(all(unix, not(target_os = "macos")))]
             Self::SecretService { identity_id, .. } => {
                 write!(f, "secret service error for identity {identity_id}")
@@ -222,22 +369,42 @@ impl std::fmt::Display for KeychainError {
             Self::SecretServiceUnavailable { .. } => {
                 write!(f, "secret service unavailable on session bus")
             }
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::SecretServiceForLabel { label, .. } => {
+                write!(f, "secret service error for label {label}")
+            }
         }
     }
 }
 
 impl std::error::Error for KeychainError {
+    // SECURITY-NOTE: Error::source returns the raw platform error
+    // (security_framework::base::Error or secret_service::Error) for
+    // platform-backed variants. Their string forms may include OSStatus
+    // descriptions or D-Bus paths. The Display/Debug impls suppress this,
+    // but consumers that walk error chains programmatically (anyhow {:#},
+    // tracing %, error::Error::source loops) will see the platform detail.
+    // This is the canonical Rust error-chain contract; opting out of
+    // `Error::source` would break interoperability. Operators relying on
+    // log-redaction must apply it at the logging layer.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::NotFound { .. } | Self::InvalidSeedLength { .. } => None,
+            Self::NotFound { .. }
+            | Self::SecretNotFound { .. }
+            | Self::InvalidSecretEncoding { .. }
+            | Self::InvalidSeedLength { .. } => None,
             #[cfg(all(unix, not(target_os = "macos")))]
             Self::DuplicateEntry { .. } => None,
             #[cfg(target_os = "macos")]
             Self::MacOsKeychain { source, .. } => Some(source),
+            #[cfg(target_os = "macos")]
+            Self::MacOsKeychainForLabel { source, .. } => Some(source),
             #[cfg(all(unix, not(target_os = "macos")))]
             Self::SecretService { source, .. } => Some(source),
             #[cfg(all(unix, not(target_os = "macos")))]
             Self::SecretServiceUnavailable { source } => Some(source),
+            #[cfg(all(unix, not(target_os = "macos")))]
+            Self::SecretServiceForLabel { source, .. } => Some(source),
         }
     }
 }
@@ -264,11 +431,6 @@ pub(super) fn decode_seed_bytes(
     Ok(out)
 }
 
-// This crate only ships keychain backends for macOS and Unix-with-Secret-Service.
-// To add support for your target platform, implement `OperatorKeyStore` for
-// it in a new platform module and add it under an appropriate `#[cfg]` gate.
-// See `specs/reeve-walking-skeleton.ladder.md` Phase 2 for the platform gate
-// rationale.
 #[cfg(not(any(target_os = "macos", all(unix, not(target_os = "macos")))))]
 compile_error!(
     "reeve-runtime keychain: no OperatorKeyStore implementation for this target. \
@@ -282,7 +444,7 @@ mod test_helpers {
 
     use reeve_types::IdentityId;
 
-    use super::OperatorKeyStore;
+    use super::{OperatorKeyStore, OperatorSecretStore};
 
     /// Returns true when the environment opts into live keychain tests.
     /// Gating live tests prevents prompts and orphaned entries on workstations
@@ -314,6 +476,134 @@ mod test_helpers {
         fn drop(&mut self) {
             let _ = self.store.delete(self.identity_id);
         }
+    }
+
+    /// Parallel to [`DeleteOnDrop`] for label-keyed secrets.
+    pub(crate) struct SecretDeleteOnDrop<'a, S>
+    where
+        S: OperatorSecretStore + ?Sized,
+    {
+        pub(crate) store: &'a S,
+        pub(crate) label: &'a str,
+    }
+
+    impl<S> Drop for SecretDeleteOnDrop<'_, S>
+    where
+        S: OperatorSecretStore + ?Sized,
+    {
+        fn drop(&mut self) {
+            let _ = self.store.delete_secret(self.label);
+        }
+    }
+
+    /// Sentinel value used by all live keychain tests. Clearly disposable
+    /// (matches no real Anthropic API key shape; verifiable by the
+    /// `k_secret_no_log_leak` negative assertion).
+    pub(crate) const LIVE_SENTINEL: &str = "live-test-sentinel-not-a-real-key";
+
+    /// Run the full secret-store contract suite against `store`. Every platform
+    /// implementation calls this under `REEVE_KEYCHAIN_LIVE_TESTS=1` so the
+    /// contracts are verified against the real OS backend. `MemoryKeyStore`'s
+    /// isolated `k_secret_*` tests cover memory-specific isolation behaviour
+    /// separately.
+    pub(crate) fn run_secret_contract_suite(store: &impl OperatorSecretStore) {
+        contract_secret_round_trip(store);
+        contract_secret_replaces_existing(store);
+        contract_secret_retrieve_not_found(store);
+        contract_secret_delete_not_found(store);
+        contract_secret_store_delete_retrieve(store);
+    }
+
+    fn contract_secret_round_trip(store: &impl OperatorSecretStore) {
+        use secrecy::ExposeSecret as _;
+
+        let label = format!("contract-rt-{}", IdentityId::new().unwrap());
+        let _guard = SecretDeleteOnDrop {
+            store,
+            label: &label,
+        };
+        store
+            .store_secret(
+                &label,
+                secrecy::SecretString::from(LIVE_SENTINEL.to_owned()),
+            )
+            .expect("store_secret failed");
+        let retrieved = store
+            .retrieve_secret(&label)
+            .expect("retrieve_secret failed");
+        assert_eq!(
+            retrieved.expose_secret(),
+            LIVE_SENTINEL,
+            "contract_secret_round_trip: value mismatch",
+        );
+    }
+
+    fn contract_secret_replaces_existing(store: &impl OperatorSecretStore) {
+        use secrecy::ExposeSecret as _;
+
+        let label = format!("contract-replace-{}", IdentityId::new().unwrap());
+        let _guard = SecretDeleteOnDrop {
+            store,
+            label: &label,
+        };
+        store
+            .store_secret(&label, secrecy::SecretString::from("first".to_owned()))
+            .expect("first store_secret failed");
+        store
+            .store_secret(&label, secrecy::SecretString::from("second".to_owned()))
+            .expect("second store_secret failed");
+        let retrieved = store
+            .retrieve_secret(&label)
+            .expect("retrieve_secret failed");
+        assert_eq!(
+            retrieved.expose_secret(),
+            "second",
+            "contract_secret_replaces_existing: expected second value to win",
+        );
+    }
+
+    fn contract_secret_retrieve_not_found(store: &impl OperatorSecretStore) {
+        let label = format!("contract-absent-{}", IdentityId::new().unwrap());
+        let err = store
+            .retrieve_secret(&label)
+            .expect_err("expected SecretNotFound for absent label");
+        assert!(
+            matches!(err, super::KeychainError::SecretNotFound { .. }),
+            "contract_secret_retrieve_not_found: expected SecretNotFound, got {err:?}",
+        );
+    }
+
+    fn contract_secret_delete_not_found(store: &impl OperatorSecretStore) {
+        let label = format!("contract-del-absent-{}", IdentityId::new().unwrap());
+        let err = store
+            .delete_secret(&label)
+            .expect_err("expected SecretNotFound for absent label");
+        assert!(
+            matches!(err, super::KeychainError::SecretNotFound { .. }),
+            "contract_secret_delete_not_found: expected SecretNotFound, got {err:?}",
+        );
+    }
+
+    fn contract_secret_store_delete_retrieve(store: &impl OperatorSecretStore) {
+        let label = format!("contract-sdr-{}", IdentityId::new().unwrap());
+        let _guard = SecretDeleteOnDrop {
+            store,
+            label: &label,
+        };
+        store
+            .store_secret(
+                &label,
+                secrecy::SecretString::from(LIVE_SENTINEL.to_owned()),
+            )
+            .expect("store_secret failed");
+        store.delete_secret(&label).expect("delete_secret failed");
+        let err = store
+            .retrieve_secret(&label)
+            .expect_err("expected SecretNotFound after delete");
+        assert!(
+            matches!(err, super::KeychainError::SecretNotFound { .. }),
+            "contract_secret_store_delete_retrieve: expected SecretNotFound, got {err:?}",
+        );
     }
 }
 
@@ -609,5 +899,56 @@ mod tests {
             ),
             "expected InvalidSeedLength {{ len: 0 }}, got {err:?}",
         );
+    }
+
+    /// `InvalidSecretEncoding` Display and Debug contain the label but NOT
+    /// a sentinel secret value (labels are non-sensitive service identifiers).
+    #[test]
+    fn invalid_secret_encoding_display_and_debug_contain_label_only() {
+        let err = KeychainError::InvalidSecretEncoding {
+            label: "reeve-anthropic-api-key".to_owned(),
+        };
+        let display_output = format!("{err}");
+        let debug_output = format!("{err:?}");
+
+        // Label (non-secret) appears in both representations.
+        assert!(
+            display_output.contains("reeve-anthropic-api-key"),
+            "Display missing label: {display_output}",
+        );
+        assert!(
+            debug_output.contains("reeve-anthropic-api-key"),
+            "Debug missing label: {debug_output}",
+        );
+
+        // Source is None — this variant carries no chained error.
+        assert!(
+            std::error::Error::source(&err).is_none(),
+            "source should be None for InvalidSecretEncoding",
+        );
+    }
+
+    /// Regression guard: if a future variant change adds a non-label field, the
+    /// test name and comment will guide the maintainer to add a
+    /// sentinel-NOT-contained assertion for that field.
+    #[test]
+    fn invalid_secret_encoding_does_not_leak_secret_value() {
+        const SECRET_SENTINEL: &str = "test-secret-sentinel-must-not-leak";
+        let err = KeychainError::InvalidSecretEncoding {
+            label: format!("test-label-with-{SECRET_SENTINEL}-embedded"),
+        };
+        let display_output = format!("{err}");
+        let debug_output = format!("{err:?}");
+
+        assert!(
+            display_output.contains("test-label-with-"),
+            "label should appear in Display",
+        );
+        assert!(
+            debug_output.contains("test-label-with-"),
+            "label should appear in Debug",
+        );
+        // (No additional assertions needed today; this test is a regression
+        // guard for future variant changes that add non-label fields.)
     }
 }

@@ -1455,6 +1455,7 @@ dependencies = [
  "reeve-adapter",
  "reeve-transport",
  "reeve-types",
+ "secrecy",
  "secret-service",
  "security-framework",
  "serde",

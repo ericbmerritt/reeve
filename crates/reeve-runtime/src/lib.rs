@@ -18,7 +18,9 @@ pub mod watcher;
 pub use audit::{AuditError, AuditEvent, AuditLog};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
-pub use keychain::{KeychainError, OperatorKeyStore, KEYCHAIN_SERVICE, SEED_LEN};
+pub use keychain::{
+    labels, KeychainError, OperatorKeyStore, OperatorSecretStore, KEYCHAIN_SERVICE, SEED_LEN,
+};
 pub use ledger::{
     DeliveryKey, DeliveryLedger, DeliveryRecord, LedgerError, ReplayKey, ReplayLedger, ReplayRecord,
 };
