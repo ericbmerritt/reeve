@@ -38,6 +38,16 @@ pub enum IdentityType {
     External,
 }
 
+impl fmt::Display for IdentityType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Operator => f.write_str("Operator"),
+            Self::Agent => f.write_str("Agent"),
+            Self::External => f.write_str("External"),
+        }
+    }
+}
+
 /// Lifecycle state of an [`Identity`].
 ///
 /// An identity is exactly one of: active with no scheduled expiry, active
@@ -576,5 +586,12 @@ mod tests {
         assert_eq!(json, "\"agent\"");
         let json = serde_json::to_string(&IdentityType::External).unwrap();
         assert_eq!(json, "\"external\"");
+    }
+
+    #[test]
+    fn identity_type_display_uses_title_case() {
+        assert_eq!(IdentityType::Operator.to_string(), "Operator");
+        assert_eq!(IdentityType::Agent.to_string(), "Agent");
+        assert_eq!(IdentityType::External.to_string(), "External");
     }
 }

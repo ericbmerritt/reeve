@@ -17,6 +17,11 @@ name = "reeve"
 path = "src/main.rs"
 
 [dependencies]
-clap = { workspace = true }
+clap = { version = "4", default-features = false, features = ["derive", "std", "help", "usage", "error-context"] }
 reeve-runtime = { workspace = true }
 reeve-tui = { workspace = true }
+reeve-types = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+zeroize = { workspace = true }

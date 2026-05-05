@@ -28,7 +28,7 @@ Cargo workspace and crate split that everything else builds on. Six crates: `ree
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| 🟡 in-progress  | 2026-05-05 |            |
+| ✅ complete     | 2026-05-05 | 2026-05-05 |
 
 Tags: security, identity
 
@@ -57,7 +57,7 @@ First-class identity primitives and operator enrollment, the foundation under ev
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| 🟡 in-progress  | 2026-05-05 |            |
 
 Tags: security, transport, crypto
 

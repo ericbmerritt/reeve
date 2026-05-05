@@ -226,6 +226,13 @@ impl IdentityRegistry {
         }
     }
 
+    /// Returns the canonical TOML file path for `identity_id` under this
+    /// registry. Useful for diagnostic messages that point operators at a
+    /// specific file.
+    pub fn toml_path(&self, identity_id: IdentityId) -> PathBuf {
+        self.path_for(identity_id)
+    }
+
     fn path_for(&self, id: IdentityId) -> PathBuf {
         self.data_dir
             .join(format!("{id}.{REGISTRY_FILE_EXTENSION}"))
@@ -1366,6 +1373,16 @@ valid_from = "2026-06-01T00:00:00Z"
             matches!(err, RegistryError::NonUtf8Body { .. }),
             "expected NonUtf8Body, got {err:?}",
         );
+    }
+
+    #[test]
+    fn toml_path_joins_data_dir_and_filename() {
+        let dir = tempdir().unwrap();
+        chmod_secure(dir.path());
+        let registry = IdentityRegistry::open(dir.path().to_path_buf()).unwrap();
+        let id = IdentityId::new().unwrap();
+        let path = registry.toml_path(id);
+        assert_eq!(path, dir.path().join(format!("{id}.toml")));
     }
 
     // T1: a registry file whose path stem is not valid UTF-8 must surface
