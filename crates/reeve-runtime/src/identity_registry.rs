@@ -27,6 +27,8 @@ use reeve_types::{Identity, IdentityId, IdentityIdError, KeyRecord};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
+use crate::fs_util::{ensure_directory, FsCheckError};
+
 /// Maximum size in bytes of any single registry TOML file. Identities and
 /// their key records serialize to well under a kilobyte; the cap guards
 /// against torn writes, accidental large files, and decoder OOM. 64 KiB is
@@ -147,7 +149,7 @@ impl IdentityRegistry {
     /// platform default and skip the mode check until the runtime grows
     /// a Windows ACL story.
     pub fn open(data_dir: PathBuf) -> Result<Self, RegistryError> {
-        ensure_directory(&data_dir)?;
+        ensure_directory(&data_dir, REGISTRY_DIR_MODE).map_err(RegistryError::from_fs)?;
         Ok(Self { data_dir })
     }
 
@@ -352,6 +354,25 @@ pub enum RegistryError {
     },
 }
 
+impl RegistryError {
+    fn from_fs(err: FsCheckError) -> Self {
+        match err {
+            FsCheckError::Io { path, source } => Self::Io { path, source },
+            FsCheckError::Symlink { path } => Self::SymlinkedDataDir { path },
+            FsCheckError::NotADirectory { path } => Self::NotADirectory { path },
+            FsCheckError::WrongMode {
+                path,
+                actual,
+                expected,
+            } => Self::WrongDirectoryMode {
+                path,
+                actual,
+                expected,
+            },
+        }
+    }
+}
+
 impl std::fmt::Display for RegistryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Dispatch contract: every RegistryError variant is handled in exactly
@@ -524,69 +545,6 @@ fn resolve_default_data_dir(
         }
     };
     Ok(base.join("reeve").join("identities"))
-}
-
-fn ensure_directory(data_dir: &Path) -> Result<(), RegistryError> {
-    match fs::symlink_metadata(data_dir) {
-        Ok(metadata) => {
-            if metadata.file_type().is_symlink() {
-                return Err(RegistryError::SymlinkedDataDir {
-                    path: data_dir.to_path_buf(),
-                });
-            }
-            if !metadata.is_dir() {
-                return Err(RegistryError::NotADirectory {
-                    path: data_dir.to_path_buf(),
-                });
-            }
-            check_directory_mode(data_dir, &metadata)?;
-            Ok(())
-        }
-        Err(err) if err.kind() == io::ErrorKind::NotFound => create_dir_all_secure(data_dir)
-            .map_err(|source| RegistryError::Io {
-                path: data_dir.to_path_buf(),
-                source,
-            }),
-        Err(source) => Err(RegistryError::Io {
-            path: data_dir.to_path_buf(),
-            source,
-        }),
-    }
-}
-
-#[cfg(unix)]
-fn check_directory_mode(data_dir: &Path, metadata: &fs::Metadata) -> Result<(), RegistryError> {
-    use std::os::unix::fs::PermissionsExt;
-    let actual = metadata.permissions().mode() & 0o7777;
-    if actual != REGISTRY_DIR_MODE {
-        return Err(RegistryError::WrongDirectoryMode {
-            path: data_dir.to_path_buf(),
-            actual,
-            expected: REGISTRY_DIR_MODE,
-        });
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn check_directory_mode(_data_dir: &Path, _metadata: &fs::Metadata) -> Result<(), RegistryError> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn create_dir_all_secure(data_dir: &Path) -> io::Result<()> {
-    use std::fs::DirBuilder;
-    use std::os::unix::fs::DirBuilderExt;
-
-    DirBuilder::new()
-        .recursive(true)
-        .mode(REGISTRY_DIR_MODE)
-        .create(data_dir)
-}
-
-#[cfg(not(unix))]
-fn create_dir_all_secure(data_dir: &Path) -> io::Result<()> {
-    fs::create_dir_all(data_dir)
 }
 
 /// Case-sensitive: registry files are lowercase `.toml` by convention;
