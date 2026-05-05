@@ -34,7 +34,8 @@ lint-nix:
     rg --files -g '*.nix' -g '!.*' | xargs -L 1 statix check --
 
 test:
-    cargo test --workspace
+    cargo llvm-cov nextest --workspace --fail-under-lines 90 \
+      --ignore-filename-regex '(^|/)main\.rs$|reeve-runtime/src/keychain/(macos|linux)\.rs$|reeve-cli/src/keychain\.rs$'
 
 [parallel]
 format: remove-trailing-whitespace format-rust format-nix format-md
