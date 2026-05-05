@@ -9,8 +9,12 @@ pub(crate) mod fs_util;
 pub mod identity_registry;
 pub mod inbox;
 pub mod keychain;
+pub mod ledger;
 
 pub use audit::{AuditError, AuditEvent, AuditLog};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{KeychainError, OperatorKeyStore, KEYCHAIN_SERVICE, SEED_LEN};
+pub use ledger::{
+    DeliveryKey, DeliveryLedger, DeliveryRecord, LedgerError, ReplayKey, ReplayLedger, ReplayRecord,
+};

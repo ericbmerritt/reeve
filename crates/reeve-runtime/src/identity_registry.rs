@@ -27,7 +27,7 @@ use reeve_types::{Identity, IdentityId, IdentityIdError, KeyRecord};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::fs_util::{ensure_directory, FsCheckError};
+use crate::fs_util::{ensure_directory, set_nofollow, FsCheckError};
 
 /// Maximum size in bytes of any single registry TOML file. Identities and
 /// their key records serialize to well under a kilobyte; the cap guards
@@ -622,15 +622,6 @@ fn read_bounded(path: &Path) -> Result<String, RegistryError> {
         source,
     })
 }
-
-#[cfg(unix)]
-fn set_nofollow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
-}
-
-#[cfg(not(unix))]
-fn set_nofollow(_options: &mut OpenOptions) {}
 
 fn parse_identity_id_from_path(path: &Path) -> Result<IdentityId, RegistryError> {
     let stem =

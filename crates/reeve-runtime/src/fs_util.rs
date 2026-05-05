@@ -1,12 +1,12 @@
-//! Crate-private filesystem safety helpers shared by the inbox and identity
-//! registry modules.
+//! Crate-private filesystem safety helpers shared by the inbox, audit, ledger,
+//! and identity registry modules.
 //!
 //! Every public function here follows `specs/reeve-transport-security.md` §
 //! Filesystem Safety: no symlink following, non-directory rejection, and
 //! mode-bit checks without silent chmod. Callers map [`FsCheckError`] into
 //! their own typed error via `From`.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -124,4 +124,44 @@ pub(crate) fn create_dir_all_secure(path: &Path, mode: u32) -> io::Result<()> {
 #[cfg(not(unix))]
 pub(crate) fn create_dir_all_secure(path: &Path, _mode: u32) -> io::Result<()> {
     fs::create_dir_all(path)
+}
+
+/// Set `O_NOFOLLOW` on `options` on Unix so a symlink placed at the target
+/// path surfaces as an error rather than being silently followed. A no-op on
+/// non-Unix platforms.
+#[cfg(unix)]
+pub(crate) fn set_nofollow(options: &mut OpenOptions) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.custom_flags(libc::O_NOFOLLOW);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn set_nofollow(_options: &mut OpenOptions) {}
+
+/// Apply `mode` to `options` on Unix so a newly created file gets the
+/// specified permission bits. A no-op on non-Unix platforms.
+///
+/// Note: `identity_registry` uses a separate `apply_file_mode(&File)` that
+/// operates on an already-open handle via `set_permissions`; that variant is
+/// not replaced here because it has a different shape.
+#[cfg(unix)]
+pub(crate) fn apply_file_mode_options(options: &mut OpenOptions, mode: u32) {
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(mode);
+}
+
+#[cfg(not(unix))]
+pub(crate) fn apply_file_mode_options(_options: &mut OpenOptions, _mode: u32) {}
+
+/// Open `path` for appending with `O_NOFOLLOW` and `mode` on Unix.
+///
+/// Creates the file if absent. Combines `apply_file_mode_options`,
+/// `set_nofollow`, and the open call so audit and ledger modules share a
+/// single JSONL-open path.
+pub(crate) fn open_jsonl_file(path: &Path, mode: u32) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.create(true).append(true);
+    apply_file_mode_options(&mut options, mode);
+    set_nofollow(&mut options);
+    options.open(path)
 }

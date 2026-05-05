@@ -33,7 +33,7 @@
 //! enrollment and transport pipeline operations is task 12+.
 
 use std::fmt;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -42,7 +42,7 @@ use reeve_types::{IdentityId, KeyId, MessageId};
 use serde::Serialize;
 use time::OffsetDateTime;
 
-use crate::fs_util::{ensure_directory, FsCheckError};
+use crate::fs_util::{ensure_directory, open_jsonl_file, FsCheckError};
 
 /// Mode for the audit directory on Unix. Restrictive: runtime-owned, not
 /// world-readable. Matches the posture applied to the identity registry and
@@ -267,36 +267,14 @@ impl AuditLog {
 }
 
 fn open_log_file(path: &Path) -> Result<File, AuditError> {
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
-    apply_file_mode(&mut options);
-    // O_NOFOLLOW mirrors identity_registry::read_bounded: a symlink placed at
-    // audit/log.jsonl after directory creation surfaces as ELOOP rather than
-    // writing audit records to an attacker-chosen target.
-    set_nofollow(&mut options);
-    options.open(path).map_err(|source| AuditError::Io {
+    // O_NOFOLLOW: a symlink placed at audit/log.jsonl after directory creation
+    // surfaces as ELOOP rather than writing audit records to an attacker-chosen
+    // target.
+    open_jsonl_file(path, AUDIT_FILE_MODE).map_err(|source| AuditError::Io {
         path: path.to_path_buf(),
         source,
     })
 }
-
-#[cfg(unix)]
-fn apply_file_mode(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(AUDIT_FILE_MODE);
-}
-
-#[cfg(not(unix))]
-fn apply_file_mode(_options: &mut OpenOptions) {}
-
-#[cfg(unix)]
-fn set_nofollow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.custom_flags(libc::O_NOFOLLOW);
-}
-
-#[cfg(not(unix))]
-fn set_nofollow(_options: &mut OpenOptions) {}
 
 #[cfg(test)]
 mod tests {
