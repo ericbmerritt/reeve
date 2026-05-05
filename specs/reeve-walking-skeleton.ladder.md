@@ -119,7 +119,7 @@ The maildir-based transport that the rest of Reeve composes on. Per-agent inbox 
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| 🟡 in-progress  | 2026-05-05 |            |
 
 Tags: adapter, model
 
