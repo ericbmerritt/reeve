@@ -496,26 +496,11 @@ mod tests {
         Envelope, EnvelopeSignature, Identity, IdentityId, KeyId, KeyRecord, KeyState, Keypair,
         MessageId, Nonce, PayloadHash, SchemaVersion, NONCE_LEN, PAYLOAD_HASH_LEN, SIGNATURE_LEN,
     };
-    use tempfile::tempdir;
     use time::macros::datetime;
     use time::OffsetDateTime;
 
     use crate::identity_registry::{IdentityRegistry, StoredIdentity};
     use crate::ledger::{DeliveryLedger, ReplayLedger};
-
-    /// Tighten tempdir permissions to pass the 0o700 mode check.
-    #[cfg(unix)]
-    fn secure_dir() -> tempfile::TempDir {
-        use std::os::unix::fs::PermissionsExt;
-        let dir = tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        dir
-    }
-
-    #[cfg(not(unix))]
-    fn secure_dir() -> tempfile::TempDir {
-        tempdir().unwrap()
-    }
 
     struct TestContext {
         pipeline: VerificationPipeline,
@@ -526,9 +511,9 @@ mod tests {
     }
 
     fn build_context() -> TestContext {
-        let reg_dir = secure_dir();
-        let replay_dir = secure_dir();
-        let delivery_dir = secure_dir();
+        let reg_dir = crate::test_support::secure_dir();
+        let replay_dir = crate::test_support::secure_dir();
+        let delivery_dir = crate::test_support::secure_dir();
 
         let registry = Arc::new(IdentityRegistry::open(reg_dir.keep()).unwrap());
         let replay = Arc::new(ReplayLedger::open(replay_dir.keep()).unwrap());
@@ -554,6 +539,9 @@ mod tests {
         }
     }
 
+    /// Convenience wrapper returning only the [`Envelope`]; the serialized
+    /// bytes from [`crate::test_support::signed_envelope_at`] are discarded
+    /// because verify-layer tests don't need them.
     fn signed_envelope(
         keypair: &Keypair,
         sender_id: IdentityId,
@@ -561,22 +549,7 @@ mod tests {
         recipient_id: IdentityId,
         now: OffsetDateTime,
     ) -> Envelope {
-        let placeholder = EnvelopeSignature::from_bytes([0u8; SIGNATURE_LEN]);
-        let mut env = Envelope::new(
-            SchemaVersion::V1,
-            MessageId::new().unwrap(),
-            sender_id,
-            key_id,
-            recipient_id,
-            now,
-            Nonce::from_bytes([0xAAu8; NONCE_LEN]),
-            PayloadHash::from_bytes([0xBBu8; PAYLOAD_HASH_LEN]),
-            b"hello".to_vec(),
-            placeholder,
-        );
-        let sig = sign_envelope(&env, keypair.private()).unwrap();
-        env.signature = sig;
-        env
+        crate::test_support::signed_envelope_at(keypair, sender_id, key_id, recipient_id, now).0
     }
 
     fn now() -> OffsetDateTime {
@@ -812,9 +785,9 @@ mod tests {
     // VP7: sender's key state is Revoked → KeyRevoked.
     #[test]
     fn key_revoked_yields_quarantine() {
-        let reg_dir = secure_dir();
-        let replay_dir = secure_dir();
-        let delivery_dir = secure_dir();
+        let reg_dir = crate::test_support::secure_dir();
+        let replay_dir = crate::test_support::secure_dir();
+        let delivery_dir = crate::test_support::secure_dir();
 
         let registry = Arc::new(IdentityRegistry::open(reg_dir.keep()).unwrap());
         let replay = Arc::new(ReplayLedger::open(replay_dir.keep()).unwrap());
@@ -851,9 +824,9 @@ mod tests {
     // VP8: deprecated key, envelope.created_at after valid_until → KeyExpired.
     #[test]
     fn key_expired_deprecated_past_window_yields_quarantine() {
-        let reg_dir = secure_dir();
-        let replay_dir = secure_dir();
-        let delivery_dir = secure_dir();
+        let reg_dir = crate::test_support::secure_dir();
+        let replay_dir = crate::test_support::secure_dir();
+        let delivery_dir = crate::test_support::secure_dir();
 
         let registry = Arc::new(IdentityRegistry::open(reg_dir.keep()).unwrap());
         let replay = Arc::new(ReplayLedger::open(replay_dir.keep()).unwrap());
@@ -903,9 +876,9 @@ mod tests {
     // check (may succeed overall if other checks pass).
     #[test]
     fn key_deprecated_within_window_passes_key_check() {
-        let reg_dir = secure_dir();
-        let replay_dir = secure_dir();
-        let delivery_dir = secure_dir();
+        let reg_dir = crate::test_support::secure_dir();
+        let replay_dir = crate::test_support::secure_dir();
+        let delivery_dir = crate::test_support::secure_dir();
 
         let registry = Arc::new(IdentityRegistry::open(reg_dir.keep()).unwrap());
         let replay = Arc::new(ReplayLedger::open(replay_dir.keep()).unwrap());
@@ -1099,9 +1072,9 @@ mod tests {
     // IT1: integration — enroll operator, sign envelope, verify → Deliver.
     #[test]
     fn integration_enroll_sign_verify_deliver() {
-        let reg_dir = secure_dir();
-        let replay_dir = secure_dir();
-        let delivery_dir = secure_dir();
+        let reg_dir = crate::test_support::secure_dir();
+        let replay_dir = crate::test_support::secure_dir();
+        let delivery_dir = crate::test_support::secure_dir();
 
         let registry = Arc::new(IdentityRegistry::open(reg_dir.keep()).unwrap());
         let replay = Arc::new(ReplayLedger::open(replay_dir.keep()).unwrap());

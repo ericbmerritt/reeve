@@ -10,7 +10,10 @@ pub mod identity_registry;
 pub mod inbox;
 pub mod keychain;
 pub mod ledger;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod verify;
+pub mod watcher;
 
 pub use audit::{AuditError, AuditEvent, AuditLog};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
@@ -23,3 +26,4 @@ pub use verify::{
     emit_quarantine_audit, EnvelopeIds, QuarantineReason, Verdict, VerificationError,
     VerificationPipeline, DEFAULT_CLOCK_SKEW, MAX_ENVELOPE_BYTES,
 };
+pub use watcher::{FilenameError, ProcessOutcome, Watcher, WatcherError};

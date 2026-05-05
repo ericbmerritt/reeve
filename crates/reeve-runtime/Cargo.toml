@@ -17,6 +17,7 @@ reeve-types = { workspace = true }
 reeve-transport = { workspace = true }
 reeve-adapter = { workspace = true }
 
+notify = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }

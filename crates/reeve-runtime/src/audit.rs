@@ -43,6 +43,7 @@ use serde::Serialize;
 use time::OffsetDateTime;
 
 use crate::fs_util::{ensure_directory, open_jsonl_file, FsCheckError};
+use crate::watcher::FilenameError;
 
 /// Mode for the audit directory on Unix. Restrictive: runtime-owned, not
 /// world-readable. Matches the posture applied to the identity registry and
@@ -59,9 +60,9 @@ const AUDIT_LOG_NAME: &str = "log.jsonl";
 ///
 /// Each variant maps to a `kind` discriminator string in the JSONL output:
 /// `identity.enrolled`, `transport.delivered`, `transport.quarantine`,
-/// `transport.replay-rejected`. The dots in the kind values require explicit
-/// `#[serde(rename = ...)]` because serde's `rename_all` strategies cannot
-/// produce dots.
+/// `transport.replay-rejected`, `transport.filename-rejected`. The dots in
+/// the kind values require explicit `#[serde(rename = ...)]` because serde's
+/// `rename_all` strategies cannot produce dots.
 ///
 /// Marked `#[non_exhaustive]` because future phases will add variants for
 /// authority decisions, cost-ceiling trips, tool invocations, and similar
@@ -115,6 +116,23 @@ pub enum AuditEvent {
         sender_id: IdentityId,
         sender_key_id: KeyId,
         message_id: MessageId,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// File in `inbox/new/` had a malformed filename and was left in place
+    /// for operator inspection. Fires INSTEAD OF `transport.quarantine`
+    /// (no rename, no quarantine/ entry). Operators should alert on
+    /// accumulation: the runtime cannot self-clean these files.
+    ///
+    /// `reason` is one of: `"not_utf8"`, `"reserved"`, `"contains_null"`,
+    /// or `"too_long(<N>)"` where `<N>` is the byte length. The token format
+    /// is stable and machine-parseable.
+    #[serde(rename = "transport.filename-rejected")]
+    TransportFilenameRejected {
+        agent_id: IdentityId,
+        /// Typed filename error; serializes to a stable machine-readable token.
+        reason: FilenameError,
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
@@ -642,6 +660,11 @@ mod tests {
                 sender_id,
                 sender_key_id,
                 message_id,
+                at: at(),
+            },
+            AuditEvent::TransportFilenameRejected {
+                agent_id: recipient_id,
+                reason: FilenameError::NotUtf8,
                 at: at(),
             },
         ];
