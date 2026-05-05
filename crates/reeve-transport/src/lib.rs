@@ -5,5 +5,7 @@
 //! the trust contract this layer implements.
 
 pub mod canonical;
+pub mod sign;
 
 pub use canonical::{canonical_bytes, CanonicalError};
+pub use sign::{sign_envelope, verify_envelope, SignError, VerifyError};
