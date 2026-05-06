@@ -14,8 +14,12 @@ concurrency:
 
 jobs:
   validate:
-    name: just validate
-    runs-on: ubuntu-latest
+    name: just validate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
 
@@ -39,8 +43,12 @@ jobs:
         run: nix develop --command just validate
 
   nix-build:
-    name: nix build
-    runs-on: ubuntu-latest
+    name: nix build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v6
 
