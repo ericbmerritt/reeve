@@ -7,7 +7,7 @@
 //! their own typed error via `From`.
 
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
 
 /// Mask for extracting permission bits (rwx for u/g/o plus sticky/setuid/setgid)
@@ -183,4 +183,77 @@ pub(crate) fn open_jsonl_file(path: &Path, mode: u32) -> io::Result<File> {
     apply_file_mode_options(&mut options, mode);
     set_nofollow(&mut options);
     options.open(path)
+}
+
+/// Set permission bits on an already-open file on Unix.
+///
+/// Used for files created via `NamedTempFile` (which opens internally and
+/// does not support `OpenOptions::mode` at create time). A no-op on
+/// non-Unix platforms.
+#[cfg(unix)]
+pub(crate) fn apply_file_perms(file: &File, mode: u32) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(mode))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn apply_file_perms(_file: &File, _mode: u32) -> io::Result<()> {
+    Ok(())
+}
+
+/// Read a file with `O_NOFOLLOW`, up to `max_bytes`, as a UTF-8 string.
+///
+/// Returns `io::Error` on open failure (including symlinks → `ELOOP`/`ENOTDIR`),
+/// read failure, or non-UTF-8 content. Callers map this to their own error types.
+pub(crate) fn read_nofollow_bounded(path: &Path, max_bytes: u64) -> io::Result<String> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    set_nofollow(&mut options);
+    let file = options.open(path)?;
+
+    let cap = max_bytes.saturating_add(1);
+    let init_cap = usize::try_from(cap).unwrap_or(usize::MAX).min(8 * 1024);
+    let mut buffer = Vec::with_capacity(init_cap);
+    let cap_usize = usize::try_from(cap).unwrap_or(usize::MAX);
+    file.take(u64::try_from(cap_usize).unwrap_or(u64::MAX))
+        .read_to_end(&mut buffer)?;
+
+    // Detect truncation: if buffer hit the cap, the file exceeds max_bytes.
+    if buffer.len() >= cap_usize {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("file exceeds {max_bytes} byte limit"),
+        ));
+    }
+
+    String::from_utf8(buffer)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn read_nofollow_bounded_rejects_oversized_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("big.bin");
+        let limit: u64 = 16;
+        let size = usize::try_from(limit + 1).unwrap();
+        fs::write(&path, vec![b'x'; size]).unwrap();
+        let err = read_nofollow_bounded(&path, limit).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("byte limit"), "error: {err}");
+    }
+
+    #[test]
+    fn read_nofollow_bounded_accepts_exactly_at_limit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("exact.txt");
+        let limit: u64 = 16;
+        let size = usize::try_from(limit).unwrap();
+        fs::write(&path, vec![b'a'; size]).unwrap();
+        let content = read_nofollow_bounded(&path, limit).unwrap();
+        assert_eq!(content.len(), size);
+    }
 }

@@ -19,7 +19,7 @@
 //! and atomic transitions via write-tmp-then-rename in the same directory.
 
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -719,9 +719,11 @@ fn atomic_write(dir: &Path, target: &Path, body: &[u8]) -> Result<(), RegistryEr
         path: dir.to_path_buf(),
         source,
     })?;
-    apply_file_mode(tmp.as_file()).map_err(|source| RegistryError::Io {
-        path: tmp.path().to_path_buf(),
-        source,
+    crate::fs_util::apply_file_perms(tmp.as_file(), REGISTRY_FILE_MODE).map_err(|source| {
+        RegistryError::Io {
+            path: tmp.path().to_path_buf(),
+            source,
+        }
     })?;
     tmp.write_all(body).map_err(|source| RegistryError::Io {
         path: tmp.path().to_path_buf(),
@@ -738,17 +740,6 @@ fn atomic_write(dir: &Path, target: &Path, body: &[u8]) -> Result<(), RegistryEr
         source: err.error,
     })?;
     sync_directory(dir);
-    Ok(())
-}
-
-#[cfg(unix)]
-fn apply_file_mode(file: &File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    file.set_permissions(fs::Permissions::from_mode(REGISTRY_FILE_MODE))
-}
-
-#[cfg(not(unix))]
-fn apply_file_mode(_file: &File) -> io::Result<()> {
     Ok(())
 }
 
