@@ -39,6 +39,7 @@ security-framework = { workspace = true }
 secret-service = { workspace = true }
 
 [dev-dependencies]
+async-trait = { workspace = true }
 ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 time = { workspace = true }
