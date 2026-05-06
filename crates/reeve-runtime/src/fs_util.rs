@@ -201,6 +201,27 @@ pub(crate) fn apply_file_perms(_file: &File, _mode: u32) -> io::Result<()> {
     Ok(())
 }
 
+/// Write `content` atomically to `path` using a temp file in `dir`.
+///
+/// Pattern: `NamedTempFile::new_in(dir)` → set mode → write → fsync →
+/// persist → sync dir. A crash at any point before persist leaves `path`
+/// unchanged.
+pub(crate) fn atomic_write_file(
+    path: &Path,
+    dir: &Path,
+    content: &[u8],
+    mode: u32,
+) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    apply_file_perms(tmp.as_file(), mode)?;
+    tmp.write_all(content)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| e.error)?;
+    sync_directory(dir);
+    Ok(())
+}
+
 /// Read a file with `O_NOFOLLOW`, up to `max_bytes`, as a UTF-8 string.
 ///
 /// Returns `io::Error` on open failure (including symlinks → `ELOOP`/`ENOTDIR`),

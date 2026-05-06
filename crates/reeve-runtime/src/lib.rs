@@ -4,6 +4,7 @@
 //! maildir watcher, audit log writer, model resolution, cost meters. See
 //! `specs/reeve-domain-model.md` § Runtime for owned state and lifecycle.
 
+pub mod agent_fs;
 pub mod audit;
 pub mod config;
 pub mod daemon;
@@ -19,6 +20,9 @@ pub(crate) mod test_support;
 pub mod verify;
 pub mod watcher;
 
+pub use agent_fs::{
+    AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread,
+};
 pub use audit::{AuditError, AuditEvent, AuditLog};
 pub use config::{
     install_defaults, load_persona_config, load_team_config, ConfigError, PersonaConfig,
