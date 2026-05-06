@@ -8,6 +8,7 @@ use reeve_runtime::{AuditLog, IdentityRegistry};
 use reeve_types::IdentityId;
 
 mod adapter;
+mod daemon;
 mod envelope;
 mod identity;
 mod keychain;
@@ -41,6 +42,11 @@ enum Commands {
     Adapter {
         #[command(subcommand)]
         command: adapter::AdapterSubcommand,
+    },
+    /// Manage the runtime daemon: start, stop, check status.
+    Daemon {
+        #[command(subcommand)]
+        command: daemon::DaemonSubcommand,
     },
 }
 
@@ -104,6 +110,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             command: EnvelopeCommands::Verify { file },
         }) => cmd_envelope_verify(&file),
         Some(Commands::Adapter { command }) => adapter::dispatch(command),
+        Some(Commands::Daemon { command }) => daemon::dispatch(&command),
     }
 }
 
