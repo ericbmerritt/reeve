@@ -1,5 +1,10 @@
 [advisories]
-ignore = []
+# RUSTSEC-2024-0436: `paste` is no longer maintained; it is a transitive
+# dependency of `ratatui` (via reeve-tui) and has no safe upgrade path.
+# The crate is used only for proc-macro identifier generation, has no
+# exploitable attack surface, and the advisory notes this as a
+# maintenance concern rather than a security vulnerability.
+ignore = ["RUSTSEC-2024-0436"]
 
 [licenses]
 allow = [
@@ -92,6 +97,24 @@ skip = [
   { name = "windows_x86_64_gnullvm", version = "=0.53.1" },
   { name = "windows_x86_64_msvc", version = "=0.52.6" },
   { name = "windows_x86_64_msvc", version = "=0.53.1" },
+  # ratatui (via reeve-tui) depends on hashbrown 0.15.x; the indexmap
+  # crate (a transitive dep via other paths) pins hashbrown 0.17.x.
+  # Both versions are ABI-compatible; unifying them requires upstream
+  # coordination outside our control.
+  { name = "hashbrown", version = "=0.15.5" },
+  { name = "hashbrown", version = "=0.17.0" },
+  # crossterm (via reeve-tui) depends on linux-raw-sys 0.4.x and
+  # rustix 0.38.x. The reeve-runtime keychain / notify path uses
+  # linux-raw-sys 0.12.x and rustix 1.x. Unifying requires upstream
+  # crossterm upgrade outside our control.
+  { name = "linux-raw-sys", version = "=0.4.15" },
+  { name = "linux-raw-sys", version = "=0.12.1" },
+  { name = "rustix", version = "=0.38.44" },
+  { name = "rustix", version = "=1.1.4" },
+  # ratatui (via reeve-tui) pins unicode-width 0.2.x; other crates in the
+  # workspace use unicode-width 0.1.x. Unifying requires upstream updates.
+  { name = "unicode-width", version = "=0.1.14" },
+  { name = "unicode-width", version = "=0.2.0" },
 ]
 
 [sources]

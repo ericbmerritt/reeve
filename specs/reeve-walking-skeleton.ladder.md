@@ -213,7 +213,7 @@ Curator simplicity: in this phase, the curator is a degenerate appending loop. I
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| 🟡 in-progress  | 2026-05-06 |            |
+| ✅ complete     | 2026-05-06 | 2026-05-07 |
 
 Tags: tui
 
@@ -246,7 +246,7 @@ The terminal UI as a separate process whose entire interaction with the runtime 
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| 🟡 in-progress  | 2026-05-07 |            |
 
 Tags: polish, ux
 

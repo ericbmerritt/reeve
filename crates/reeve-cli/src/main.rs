@@ -226,11 +226,9 @@ fn cmd_attach() -> Result<(), Box<dyn std::error::Error>> {
         )?;
         return Ok(());
     }
-    writeln!(
-        io::stdout().lock(),
-        "[TUI not yet implemented — Phase 8 Task 2]",
-    )?;
-    Ok(())
+    let data_dir = IdentityRegistry::default_data_dir()?;
+    let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
+    reeve_tui::app::run(&dirs).map_err(Into::into)
 }
 
 fn prompt_display_name() -> Result<String, Box<dyn std::error::Error>> {
