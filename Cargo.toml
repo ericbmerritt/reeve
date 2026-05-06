@@ -26,7 +26,7 @@ rand_core = { version = "0.6", default-features = false, features = ["getrandom"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
 security-framework = { version = "3", default-features = false }
-secret-service = { version = "5", default-features = false, features = ["crypto-rust"] }
+secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
 tempfile = { version = "3", default-features = false }
 time = { version = "0.3", features = ["serde", "formatting", "parsing", "macros"] }
 toml = { version = "0.8", default-features = false, features = ["parse", "display"] }
@@ -50,6 +50,11 @@ return_self_not_must_use = "allow"
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 map_unwrap_or = "allow"
+# Allowed because KeychainError carries platform-specific source enums
+# (secret_service::Error on Linux is large). The error types are returned
+# from CLI dispatch paths, not hot loops. If we ever care, box the
+# Keychain variant of EnrollError / UnenrollError (follow-on).
+result_large_err = "allow"
 
 allow_attributes = "deny"
 allow_attributes_without_reason = "deny"

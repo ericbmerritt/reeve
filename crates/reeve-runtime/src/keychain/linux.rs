@@ -3,7 +3,7 @@
 //! interface.
 //!
 //! The Secret Service API is provided on the session bus by
-//! `gnome-keyring-daemon`, KWallet, or another compatible daemon. If no such
+//! `gnome-keyring-daemon`, `KWallet`, or another compatible daemon. If no such
 //! daemon is reachable, every method returns
 //! [`KeychainError::SecretServiceUnavailable`] — typical headless CI does not
 //! run one, which is why higher-layer tests inject [`MemoryKeyStore`].
@@ -147,10 +147,17 @@ impl SecretServiceKeyStore {
     /// `replace=true` as atomic across daemon restarts or concurrent writers —
     /// this guard surfaces the corruption rather than silently returning the
     /// wrong key.
-    fn find_item(&self, identity_id: IdentityId) -> Result<Option<Item<'_>>, KeychainError> {
+    ///
+    /// The caller owns the [`Collection`] so that the returned [`Item`] (which
+    /// borrows from it) outlives this call — the borrow checker cannot infer
+    /// that the inner [`SecretService<'static>`] would keep both alive.
+    fn find_item<'c>(
+        &self,
+        collection: &'c Collection<'_>,
+        identity_id: IdentityId,
+    ) -> Result<Option<Item<'c>>, KeychainError> {
         let id_str = identity_id.to_string();
         let attrs = self.attributes(&id_str);
-        let collection = self.unlocked_default_collection(identity_id)?;
         let items =
             collection
                 .search_items(attrs)
@@ -160,7 +167,8 @@ impl SecretServiceKeyStore {
                 })?;
         match items.len() {
             0 => Ok(None),
-            1 => Ok(Some(items.into_iter().next().unwrap())),
+            // len() == 1 invariant: into_iter().next() yields Some(item).
+            1 => Ok(items.into_iter().next()),
             n => Err(KeychainError::DuplicateEntry {
                 identity_id,
                 count: n,
@@ -173,13 +181,19 @@ impl SecretServiceKeyStore {
     ///
     /// `replace=true` is passed on `create_item`, which is best-effort on
     /// most Secret Service implementations. Conformant daemons (gnome-keyring,
-    /// KWallet) honour it, but the guarantee is not part of the specification.
+    /// `KWallet`) honour it, but the guarantee is not part of the specification.
     /// Unlike `find_item` (which guards identity items against duplicates),
     /// this method returns the first matching item; a future hardening pass
     /// may add a `DuplicateSecretEntry` guard here.
-    fn find_secret_item(&self, label: &str) -> Result<Option<Item<'_>>, KeychainError> {
+    ///
+    /// Caller owns the [`Collection`] for the same borrow-lifetime reason as
+    /// [`find_item`].
+    fn find_secret_item<'c>(
+        &self,
+        collection: &'c Collection<'_>,
+        label: &str,
+    ) -> Result<Option<Item<'c>>, KeychainError> {
         let attrs = self.secret_attributes(label);
-        let collection = self.unlocked_default_collection_for_label(label)?;
         let items = collection.search_items(attrs).map_err(|source| {
             KeychainError::SecretServiceForLabel {
                 label: label.to_owned(),
@@ -219,8 +233,9 @@ impl OperatorKeyStore for SecretServiceKeyStore {
         &self,
         identity_id: IdentityId,
     ) -> Result<Zeroizing<[u8; SEED_LEN]>, KeychainError> {
+        let collection = self.unlocked_default_collection(identity_id)?;
         let item = self
-            .find_item(identity_id)?
+            .find_item(&collection, identity_id)?
             .ok_or(KeychainError::NotFound { identity_id })?;
         if item
             .is_locked()
@@ -247,8 +262,9 @@ impl OperatorKeyStore for SecretServiceKeyStore {
     }
 
     fn delete(&self, identity_id: IdentityId) -> Result<(), KeychainError> {
+        let collection = self.unlocked_default_collection(identity_id)?;
         let item = self
-            .find_item(identity_id)?
+            .find_item(&collection, identity_id)?
             .ok_or(KeychainError::NotFound { identity_id })?;
         item.delete()
             .map_err(|source| KeychainError::SecretService {
@@ -280,11 +296,12 @@ impl OperatorSecretStore for SecretServiceKeyStore {
     }
 
     fn retrieve_secret(&self, label: &str) -> Result<SecretString, KeychainError> {
-        let item = self
-            .find_secret_item(label)?
-            .ok_or_else(|| KeychainError::SecretNotFound {
+        let collection = self.unlocked_default_collection_for_label(label)?;
+        let item = self.find_secret_item(&collection, label)?.ok_or_else(|| {
+            KeychainError::SecretNotFound {
                 label: label.to_owned(),
-            })?;
+            }
+        })?;
         if item
             .is_locked()
             .map_err(|source| KeychainError::SecretServiceForLabel {
@@ -317,11 +334,12 @@ impl OperatorSecretStore for SecretServiceKeyStore {
     }
 
     fn delete_secret(&self, label: &str) -> Result<(), KeychainError> {
-        let item = self
-            .find_secret_item(label)?
-            .ok_or_else(|| KeychainError::SecretNotFound {
+        let collection = self.unlocked_default_collection_for_label(label)?;
+        let item = self.find_secret_item(&collection, label)?.ok_or_else(|| {
+            KeychainError::SecretNotFound {
                 label: label.to_owned(),
-            })?;
+            }
+        })?;
         item.delete()
             .map_err(|source| KeychainError::SecretServiceForLabel {
                 label: label.to_owned(),
@@ -346,6 +364,29 @@ mod tests {
     use crate::keychain::test_helpers::run_secret_contract_suite;
     use crate::keychain::test_helpers::{live_tests_enabled, unique_service, DeleteOnDrop};
     use crate::keychain::tests::run_contract_suite;
+
+    /// Cleanup guard for tests that create multiple items with the same
+    /// `(service, identity_id)` attributes — `DeleteOnDrop` cannot be used
+    /// because it calls `store.delete` -> `find_item`, which errors on
+    /// duplicates.
+    struct AllItemsGuard<'a> {
+        collection: &'a Collection<'a>,
+        service_attr: &'a str,
+        id_str: &'a str,
+    }
+
+    impl Drop for AllItemsGuard<'_> {
+        fn drop(&mut self) {
+            let mut attrs = HashMap::new();
+            attrs.insert(ATTR_SERVICE, self.service_attr);
+            attrs.insert(ATTR_IDENTITY_ID, self.id_str);
+            if let Ok(items) = self.collection.search_items(attrs) {
+                for item in items {
+                    let _ = item.delete();
+                }
+            }
+        }
+    }
 
     #[test]
     fn live_contract_suite_when_enabled() {
@@ -468,26 +509,6 @@ mod tests {
 
         let collection = store.unlocked_default_collection(id).unwrap();
         let label = format!("reeve test duplicate for {id}");
-
-        // DeleteOnDrop calls store.delete → find_item → errors on duplicates.
-        // Bypass: search the collection directly and delete each item.
-        struct AllItemsGuard<'a> {
-            collection: &'a Collection<'a>,
-            service_attr: &'a str,
-            id_str: &'a str,
-        }
-        impl Drop for AllItemsGuard<'_> {
-            fn drop(&mut self) {
-                let mut attrs = HashMap::new();
-                attrs.insert(ATTR_SERVICE, self.service_attr);
-                attrs.insert(ATTR_IDENTITY_ID, self.id_str);
-                if let Ok(items) = self.collection.search_items(attrs) {
-                    for item in items {
-                        let _ = item.delete();
-                    }
-                }
-            }
-        }
 
         // First item (replace=true — same as the public API).
         collection

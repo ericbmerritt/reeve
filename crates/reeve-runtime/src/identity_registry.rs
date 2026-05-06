@@ -622,6 +622,11 @@ fn is_registry_file(path: &Path) -> bool {
 }
 
 fn read_validated(path: &Path) -> Result<StoredIdentity, RegistryError> {
+    // Filename must parse to a valid UUID before any body read. This surfaces
+    // NonUtf8Filename / InvalidFilename without first reading bogus or
+    // attacker-supplied content.
+    let from_filename = parse_identity_id_from_path(path)?;
+
     let metadata = fs::symlink_metadata(path).map_err(|source| RegistryError::Io {
         path: path.to_path_buf(),
         source,
@@ -647,7 +652,6 @@ fn read_validated(path: &Path) -> Result<StoredIdentity, RegistryError> {
         path: path.to_path_buf(),
         source,
     })?;
-    let from_filename = parse_identity_id_from_path(path)?;
     if from_filename != file.identity.identity_id {
         return Err(RegistryError::FilenameMismatch {
             path: path.to_path_buf(),
