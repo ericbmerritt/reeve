@@ -22,6 +22,7 @@ rand_core = { workspace = true }
 reeve-adapter = { workspace = true }
 reeve-runtime = { workspace = true }
 reeve-transport = { workspace = true }
+reeve-tui = { workspace = true }
 reeve-types = { workspace = true }
 secrecy = { workspace = true }
 serde_json = { workspace = true }

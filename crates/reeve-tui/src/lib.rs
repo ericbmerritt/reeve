@@ -4,3 +4,10 @@
 //! Talks to the runtime through the filesystem only — no socket, no RPC.
 //! See `specs/reeve-tui-design.md` and `specs/reeve-tui-screens.md` for
 //! design and layout.
+
+pub mod reader;
+pub mod state;
+pub mod watcher;
+
+pub use reader::{heartbeat_fresh, read_conversation, read_cost, read_status};
+pub use state::{AgentStatus, AppState, ConversationEntry, EntryKind};
