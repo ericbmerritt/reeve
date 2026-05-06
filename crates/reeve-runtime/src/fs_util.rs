@@ -140,10 +140,6 @@ pub(crate) fn set_nofollow(_options: &mut OpenOptions) {}
 
 /// Apply `mode` to `options` on Unix so a newly created file gets the
 /// specified permission bits. A no-op on non-Unix platforms.
-///
-/// Note: `identity_registry` uses a separate `apply_file_mode(&File)` that
-/// operates on an already-open handle via `set_permissions`; that variant is
-/// not replaced here because it has a different shape.
 #[cfg(unix)]
 pub(crate) fn apply_file_mode_options(options: &mut OpenOptions, mode: u32) {
     use std::os::unix::fs::OpenOptionsExt;
@@ -152,6 +148,29 @@ pub(crate) fn apply_file_mode_options(options: &mut OpenOptions, mode: u32) {
 
 #[cfg(not(unix))]
 pub(crate) fn apply_file_mode_options(_options: &mut OpenOptions, _mode: u32) {}
+
+/// Best-effort fsync of a directory after a rename for durability.
+///
+/// Failures are non-fatal: the file content is already durable through
+/// `sync_all` on the tmp file, and the rename itself is the atomicity
+/// primitive — directory metadata persistence is a power-loss durability
+/// question, not a torn-state one.
+///
+/// Opens the directory with `O_NOFOLLOW` (and `O_DIRECTORY` on Unix) so a
+/// symlink placed at `dir` between the rename and this call does not cause
+/// fsync to hit an attacker-controlled target.
+pub(crate) fn sync_directory(dir: &Path) {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY);
+    }
+    if let Ok(handle) = options.open(dir) {
+        let _ = handle.sync_all();
+    }
+}
 
 /// Open `path` for appending with `O_NOFOLLOW` and `mode` on Unix.
 ///

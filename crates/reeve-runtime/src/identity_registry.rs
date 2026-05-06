@@ -27,7 +27,7 @@ use reeve_types::{Identity, IdentityId, IdentityIdError, KeyRecord};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::fs_util::{ensure_directory, set_nofollow, FsCheckError};
+use crate::fs_util::{ensure_directory, set_nofollow, sync_directory, FsCheckError};
 
 /// Maximum size in bytes of any single registry TOML file. Identities and
 /// their key records serialize to well under a kilobyte; the cap guards
@@ -383,6 +383,15 @@ pub enum RegistryError {
         actual: u32,
         expected: u32,
     },
+
+    /// `$XDG_DATA_HOME` or `$HOME` is set to a relative path.
+    ///
+    /// Relative paths silently resolve against the process cwd at daemon-launch
+    /// time, leading to data ending up in unexpected locations. Reject early.
+    RelativeDataDir {
+        var_name: &'static str,
+        path: PathBuf,
+    },
 }
 
 impl RegistryError {
@@ -460,6 +469,11 @@ impl std::fmt::Display for RegistryError {
                 f,
                 "registry file for identity {identity_id} has {count} [[keys]] entries; v1 requires exactly one",
             ),
+            Self::RelativeDataDir { var_name, path } => write!(
+                f,
+                "${var_name} is a relative path ({}); the data directory must be absolute",
+                path.display()
+            ),
             Self::MissingHome
             | Self::NotFound { .. }
             | Self::SymlinkedDataDir { .. }
@@ -536,7 +550,8 @@ fn fmt_short(err: &RegistryError, f: &mut std::fmt::Formatter<'_>) -> std::fmt::
         | RegistryError::WrongDirectoryMode { .. }
         | RegistryError::KeyIdentityMismatch { .. }
         | RegistryError::NoKeys { .. }
-        | RegistryError::TooManyKeys { .. } => {
+        | RegistryError::TooManyKeys { .. }
+        | RegistryError::RelativeDataDir { .. } => {
             unreachable!("dispatched in <RegistryError as Display>::fmt")
         }
     }
@@ -564,7 +579,8 @@ impl std::error::Error for RegistryError {
             | Self::KeyIdentityMismatch { .. }
             | Self::NoKeys { .. }
             | Self::TooManyKeys { .. }
-            | Self::WrongDirectoryMode { .. } => None,
+            | Self::WrongDirectoryMode { .. }
+            | Self::RelativeDataDir { .. } => None,
         }
     }
 }
@@ -574,10 +590,26 @@ fn resolve_default_data_dir(
     home: Option<&OsStr>,
 ) -> Result<PathBuf, RegistryError> {
     let base = match xdg_data_home {
-        Some(value) if !value.is_empty() => PathBuf::from(value),
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(RegistryError::RelativeDataDir {
+                    var_name: "XDG_DATA_HOME",
+                    path,
+                });
+            }
+            path
+        }
         _ => {
             let home = home.ok_or(RegistryError::MissingHome)?;
-            PathBuf::from(home).join(".local").join("share")
+            let path = PathBuf::from(home);
+            if !path.is_absolute() {
+                return Err(RegistryError::RelativeDataDir {
+                    var_name: "HOME",
+                    path,
+                });
+            }
+            path.join(".local").join("share")
         }
     };
     Ok(base.join("reeve").join("identities"))
@@ -714,17 +746,6 @@ fn apply_file_mode(file: &File) -> io::Result<()> {
 #[cfg(not(unix))]
 fn apply_file_mode(_file: &File) -> io::Result<()> {
     Ok(())
-}
-
-/// Best-effort fsync of the directory after a rename so the entry is durable
-/// before we return. Failures here are non-fatal: the file content is
-/// already durable through `sync_all` on the tmp file, and the rename itself
-/// is the atomicity primitive — directory metadata persistence is a power-
-/// loss durability question, not a torn-state one.
-fn sync_directory(dir: &Path) {
-    if let Ok(handle) = File::open(dir) {
-        let _ = handle.sync_all();
-    }
 }
 
 #[cfg(test)]
@@ -1125,6 +1146,71 @@ valid_from = "2026-06-01T00:00:00Z"
     fn resolve_default_data_dir_errors_when_xdg_and_home_both_unset() {
         let err = resolve_default_data_dir(None, None).unwrap_err();
         assert!(matches!(err, RegistryError::MissingHome));
+    }
+
+    #[test]
+    fn resolve_rejects_relative_xdg_data_home() {
+        // Relative XDG_DATA_HOME must be rejected.
+        let err = resolve_default_data_dir(
+            Some(OsStr::new("data/home")),
+            Some(OsStr::new("/home/operator")),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistryError::RelativeDataDir {
+                    var_name: "XDG_DATA_HOME",
+                    ..
+                }
+            ),
+            "expected RelativeDataDir for XDG_DATA_HOME, got {err:?}",
+        );
+
+        // Relative HOME (XDG unset so HOME fallback is used) must also be rejected.
+        let err = resolve_default_data_dir(None, Some(OsStr::new("home/operator"))).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                RegistryError::RelativeDataDir {
+                    var_name: "HOME",
+                    ..
+                }
+            ),
+            "expected RelativeDataDir for HOME, got {err:?}",
+        );
+    }
+
+    #[test]
+    fn display_relative_data_dir() {
+        let xdg_err = RegistryError::RelativeDataDir {
+            var_name: "XDG_DATA_HOME",
+            path: PathBuf::from("data/home"),
+        };
+        let s = xdg_err.to_string();
+        assert!(
+            s.contains("XDG_DATA_HOME"),
+            "display must reference var name: {s}",
+        );
+        assert!(
+            s.contains("data/home"),
+            "display must include the relative path: {s}",
+        );
+        assert!(
+            s.contains("absolute"),
+            "display must mention 'absolute': {s}",
+        );
+
+        let home_err = RegistryError::RelativeDataDir {
+            var_name: "HOME",
+            path: PathBuf::from("home/operator"),
+        };
+        let s = home_err.to_string();
+        assert!(s.contains("HOME"), "display must reference var name: {s}");
+        assert!(
+            s.contains("home/operator"),
+            "display must include the relative path: {s}",
+        );
     }
 
     #[test]
