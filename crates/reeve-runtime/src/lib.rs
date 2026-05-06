@@ -30,7 +30,10 @@ pub use config::{
     install_defaults, load_persona_config, load_team_config, ConfigError, PersonaConfig,
     TeamConfig, TeamMember,
 };
-pub use daemon::{daemon_run, daemon_spawn, daemon_status, daemon_stop, DaemonError, DaemonStatus};
+pub use daemon::{
+    daemon_run, daemon_spawn, daemon_status, daemon_stop, heartbeat_fresh, DaemonError,
+    DaemonStatus,
+};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{

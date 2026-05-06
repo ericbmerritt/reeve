@@ -48,6 +48,8 @@ enum Commands {
         #[command(subcommand)]
         command: daemon::DaemonSubcommand,
     },
+    /// Attach the TUI to the running daemon.
+    Attach,
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,6 +113,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) => cmd_envelope_verify(&file),
         Some(Commands::Adapter { command }) => adapter::dispatch(command),
         Some(Commands::Daemon { command }) => daemon::dispatch(&command),
+        Some(Commands::Attach) => cmd_attach(),
     }
 }
 
@@ -212,6 +215,22 @@ fn cmd_envelope_verify(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn parse_identity_id(s: &str) -> Result<IdentityId, Box<dyn std::error::Error>> {
     let uuid: uuid::Uuid = s.parse()?;
     Ok(IdentityId::try_from(uuid)?)
+}
+
+fn cmd_attach() -> Result<(), Box<dyn std::error::Error>> {
+    let state_dir = reeve_runtime::runtime_lock::default_state_dir()?;
+    if !reeve_tui::heartbeat_fresh(&state_dir) {
+        writeln!(
+            io::stdout().lock(),
+            "no runtime found, run reeve daemon start",
+        )?;
+        return Ok(());
+    }
+    writeln!(
+        io::stdout().lock(),
+        "[TUI not yet implemented — Phase 8 Task 2]",
+    )?;
+    Ok(())
 }
 
 fn prompt_display_name() -> Result<String, Box<dyn std::error::Error>> {

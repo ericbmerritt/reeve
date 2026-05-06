@@ -200,6 +200,17 @@ fn heartbeat_age(path: &Path) -> Option<Duration> {
     Some(now.duration_since(mtime).unwrap_or(Duration::ZERO))
 }
 
+// ── heartbeat_fresh ───────────────────────────────────────────────────────────
+
+/// Returns `true` if the daemon heartbeat file is fresh (written within 2 seconds).
+///
+/// Reads `{state_dir}/runtime/heartbeat` mtime via `symlink_metadata`. A symlink
+/// at the path is treated as absent. Returns `false` on any error.
+pub fn heartbeat_fresh(state_dir: &Path) -> bool {
+    let path = state_dir.join("runtime").join("heartbeat");
+    matches!(heartbeat_age(&path), Some(age) if age <= STALE_THRESHOLD)
+}
+
 // ── daemon_spawn ──────────────────────────────────────────────────────────────
 
 /// Spawn the daemon as a detached background process.
