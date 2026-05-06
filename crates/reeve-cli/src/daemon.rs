@@ -5,12 +5,13 @@
 //! Lifecycle logic lives entirely in [`reeve_runtime::daemon`].
 
 use std::io::{self, Write};
+use std::sync::Arc;
 
 use clap::Subcommand;
 use reeve_runtime::runtime_lock::default_state_dir;
 use reeve_runtime::{
-    daemon_run, daemon_spawn, daemon_status, daemon_stop, DaemonError, DaemonStatus,
-    IdentityRegistry,
+    daemon_run, daemon_spawn, daemon_status, daemon_stop, keychain::labels, DaemonError,
+    DaemonStatus, IdentityRegistry, KeychainError, OperatorSecretStore,
 };
 
 // ── Subcommand definitions ────────────────────────────────────────────────────
@@ -143,7 +144,51 @@ fn format_status(
 fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = default_state_dir()?;
     let data_dir = IdentityRegistry::default_data_dir()?;
-    daemon_run(state_dir, &data_dir).map_err(Into::into)
+    let adapter = build_adapter_for_daemon()?;
+    daemon_run(state_dir, &data_dir, &adapter).map_err(Into::into)
+}
+
+/// Retrieve the Anthropic API key from the platform keychain and construct
+/// the `ClaudeOpus47` adapter.
+///
+/// Mirrors the key-loading path used by `reeve adapter test`
+/// (`adapter::retrieve_api_key`). The CLI layer owns keychain access;
+/// `reeve-runtime` receives an already-constructed adapter.
+fn build_adapter_for_daemon() -> Result<Arc<dyn reeve_adapter::Adapter>, Box<dyn std::error::Error>>
+{
+    let store = crate::keychain::open_platform_secretstore()?;
+    let secret = store
+        .retrieve_secret(labels::ANTHROPIC_API_KEY)
+        .map_err(keychain_error_for_daemon)?;
+    let adapter = reeve_adapter::ClaudeOpus47::new(secret);
+    Ok(Arc::new(adapter))
+}
+
+/// Map a [`KeychainError`] from daemon adapter loading to a user-facing error.
+///
+/// `SecretNotFound` gets a tailored hint; all other variants surface their
+/// `Display` representation. Platform-specific arms are unreachable on the
+/// opposing platform; the final wildcard handles `#[non_exhaustive]` future
+/// additions.
+fn keychain_error_for_daemon(err: KeychainError) -> Box<dyn std::error::Error> {
+    match err {
+        KeychainError::SecretNotFound { .. } => "No Anthropic API key in keychain. \
+             Run `reeve adapter set-key` to add one."
+            .into(),
+        KeychainError::NotFound { .. }
+        | KeychainError::InvalidSecretEncoding { .. }
+        | KeychainError::InvalidSeedLength { .. } => Box::new(err),
+        #[cfg(target_os = "macos")]
+        KeychainError::MacOsKeychain { .. } | KeychainError::MacOsKeychainForLabel { .. } => {
+            Box::new(err)
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        KeychainError::DuplicateEntry { .. }
+        | KeychainError::SecretService { .. }
+        | KeychainError::SecretServiceUnavailable { .. }
+        | KeychainError::SecretServiceForLabel { .. } => Box::new(err),
+        _ => Box::new(err),
+    }
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

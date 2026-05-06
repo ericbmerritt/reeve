@@ -178,6 +178,16 @@ impl AgentInbox {
         }
     }
 
+    /// Construct an inbox handle from a plain path.
+    ///
+    /// The directories must already exist (e.g., created by
+    /// [`crate::agent_fs::AgentDirs::provision`]). Use this for name-based
+    /// agent inboxes (`agents/lead/inbox/`) rather than identity-ID-based
+    /// ones (`agents/<uuid>/inbox/`).
+    pub fn from_path(inbox_root: PathBuf) -> Self {
+        Self::from_root(inbox_root)
+    }
+
     /// The inbox base: `agents/<id>/inbox/`.
     pub fn root(&self) -> &Path {
         &self.root
