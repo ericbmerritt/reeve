@@ -1535,6 +1535,7 @@ name = "reeve-runtime"
 version = "0.1.0"
 dependencies = [
  "actix",
+ "async-trait",
  "ed25519-dalek",
  "libc",
  "notify",
