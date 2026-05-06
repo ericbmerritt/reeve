@@ -329,7 +329,7 @@ fn write_pid_file(state_dir: &Path, pid_path: &Path) -> Result<(), RuntimeLockEr
 }
 
 /// Read and parse the PID from a pid file, returning `None` on any failure.
-fn read_pid_file(pid_path: &Path) -> Option<u32> {
+pub(crate) fn read_pid_file(pid_path: &Path) -> Option<u32> {
     use std::io::Read;
 
     let mut options = OpenOptions::new();

@@ -5,6 +5,7 @@
 //! `specs/reeve-domain-model.md` § Runtime for owned state and lifecycle.
 
 pub mod audit;
+pub mod daemon;
 pub(crate) mod fs_util;
 pub mod identity_registry;
 pub mod inbox;
@@ -18,6 +19,7 @@ pub mod verify;
 pub mod watcher;
 
 pub use audit::{AuditError, AuditEvent, AuditLog};
+pub use daemon::{daemon_run, daemon_spawn, daemon_status, daemon_stop, DaemonError, DaemonStatus};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{
