@@ -349,8 +349,8 @@ pub(crate) fn read_pid_file(pid_path: &Path) -> Option<u32> {
 
 // `apply_pid_file_mode` operates on an already-open `&File` via
 // `set_permissions`, which is a different shape from `fs_util::apply_file_mode_options`
-// (which takes `&mut OpenOptions`). The same pattern exists in
-// `identity_registry::apply_file_mode`.
+// (which takes `&mut OpenOptions`). The canonical shared version for
+// already-open files is `fs_util::apply_file_perms`.
 #[cfg(unix)]
 fn apply_pid_file_mode(file: &File) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
