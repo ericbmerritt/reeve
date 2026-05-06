@@ -261,4 +261,41 @@ mod tests {
         assert!(output.contains("alive"), "got: {output:?}");
         assert!(output.contains('1'), "got: {output:?}");
     }
+
+    // D1: keychain_error_for_daemon maps SecretNotFound to a hint message.
+    #[test]
+    fn keychain_error_secret_not_found_maps_to_hint() {
+        use reeve_runtime::KeychainError;
+
+        use super::keychain_error_for_daemon;
+
+        let err = KeychainError::SecretNotFound {
+            label: reeve_runtime::keychain::labels::ANTHROPIC_API_KEY.to_owned(),
+        };
+        let mapped = keychain_error_for_daemon(err);
+        let msg = mapped.to_string();
+        assert!(
+            msg.contains("No Anthropic API key in keychain"),
+            "expected hint message; got: {msg}"
+        );
+        assert!(
+            msg.contains("reeve adapter set-key"),
+            "expected set-key hint; got: {msg}"
+        );
+    }
+
+    // D2: keychain_error_for_daemon maps InvalidSecretEncoding to Box<dyn Error>.
+    #[test]
+    fn keychain_error_other_variants_surface_display() {
+        use reeve_runtime::KeychainError;
+
+        use super::keychain_error_for_daemon;
+
+        let err = KeychainError::InvalidSecretEncoding {
+            label: String::from("test"),
+        };
+        let mapped = keychain_error_for_daemon(err);
+        let msg = mapped.to_string();
+        assert!(!msg.is_empty(), "error message must not be empty");
+    }
 }
