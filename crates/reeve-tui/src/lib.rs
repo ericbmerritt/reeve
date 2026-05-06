@@ -5,8 +5,11 @@
 //! See `specs/reeve-tui-design.md` and `specs/reeve-tui-screens.md` for
 //! design and layout.
 
+pub mod app;
 pub mod reader;
 pub mod state;
+pub mod submit;
+pub mod ui;
 pub mod watcher;
 
 pub use reader::{heartbeat_fresh, read_conversation, read_cost, read_status};
