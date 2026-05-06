@@ -12,13 +12,12 @@
 //! mode `0o700`; config files are created with mode `0o600`.
 
 use std::fmt;
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
-use tempfile::NamedTempFile;
 
-use crate::fs_util::{ensure_directory, sync_directory};
+use crate::fs_util::ensure_directory;
 
 // ── File-mode constants ───────────────────────────────────────────────────────
 
@@ -348,39 +347,16 @@ fn ensure_config_dir(dir: &Path) -> Result<(), ConfigError> {
 
 /// Atomically write `content` to `target`, using `dir` as the temp directory.
 ///
-/// Pattern: `NamedTempFile::new_in(dir)` → set mode → write → fsync → persist.
-/// A crash at any point before persist leaves `target` unchanged.
+/// Pattern: `NamedTempFile::new_in(dir)` → set mode → write → fsync →
+/// persist → sync dir. A crash at any point before persist leaves `target`
+/// unchanged.
 fn atomic_write_str(dir: &Path, target: &Path, content: &str) -> Result<(), ConfigError> {
-    let mut tmp = NamedTempFile::new_in(dir).map_err(|source| ConfigError::Io {
-        path: dir.to_path_buf(),
-        source,
-    })?;
-
-    crate::fs_util::apply_file_perms(tmp.as_file(), CONFIG_FILE_MODE).map_err(|source| {
-        ConfigError::Io {
-            path: tmp.path().to_path_buf(),
+    crate::fs_util::atomic_write_file(target, dir, content.as_bytes(), CONFIG_FILE_MODE).map_err(
+        |source| ConfigError::Io {
+            path: target.to_path_buf(),
             source,
-        }
-    })?;
-
-    tmp.write_all(content.as_bytes())
-        .map_err(|source| ConfigError::Io {
-            path: tmp.path().to_path_buf(),
-            source,
-        })?;
-
-    tmp.as_file().sync_all().map_err(|source| ConfigError::Io {
-        path: tmp.path().to_path_buf(),
-        source,
-    })?;
-
-    tmp.persist(target).map_err(|err| ConfigError::Io {
-        path: target.to_path_buf(),
-        source: err.error,
-    })?;
-
-    sync_directory(dir);
-    Ok(())
+        },
+    )
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
