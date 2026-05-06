@@ -149,7 +149,7 @@ The model adapter framework and first concrete adapter. Per domain-model § Adap
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| 🟡 in-progress  | 2026-05-06 |            |
+| ✅ complete     | 2026-05-06 | 2026-05-06 |
 
 Tags: runtime
 
@@ -180,7 +180,7 @@ The long-lived background process that hosts the supervisor tree and the runtime
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| 🟡 in-progress  | 2026-05-06 |            |
 
 Tags: runtime, agent
 
