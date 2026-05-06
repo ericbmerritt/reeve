@@ -11,6 +11,7 @@ pub mod inbox;
 pub mod keychain;
 pub mod ledger;
 pub mod runtime_lock;
+pub mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod verify;
@@ -26,6 +27,7 @@ pub use ledger::{
     DeliveryKey, DeliveryLedger, DeliveryRecord, LedgerError, ReplayKey, ReplayLedger, ReplayRecord,
 };
 pub use runtime_lock::{default_state_dir, RuntimeLock, RuntimeLockError};
+pub use supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 pub use verify::{
     emit_quarantine_audit, EnvelopeIds, QuarantineReason, Verdict, VerificationError,
     VerificationPipeline, DEFAULT_CLOCK_SKEW, MAX_ENVELOPE_BYTES,

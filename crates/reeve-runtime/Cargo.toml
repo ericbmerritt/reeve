@@ -13,6 +13,8 @@ publish.workspace = true
 workspace = true
 
 [dependencies]
+actix = { workspace = true }
+tokio = { workspace = true }
 reeve-types = { workspace = true }
 reeve-transport = { workspace = true }
 reeve-adapter = { workspace = true }
