@@ -6,8 +6,8 @@
 //!   so external monitors can detect a stalled daemon without polling the PID
 //!   file.
 //! - [`WatcherActor`]: a supervised mailbox that holds the [`Watcher`] handle.
-//!   Incoming [`WatchInbox`] messages are accepted and the `(agent_id, inbox)`
-//!   pairs are queued in `pending_inboxes` until the watcher loop is wired in.
+//!   Incoming [`WatchInbox`] messages immediately start watching the inbox
+//!   using [`Watcher::run`] in a `spawn_blocking` thread.
 //!
 //! Both actors are started via [`actix::Supervisor::start`] by the daemon
 //! runner. This module provides only the actor types and their message contracts
@@ -177,23 +177,20 @@ fn touch_heartbeat(path: &std::path::Path) -> io::Result<()> {
 
 /// Supervised actor that holds the [`Watcher`] handle for the inbox pipeline.
 ///
-/// Accepts [`WatchInbox`] messages and queues the `(agent_id, inbox)` pairs in
-/// `pending_inboxes` until the watcher loop is wired in. No active filesystem
-/// watching occurs until then.
+/// Accepts [`WatchInbox`] messages and immediately starts watching the inbox
+/// using [`Watcher::run`] in a blocking thread via
+/// [`tokio::task::spawn_blocking`]. The blocking thread is kept off the async
+/// executor so it does not stall other tasks.
 ///
 /// [`Watcher::run`]: crate::watcher::Watcher::run
 pub struct WatcherActor {
     watcher: Arc<Watcher>,
-    pending_inboxes: Vec<(IdentityId, AgentInbox)>,
 }
 
 impl WatcherActor {
     /// Construct a watcher actor from an existing [`Watcher`] handle.
     pub fn new(watcher: Arc<Watcher>) -> Self {
-        Self {
-            watcher,
-            pending_inboxes: Vec::new(),
-        }
+        Self { watcher }
     }
 
     /// Return the shared watcher handle.
@@ -217,9 +214,18 @@ impl Supervised for WatcherActor {
 impl Handler<WatchInbox> for WatcherActor {
     type Result = ();
 
-    /// Queue the inbox for watching.
+    /// Start watching the inbox in a blocking thread.
+    ///
+    /// [`Watcher::run`] is a blocking loop; `spawn_blocking` keeps it off the
+    /// async executor. Errors in the watcher loop are logged and the loop
+    /// exits; the supervisor does not restart the watcher thread automatically.
     fn handle(&mut self, msg: WatchInbox, _ctx: &mut Context<Self>) {
-        self.pending_inboxes.push((msg.agent_id, msg.inbox));
+        let watcher = Arc::clone(&self.watcher);
+        let agent_id = msg.agent_id;
+        let inbox = msg.inbox;
+        tokio::task::spawn_blocking(move || {
+            let _ = watcher.run(agent_id, &inbox);
+        });
     }
 }
 
@@ -232,15 +238,9 @@ mod tests {
     use std::time::Duration;
 
     use actix::{Actor, ActorContext, Context, Handler, Message, Supervised, Supervisor};
-    use reeve_types::IdentityId;
     use tempfile::tempdir;
 
-    use super::{HeartbeatActor, WatchInbox, WatcherActor};
-    use crate::audit::AuditLog;
-    use crate::identity_registry::IdentityRegistry;
-    use crate::inbox::InboxLayout;
-    use crate::ledger::{DeliveryLedger, ReplayLedger};
-    use crate::watcher::Watcher;
+    use super::HeartbeatActor;
 
     // ── S1: heartbeat actor touches the file ──────────────────────────────────
 
@@ -347,45 +347,6 @@ mod tests {
         );
     }
 
-    // ── S3: watcher actor queues WatchInbox messages ──────────────────────────
-
-    /// `WatcherActor` stores `WatchInbox` messages in `pending_inboxes` without
-    /// performing any active filesystem watching.
-    #[test]
-    fn watcher_actor_stores_watch_inbox_messages() {
-        let tmp = crate::test_support::secure_dir();
-        let data_dir = tmp.path().to_path_buf();
-
-        // Build the minimal infra needed to construct a Watcher.
-        let registry = Arc::new(IdentityRegistry::open(data_dir.clone()).unwrap());
-        let replay = Arc::new(ReplayLedger::open(data_dir.clone()).unwrap());
-        let delivery = Arc::new(DeliveryLedger::open(data_dir.clone()).unwrap());
-        let audit = Arc::new(AuditLog::open(data_dir.clone()).unwrap());
-        let watcher = Arc::new(Watcher::new(&registry, &replay, delivery, audit));
-
-        let layout = InboxLayout::open(data_dir.clone()).unwrap();
-        let agent_id = IdentityId::new().unwrap();
-        let inbox = layout.provision(agent_id).unwrap();
-
-        let watcher_owned = Arc::clone(&watcher);
-        let len = actix::System::new().block_on(async move {
-            let addr = Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher_owned)));
-
-            // Send WatchInbox then query via the native actix response path.
-            // Actix guarantees in-order delivery to a single actor, so
-            // WatchInbox is processed before QueryPendingLen. The `.await` on
-            // `send` blocks until the actor returns the reply — no channel or
-            // sleep needed.
-            addr.do_send(WatchInbox { agent_id, inbox });
-            let len = addr.send(QueryPendingLen).await.unwrap();
-
-            actix::System::current().stop();
-            len
-        });
-
-        assert_eq!(len, 1, "WatcherActor must have one pending inbox entry");
-    }
-
     // ── Test-only actor types ─────────────────────────────────────────────────
 
     /// Test actor that calls `ctx.stop()` when it receives [`TriggerStop`],
@@ -415,23 +376,6 @@ mod tests {
 
         fn handle(&mut self, _msg: TriggerStop, ctx: &mut Context<Self>) {
             ctx.stop();
-        }
-    }
-
-    /// Ask `WatcherActor` to return its `pending_inboxes` length via actix's
-    /// native response path. Test-only; avoids exposing `pending_inboxes` on
-    /// the public type.
-    struct QueryPendingLen;
-
-    impl Message for QueryPendingLen {
-        type Result = usize;
-    }
-
-    impl Handler<QueryPendingLen> for WatcherActor {
-        type Result = usize;
-
-        fn handle(&mut self, _msg: QueryPendingLen, _ctx: &mut Context<Self>) -> usize {
-            self.pending_inboxes.len()
         }
     }
 }

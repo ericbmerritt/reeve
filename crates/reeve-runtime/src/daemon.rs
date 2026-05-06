@@ -16,11 +16,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use crate::agent_fs::AgentDirs;
 use crate::audit::AuditLog;
+use crate::config::{install_defaults, load_persona_config, load_team_config};
 use crate::identity_registry::IdentityRegistry;
+use crate::inbox::AgentInbox;
+use crate::lead_agent::LeadAgent;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
+use crate::model_resolution::{resolve_model, write_spawn_snapshot};
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
-use crate::supervisor::{HeartbeatActor, WatcherActor};
+use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 use crate::watcher::Watcher;
 
 /// Filename of the PID file inside the state directory.
@@ -342,12 +347,20 @@ type Resources = (
 /// Acquires the runtime lock, opens all persistent resources, starts the actix
 /// supervisor tree, and blocks until SIGTERM arrives (Unix) or the system is
 /// stopped. On return the lock is dropped and the PID file is removed.
-pub fn daemon_run(state_dir: PathBuf, data_dir: &Path) -> Result<(), DaemonError> {
+///
+/// The `adapter` is built by the CLI layer (which has access to the platform
+/// keychain) and passed in here so the runtime crate does not need to reopen
+/// the keychain itself.
+pub fn daemon_run(
+    state_dir: PathBuf,
+    data_dir: &Path,
+    adapter: &Arc<dyn reeve_adapter::Adapter>,
+) -> Result<(), DaemonError> {
     let _lock = acquire_lock(state_dir.clone())?;
     let (registry, replay, delivery, audit) = open_resources(data_dir)?;
     let watcher = Arc::new(Watcher::new(&registry, &replay, delivery, audit));
 
-    run_actor_system(state_dir, watcher)
+    run_actor_system(state_dir, data_dir, watcher, adapter)
 }
 
 /// Acquire the runtime lock, mapping `RuntimeLockError` into `DaemonError`.
@@ -389,7 +402,17 @@ fn open_resources(data_dir: &Path) -> Result<Resources, DaemonError> {
 }
 
 /// Start the actix system, launch supervised actors, and block until shutdown.
-fn run_actor_system(state_dir: PathBuf, watcher: Arc<Watcher>) -> Result<(), DaemonError> {
+fn run_actor_system(
+    state_dir: PathBuf,
+    data_dir: &Path,
+    watcher: Arc<Watcher>,
+    adapter: &Arc<dyn reeve_adapter::Adapter>,
+) -> Result<(), DaemonError> {
+    // Prepare everything that can fail before entering the actix runtime.
+    // Agent startup failures surface here with structured errors rather than
+    // being swallowed inside block_on.
+    let startup = prepare_agent_startup(data_dir, watcher, adapter)?;
+
     #[cfg(unix)]
     {
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -402,7 +425,7 @@ fn run_actor_system(state_dir: PathBuf, watcher: Arc<Watcher>) -> Result<(), Dae
         })?;
 
         actix::System::new().block_on(async move {
-            start_actors(&state_dir, watcher);
+            launch_actors(state_dir, startup);
             let system = actix::System::current();
             tokio::spawn(async move {
                 signal_stream.recv().await;
@@ -419,7 +442,7 @@ fn run_actor_system(state_dir: PathBuf, watcher: Arc<Watcher>) -> Result<(), Dae
     #[cfg(not(unix))]
     {
         actix::System::new().block_on(async move {
-            start_actors(&state_dir, watcher);
+            launch_actors(state_dir, startup);
             // No signal API on this platform. This future never resolves; the
             // process must be killed externally. Non-Unix is not a supported
             // deployment target.
@@ -430,11 +453,130 @@ fn run_actor_system(state_dir: PathBuf, watcher: Arc<Watcher>) -> Result<(), Dae
     Ok(())
 }
 
-/// Start the supervised `HeartbeatActor` and `WatcherActor`.
-fn start_actors(state_dir: &Path, watcher: Arc<Watcher>) {
-    let state_dir = state_dir.to_path_buf();
+/// Pre-computed inputs for [`launch_actors`]; produced by the fallible
+/// [`prepare_agent_startup`] step that runs before the actix system starts.
+struct AgentStartup {
+    lead_agent: LeadAgent,
+    inbox: AgentInbox,
+    agent_id: reeve_types::IdentityId,
+    watcher: Arc<Watcher>,
+}
+
+/// Fallible preparation: load configs, provision directories, resolve the
+/// model, write the spawn snapshot, and construct the lead agent value.
+///
+/// None of this requires the actix runtime to be running, so errors can be
+/// propagated normally.
+fn prepare_agent_startup(
+    data_dir: &Path,
+    watcher: Arc<Watcher>,
+    adapter: &Arc<dyn reeve_adapter::Adapter>,
+) -> Result<AgentStartup, DaemonError> {
+    // 1. Install default configs if they do not already exist.
+    install_defaults(data_dir).map_err(|e| DaemonError::Resource {
+        component: "config defaults",
+        source: Box::new(e),
+    })?;
+
+    // 2. Load the default team config.
+    let team_path = data_dir.join("teams").join("default.toml");
+    let team = load_team_config(&team_path).map_err(|e| DaemonError::Resource {
+        component: "team config",
+        source: Box::new(e),
+    })?;
+
+    // 3. Locate the lead member entry.
+    let lead_member = team
+        .members
+        .iter()
+        .find(|m| m.role_label == team.lead_role)
+        .ok_or_else(|| DaemonError::Resource {
+            component: "lead member",
+            source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                "team config has no member with role_label '{}'",
+                team.lead_role
+            )),
+        })?;
+
+    // 4. Load persona config for the lead member.
+    let persona_path = data_dir
+        .join("personas")
+        .join(&lead_member.persona_name)
+        .join("config.toml");
+    let persona_config = load_persona_config(&persona_path).map_err(|e| DaemonError::Resource {
+        component: "persona config",
+        source: Box::new(e),
+    })?;
+
+    // 5. Provision the lead agent directory tree.
+    let dirs = AgentDirs::provision(data_dir, "lead").map_err(|e| DaemonError::Resource {
+        component: "agent dirs",
+        source: Box::new(e),
+    })?;
+
+    // 6. Resolve the model adapter against this persona's preferences.
+    let snapshot =
+        resolve_model(&persona_config, &[adapter.as_ref()]).map_err(|e| DaemonError::Resource {
+            component: "model resolution",
+            source: Box::new(e),
+        })?;
+
+    // 7. Write the spawn snapshot to disk.
+    write_spawn_snapshot(&dirs, &snapshot).map_err(|e| DaemonError::Resource {
+        component: "spawn snapshot",
+        source: Box::new(e),
+    })?;
+
+    // 8. Construct the lead agent value.
+    let system_prompt = persona_config.system_prompt.clone();
+    let lead_agent =
+        LeadAgent::new(Arc::clone(adapter), &dirs, snapshot, system_prompt).map_err(|e| {
+            DaemonError::Resource {
+                component: "lead agent",
+                source: Box::new(e),
+            }
+        })?;
+
+    // 9. Build the inbox handle pointing to the lead's provisioned inbox.
+    let inbox = AgentInbox::from_path(dirs.inbox_root());
+
+    // 10. Generate a transient identity for the lead agent's watcher slot.
+    //     The watcher uses this to key the ledger; for the walking skeleton a
+    //     fresh ID per boot is acceptable. A persistent agent-identity mapping
+    //     is a task for a later ladder.
+    let agent_id = reeve_types::IdentityId::new().map_err(|e| DaemonError::Resource {
+        component: "agent identity",
+        source: Box::new(e),
+    })?;
+
+    Ok(AgentStartup {
+        lead_agent,
+        inbox,
+        agent_id,
+        watcher,
+    })
+}
+
+/// Start all supervised actors inside the running actix system.
+///
+/// Must be called from within an actix `block_on` context.
+fn launch_actors(state_dir: PathBuf, startup: AgentStartup) {
+    let AgentStartup {
+        lead_agent,
+        inbox,
+        agent_id,
+        watcher,
+    } = startup;
+
+    // HeartbeatActor: touches the heartbeat file every second.
     actix::Supervisor::start(move |_| HeartbeatActor::new(state_dir));
-    actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
+
+    // LeadAgent: processes inbound envelopes via the model adapter.
+    actix::Supervisor::start(move |_| lead_agent);
+
+    // WatcherActor: watches the lead inbox and dispatches verified messages.
+    let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
+    watcher_addr.do_send(WatchInbox { agent_id, inbox });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
