@@ -12,6 +12,7 @@ pub(crate) mod fs_util;
 pub mod identity_registry;
 pub mod inbox;
 pub mod keychain;
+pub mod lead_agent;
 pub mod ledger;
 pub mod model_resolution;
 pub mod runtime_lock;
@@ -35,6 +36,7 @@ pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{
     labels, KeychainError, OperatorKeyStore, OperatorSecretStore, KEYCHAIN_SERVICE, SEED_LEN,
 };
+pub use lead_agent::{LeadAgent, LeadAgentError, ProcessInbound};
 pub use ledger::{
     DeliveryKey, DeliveryLedger, DeliveryRecord, LedgerError, ReplayKey, ReplayLedger, ReplayRecord,
 };
