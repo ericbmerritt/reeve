@@ -12,6 +12,7 @@ authors = ["Eric Merritt <eric@merritt.tech>"]
 publish = false
 
 [workspace.dependencies]
+actix = { version = "0.13", default-features = false }
 async-trait = { version = "0.1" }
 clap = { version = "4", features = ["derive"] }
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros", "time"] }
