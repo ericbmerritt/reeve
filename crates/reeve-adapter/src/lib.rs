@@ -358,6 +358,10 @@ impl CostEstimate {
 ///
 /// This struct is `#[non_exhaustive]`: future tasks may add fields (e.g.
 /// reasoning traces, cache metadata) without breaking callers.
+///
+/// Use [`Response::new_text`] to construct a `Response` from outside this crate —
+/// the `#[non_exhaustive]` attribute prevents struct-literal construction by
+/// external callers.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct Response {
@@ -379,6 +383,28 @@ pub struct Response {
     /// — the contract is per-adapter and should be documented in concrete
     /// adapter implementations.
     pub latency: std::time::Duration,
+}
+
+impl Response {
+    /// Construct a text-only `Response` from outside this crate.
+    ///
+    /// Sets `tool_calls` to empty, `finish_reason` to [`FinishReason::EndTurn`],
+    /// and `latency` to zero. Useful for mock adapters and simple adapter
+    /// implementations that do not use tool calling.
+    ///
+    /// For responses that include tool calls, construct `Response` directly
+    /// using struct literal syntax inside the `reeve-adapter` crate (the
+    /// `#[non_exhaustive]` attribute only prevents external struct literals).
+    pub fn new_text(content: Vec<MessageContent>, tokens: TokenCounts, cost: CostEstimate) -> Self {
+        Self {
+            content,
+            tool_calls: Vec::new(),
+            finish_reason: FinishReason::EndTurn,
+            tokens,
+            cost,
+            latency: std::time::Duration::ZERO,
+        }
+    }
 }
 
 /// A tool invocation the model requested.
