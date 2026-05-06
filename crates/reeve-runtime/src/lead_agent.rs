@@ -13,6 +13,8 @@
 //!   adapter, then transitions back to `"idle"` on completion or error.
 
 use std::fmt;
+use std::io::Read as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use actix::{Actor, ActorContext, AsyncContext, Context, Handler, Supervised};
@@ -35,7 +37,7 @@ pub enum LeadAgentError {
     /// Unclassified I/O error with path context.
     Io {
         /// File that could not be opened or written.
-        path: std::path::PathBuf,
+        path: PathBuf,
         /// Underlying OS error.
         source: std::io::Error,
     },
@@ -120,6 +122,8 @@ pub struct LeadAgent {
     /// retry with the full history. Reset the agent (restart) to clear the
     /// in-memory history.
     history: Vec<reeve_adapter::Message>,
+    /// Path to `agents/lead/inbox/cur/`. Watched for new verified envelopes.
+    inbox_cur: PathBuf,
 }
 
 /// Default maximum tokens for the adapter response.
@@ -142,6 +146,7 @@ impl LeadAgent {
         let status_writer =
             AtomicFileWriter::new(dirs.status_path()).map_err(LeadAgentError::Fs)?;
         let cost_writer = AtomicFileWriter::new(dirs.cost_path()).map_err(LeadAgentError::Fs)?;
+        let inbox_cur = dirs.inbox_root().join("cur");
         Ok(Self {
             adapter,
             snapshot,
@@ -152,6 +157,7 @@ impl LeadAgent {
             total_cost_microdollars: 0u64,
             in_flight: false,
             history: Vec::new(),
+            inbox_cur,
         })
     }
 
@@ -294,10 +300,17 @@ impl LeadAgent {
 impl Actor for LeadAgent {
     type Context = Context<Self>;
 
-    /// Initialize the agent: record the start event, write idle status.
+    /// Initialize the agent: record the start event, write idle status, and
+    /// start the inbox/cur/ watcher that forwards verified envelopes.
     fn started(&mut self, ctx: &mut Context<Self>) {
         self.append_system_entry("agent started", ctx);
         self.set_idle(ctx);
+
+        let inbox_cur = self.inbox_cur.clone();
+        let addr = ctx.address();
+        tokio::spawn(async move {
+            watch_inbox_cur(inbox_cur, addr).await;
+        });
     }
 }
 
@@ -356,6 +369,98 @@ fn extract_response_text(content: &[reeve_adapter::MessageContent]) -> String {
         }
     }
     String::new()
+}
+
+// ── inbox/cur/ watcher ────────────────────────────────────────────────────────
+
+/// Read a verified envelope file from `inbox/cur/` and return the body as a
+/// UTF-8 string, or `None` if the file cannot be read or decoded.
+///
+/// The file is opened with `O_NOFOLLOW`. The body field of the [`Envelope`] is
+/// already decoded from its base64 wire representation by `serde_json`.
+fn read_envelope_payload(path: &Path) -> Option<String> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    crate::fs_util::set_nofollow(&mut options);
+    let mut file = options.open(path).ok()?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).ok()?;
+    let envelope: reeve_types::Envelope = serde_json::from_slice(&buf).ok()?;
+    String::from_utf8(envelope.body).ok()
+}
+
+/// Send one [`ProcessInbound`] message for each path in the `cur/` directory.
+///
+/// Used at startup to process envelopes that arrived before the watcher
+/// subscribed (crash-recovery scan).
+fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<LeadAgent>) {
+    let Ok(entries) = std::fs::read_dir(inbox_cur) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(payload) = read_envelope_payload(&path) {
+            let message_id = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+                .to_owned();
+            addr.do_send(ProcessInbound {
+                payload,
+                message_id,
+            });
+        }
+    }
+}
+
+/// Watch `inbox/cur/` for `Create` events and forward each new verified
+/// envelope to the [`LeadAgent`] as a [`ProcessInbound`] message.
+///
+/// Subscribes to filesystem events first, then performs a one-shot startup
+/// scan so envelopes deposited before this function ran are not silently
+/// dropped (crash-recovery). If `notify` setup fails the function returns
+/// silently; the agent can still be spawned and respond if messages are
+/// delivered after the next restart.
+async fn watch_inbox_cur(inbox_cur: PathBuf, addr: actix::Addr<LeadAgent>) {
+    use notify::{EventKind, RecursiveMode, Watcher as _};
+    use std::sync::mpsc;
+
+    let (tx, rx) = mpsc::channel();
+    let Ok(mut watcher) = notify::RecommendedWatcher::new(tx, notify::Config::default()) else {
+        return;
+    };
+    if watcher
+        .watch(&inbox_cur, RecursiveMode::NonRecursive)
+        .is_err()
+    {
+        return;
+    }
+
+    // Crash-recovery: process files already in cur/ before the watch started.
+    scan_cur(&inbox_cur, &addr);
+
+    let _ = tokio::task::spawn_blocking(move || {
+        // Hold watcher alive for the duration of the loop.
+        let _watcher = watcher;
+        while let Ok(Ok(event)) = rx.recv() {
+            if matches!(event.kind, EventKind::Create(_)) {
+                for path in event.paths {
+                    if let Some(payload) = read_envelope_payload(&path) {
+                        let message_id = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_owned();
+                        addr.do_send(ProcessInbound {
+                            payload,
+                            message_id,
+                        });
+                    }
+                }
+            }
+        }
+    })
+    .await;
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

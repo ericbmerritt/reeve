@@ -586,11 +586,16 @@ mod tests {
     use std::fs;
     use std::io;
     use std::path::{Path, PathBuf};
+    use std::sync::Arc;
     use std::time::Duration;
 
     #[cfg(unix)]
     use super::wait_for_exit;
-    use super::{confirm_started, daemon_status, DaemonError, DaemonStatus};
+    use super::{confirm_started, daemon_status, prepare_agent_startup, DaemonError, DaemonStatus};
+    use crate::audit::AuditLog;
+    use crate::identity_registry::IdentityRegistry;
+    use crate::ledger::{DeliveryLedger, ReplayLedger};
+    use crate::watcher::Watcher;
 
     fn write_pid(state_dir: &Path, pid: u32) {
         fs::create_dir_all(state_dir).unwrap();
@@ -743,6 +748,103 @@ mod tests {
         assert!(
             matches!(result, Err(DaemonError::Timeout { .. })),
             "expected Timeout, got {result:?}",
+        );
+    }
+
+    // ── prepare_agent_startup tests ───────────────────────────────────────────
+
+    /// Mock adapter that advertises the default persona model `claude-opus-4-7`.
+    struct MockOpusAdapter;
+
+    #[async_trait::async_trait]
+    impl reeve_adapter::Adapter for MockOpusAdapter {
+        fn id(&self) -> &'static str {
+            "claude-opus-4-7@anthropic-direct"
+        }
+
+        fn capabilities(&self) -> reeve_adapter::Capabilities {
+            reeve_adapter::Capabilities::new()
+        }
+
+        async fn call(
+            &self,
+            _messages: &[reeve_adapter::Message],
+            _tools: &[reeve_adapter::Tool],
+            _params: &reeve_adapter::Params,
+        ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+            Err(reeve_adapter::AdapterError::BadRequest {
+                message: String::from("mock: no calls"),
+            })
+        }
+    }
+
+    fn build_test_watcher(data_dir: &Path) -> Arc<Watcher> {
+        let registry = Arc::new(IdentityRegistry::open(data_dir.to_path_buf()).unwrap());
+        let replay = Arc::new(ReplayLedger::open(data_dir.to_path_buf()).unwrap());
+        let delivery = Arc::new(DeliveryLedger::open(data_dir.to_path_buf()).unwrap());
+        let audit = Arc::new(AuditLog::open(data_dir.to_path_buf()).unwrap());
+        Arc::new(Watcher::new(&registry, &replay, delivery, audit))
+    }
+
+    // A1: prepare_agent_startup succeeds with default configs and a matching adapter.
+    #[test]
+    fn prepare_agent_startup_succeeds_with_defaults_and_matching_adapter() {
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let watcher = build_test_watcher(&data_dir);
+        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(MockOpusAdapter);
+
+        let result = prepare_agent_startup(&data_dir, watcher, &adapter);
+        assert!(
+            result.is_ok(),
+            "prepare_agent_startup should succeed with defaults; got: {:?}",
+            result.err().map(|e| e.to_string())
+        );
+    }
+
+    // A2: prepare_agent_startup returns Resource error when no adapter matches.
+    #[test]
+    fn prepare_agent_startup_fails_with_no_matching_adapter() {
+        struct WrongAdapter;
+
+        #[async_trait::async_trait]
+        impl reeve_adapter::Adapter for WrongAdapter {
+            fn id(&self) -> &'static str {
+                "other-model@route"
+            }
+
+            fn capabilities(&self) -> reeve_adapter::Capabilities {
+                reeve_adapter::Capabilities::new()
+            }
+
+            async fn call(
+                &self,
+                _: &[reeve_adapter::Message],
+                _: &[reeve_adapter::Tool],
+                _: &reeve_adapter::Params,
+            ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+                Err(reeve_adapter::AdapterError::BadRequest {
+                    message: String::from("mock"),
+                })
+            }
+        }
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let watcher = build_test_watcher(&data_dir);
+        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(WrongAdapter);
+
+        let result = prepare_agent_startup(&data_dir, watcher, &adapter);
+        let is_model_resolution_err = matches!(
+            result,
+            Err(DaemonError::Resource {
+                component: "model resolution",
+                ..
+            })
+        );
+        assert!(
+            is_model_resolution_err,
+            "expected Resource model resolution error"
         );
     }
 }
