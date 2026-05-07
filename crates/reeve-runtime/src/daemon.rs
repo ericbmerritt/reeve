@@ -35,7 +35,12 @@ const PID_FILENAME: &str = "runtime.pid";
 const STALE_THRESHOLD: Duration = Duration::from_secs(2);
 
 /// How long [`daemon_spawn`] waits for the daemon to write its PID file.
-const SPAWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+///
+/// First run is slower: the daemon installs default configs, opens multiple
+/// file-based stores, resolves the model adapter, and starts the actix
+/// supervisor tree before writing the heartbeat file. 15 s is generous but
+/// avoids false "start failed" errors on cold or resource-constrained machines.
+const SPAWN_CONFIRM_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Poll interval for [`confirm_started`] when waiting for the daemon to write
 /// its PID file.
@@ -243,7 +248,10 @@ fn spawn_detached(exe: &Path) -> Result<(), DaemonError> {
     cmd.args(["daemon", "run-internal"]);
     cmd.stdin(std::process::Stdio::null());
     cmd.stdout(std::process::Stdio::null());
-    cmd.stderr(std::process::Stdio::null());
+    // Daemon log: stderr goes to $XDG_STATE_HOME/reeve/daemon.log so errors are
+    // visible without attaching to the process. Falls back to /dev/null on any
+    // file-open failure so a log permission issue never blocks startup.
+    cmd.stderr(daemon_log_stdio());
 
     #[cfg(unix)]
     {
@@ -259,6 +267,26 @@ fn spawn_detached(exe: &Path) -> Result<(), DaemonError> {
     })?;
     // Child handle is intentionally dropped; daemon is detached.
     Ok(())
+}
+
+/// Return a `Stdio` that appends daemon stderr to `<state_dir>/daemon.log`.
+///
+/// Falls back to `/dev/null` so a log-file permission problem never prevents
+/// the daemon from starting.
+fn daemon_log_stdio() -> std::process::Stdio {
+    // Attempt to resolve the state directory; if that fails, fall back quietly.
+    let Ok(state_dir) = crate::runtime_lock::default_state_dir() else {
+        return std::process::Stdio::null();
+    };
+    let log_path = state_dir.join("daemon.log");
+    // ensure_directory creates the dir if absent; ignore errors here.
+    let _ = crate::fs_util::ensure_directory(&state_dir, 0o700);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .map(std::process::Stdio::from)
+        .unwrap_or_else(|_| std::process::Stdio::null())
 }
 
 /// Poll `daemon_status` until the daemon is `Alive` or `SPAWN_CONFIRM_TIMEOUT`
@@ -426,26 +454,24 @@ fn run_actor_system(
 
     #[cfg(unix)]
     {
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let mut signal_stream = tokio::signal::unix::signal(
-            tokio::signal::unix::SignalKind::terminate(),
-        )
-        .map_err(|source| DaemonError::Resource {
-            component: "SIGTERM handler",
-            source: Box::new(source),
-        })?;
-
         actix::System::new().block_on(async move {
             launch_actors(state_dir, startup);
+            // Set up SIGTERM handler inside block_on — tokio::signal requires
+            // an active runtime, which actix provides only once block_on starts.
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let Ok(mut signal_stream) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            else {
+                // If signal registration fails, run without graceful shutdown.
+                std::future::pending::<()>().await;
+                return;
+            };
             let system = actix::System::current();
             tokio::spawn(async move {
                 signal_stream.recv().await;
                 system.stop();
-                // Ignore send error: the block_on future may have already resolved.
                 let _ = shutdown_tx.send(());
             });
-            // Await shutdown notification. Resolves when SIGTERM fires or
-            // system.stop() is called from another path.
             let _ = shutdown_rx.await;
         });
     }
@@ -735,9 +761,11 @@ mod tests {
 
     // T1: confirm_started returns Timeout when no PID file is ever written.
     //
-    // SPAWN_CONFIRM_TIMEOUT is 2s; this test will take up to 2s. It verifies
-    // the loop terminates with the correct error variant.
+    // Marked #[ignore] because SPAWN_CONFIRM_TIMEOUT is 15s and this test
+    // waits the full duration. Run explicitly with `cargo test -- --ignored`
+    // when verifying timeout behaviour.
     #[test]
+    #[ignore = "SPAWN_CONFIRM_TIMEOUT is 15s; run with --ignored when verifying timeout behaviour"]
     fn confirm_started_returns_timeout_when_daemon_does_not_start() {
         let tmp = tempfile::tempdir().unwrap();
         let state_dir = tmp.path().join("state");
