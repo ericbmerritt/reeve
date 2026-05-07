@@ -4,6 +4,7 @@
 //! maildir watcher, audit log writer, model resolution, cost meters. See
 //! `specs/reeve-domain-model.md` § Runtime for owned state and lifecycle.
 
+pub mod agent;
 pub mod agent_fs;
 pub mod audit;
 pub mod config;
@@ -12,7 +13,6 @@ pub(crate) mod fs_util;
 pub mod identity_registry;
 pub mod inbox;
 pub mod keychain;
-pub mod lead_agent;
 pub mod ledger;
 pub mod model_resolution;
 pub mod runtime_lock;
@@ -22,6 +22,7 @@ pub(crate) mod test_support;
 pub mod verify;
 pub mod watcher;
 
+pub use agent::{Agent, AgentError, ProcessInbound, QuarantineEvent};
 pub use agent_fs::{
     AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread,
 };
@@ -39,7 +40,6 @@ pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{
     labels, KeychainError, OperatorKeyStore, OperatorSecretStore, KEYCHAIN_SERVICE, SEED_LEN,
 };
-pub use lead_agent::{LeadAgent, LeadAgentError, ProcessInbound};
 pub use ledger::{
     DeliveryKey, DeliveryLedger, DeliveryRecord, LedgerError, ReplayKey, ReplayLedger, ReplayRecord,
 };

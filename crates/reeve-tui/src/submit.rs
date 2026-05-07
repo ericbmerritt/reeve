@@ -105,9 +105,7 @@ impl std::error::Error for SubmitError {
             Self::Registry(err) => Some(err),
             Self::Keychain(err) => Some(err),
             Self::Sign(err) => Some(err),
-            Self::AgentIdMissing
-            | Self::NoOperatorEnrolled
-            | Self::OperatorHasNoActiveKey => None,
+            Self::AgentIdMissing | Self::NoOperatorEnrolled | Self::OperatorHasNoActiveKey => None,
         }
     }
 }
