@@ -90,7 +90,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use notify::event::{CreateKind, EventKind};
+use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use reeve_types::{IdentityId, KeyId, MessageId};
 use time::{Duration, OffsetDateTime};
@@ -366,7 +366,18 @@ impl Watcher {
 
         for event_result in &rx {
             let event = event_result.map_err(WatcherError::Notify)?;
-            if !matches!(event.kind, EventKind::Create(CreateKind::File)) {
+            // Accept both Create and Rename-Into events. On macOS, an atomic
+            // rename(2) from inbox/tmp/ into inbox/new/ generates a
+            // Modify(Name(To)) event rather than a Create event, so both
+            // must be handled to catch TUI-submitted messages.
+            let is_new_file = matches!(event.kind, EventKind::Create(CreateKind::File))
+                || matches!(
+                    event.kind,
+                    EventKind::Modify(ModifyKind::Name(
+                        RenameMode::To | RenameMode::Both | RenameMode::Any
+                    ))
+                );
+            if !is_new_file {
                 continue;
             }
             for path in event.paths {

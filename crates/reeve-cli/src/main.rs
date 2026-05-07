@@ -5,7 +5,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use reeve_runtime::{AuditLog, IdentityRegistry};
+use reeve_runtime::{AuditLog, IdentityRegistry, OperatorSecretStore as _};
+use secrecy::ExposeSecret as _;
 use reeve_types::IdentityId;
 
 mod adapter;
@@ -158,7 +159,16 @@ fn cmd_reeve() -> Result<(), Box<dyn std::error::Error>> {
         }
         reeve_runtime::DaemonStatus::NotRunning => {
             writeln!(io::stdout().lock(), "Starting daemon...")?;
+            // Retrieve the API key in the foreground so the macOS Keychain
+            // dialog (if any) appears here rather than in the background
+            // daemon process. The spawned daemon reads the key from this
+            // env var and never touches the keychain directly.
+            let api_key = secret_store
+                .retrieve_secret(reeve_runtime::keychain::labels::ANTHROPIC_API_KEY)
+                .map_err(|e| format!("keychain: {e}"))?;
+            std::env::set_var("REEVE_ADAPTER_KEY", api_key.expose_secret());
             reeve_runtime::daemon_spawn(&state_dir)?;
+            std::env::remove_var("REEVE_ADAPTER_KEY");
             // TODO: replace with a daemon readiness signal once the protocol lands.
             std::thread::sleep(std::time::Duration::from_millis(500));
         }

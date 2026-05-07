@@ -13,6 +13,7 @@ use reeve_runtime::{
     daemon_run, daemon_spawn, daemon_status, daemon_stop, keychain::labels, DaemonError,
     DaemonStatus, IdentityRegistry, KeychainError, OperatorSecretStore,
 };
+use secrecy::ExposeSecret as _;
 
 // ── Subcommand definitions ────────────────────────────────────────────────────
 
@@ -49,7 +50,12 @@ pub(crate) fn dispatch(cmd: &DaemonSubcommand) -> Result<(), Box<dyn std::error:
 
 fn cmd_start() -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = default_state_dir()?;
-    handle_spawn_result(daemon_spawn(&state_dir), &mut io::stdout().lock())
+    // Pre-fetch the API key in the foreground so the macOS Keychain dialog
+    // (if any) appears here rather than in the background daemon process.
+    preload_adapter_key()?;
+    let result = daemon_spawn(&state_dir);
+    std::env::remove_var("REEVE_ADAPTER_KEY");
+    handle_spawn_result(result, &mut io::stdout().lock())
 }
 
 // ── stop ──────────────────────────────────────────────────────────────────────
@@ -148,6 +154,18 @@ fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
     daemon_run(state_dir, &data_dir, &adapter).map_err(Into::into)
 }
 
+/// Fetch the Anthropic API key from the keychain and stash it in
+/// `REEVE_ADAPTER_KEY` so the spawned daemon subprocess can read it without
+/// triggering a second Keychain dialog.
+fn preload_adapter_key() -> Result<(), Box<dyn std::error::Error>> {
+    let store = crate::keychain::open_platform_secretstore()?;
+    let secret = store
+        .retrieve_secret(labels::ANTHROPIC_API_KEY)
+        .map_err(|e| format!("keychain: {e}"))?;
+    std::env::set_var("REEVE_ADAPTER_KEY", secret.expose_secret());
+    Ok(())
+}
+
 /// Retrieve the Anthropic API key from the platform keychain and construct
 /// the `ClaudeOpus47` adapter.
 ///
@@ -156,6 +174,14 @@ fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
 /// `reeve-runtime` receives an already-constructed adapter.
 fn build_adapter_for_daemon() -> Result<Arc<dyn reeve_adapter::Adapter>, Box<dyn std::error::Error>>
 {
+    // If the parent process pre-loaded the key (to avoid a macOS Keychain
+    // dialog in a background process), use it directly.
+    if let Ok(key_str) = std::env::var("REEVE_ADAPTER_KEY") {
+        let secret = secrecy::SecretString::from(key_str);
+        return Ok(Arc::new(reeve_adapter::ClaudeOpus47::new(secret)));
+    }
+    // Fall back to the keychain — reached when the daemon is started
+    // independently (e.g. `reeve daemon start`).
     let store = crate::keychain::open_platform_secretstore()?;
     let secret = store
         .retrieve_secret(labels::ANTHROPIC_API_KEY)
