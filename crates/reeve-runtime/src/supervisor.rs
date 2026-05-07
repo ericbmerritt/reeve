@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use actix::{Actor, ActorContext, AsyncContext, Context, Handler, Message, Supervised};
 use reeve_types::IdentityId;
+use tracing::{debug, info, warn};
 
 use crate::fs_util::{apply_file_mode_options, ensure_directory, set_nofollow};
 use crate::inbox::AgentInbox;
@@ -118,6 +119,7 @@ impl Actor for HeartbeatActor {
     /// Create `<state_dir>/runtime/` and schedule the first tick.
     fn started(&mut self, ctx: &mut Context<Self>) {
         if self.ensure_runtime_dir(ctx) {
+            debug!(path = %self.heartbeat_path.display(), "heartbeat actor started");
             ctx.notify_later(Tick, HEARTBEAT_INTERVAL);
         }
     }
@@ -130,6 +132,7 @@ impl Supervised for HeartbeatActor {
     /// error) would cause `restarting` to schedule a tick, `touch_heartbeat`
     /// to fail (no dir), the actor to stop again, and so on indefinitely.
     fn restarting(&mut self, ctx: &mut Context<Self>) {
+        warn!("heartbeat actor restarting");
         if self.ensure_runtime_dir(ctx) {
             ctx.notify_later(Tick, HEARTBEAT_INTERVAL);
         }
@@ -140,7 +143,8 @@ impl Handler<Tick> for HeartbeatActor {
     type Result = ();
 
     fn handle(&mut self, _msg: Tick, ctx: &mut Context<Self>) {
-        if touch_heartbeat(&self.heartbeat_path).is_err() {
+        if let Err(err) = touch_heartbeat(&self.heartbeat_path) {
+            warn!(err = %err, "heartbeat write failed, stopping for supervisor restart");
             ctx.stop();
             return;
         }
@@ -223,6 +227,7 @@ impl Handler<WatchInbox> for WatcherActor {
         let watcher = Arc::clone(&self.watcher);
         let agent_id = msg.agent_id;
         let inbox = msg.inbox;
+        info!(inbox_root = %inbox.root().display(), "watcher started for inbox");
         tokio::task::spawn_blocking(move || {
             let _ = watcher.run(agent_id, &inbox);
         });

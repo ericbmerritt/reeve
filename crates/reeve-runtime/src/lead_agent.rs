@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 use actix::{Actor, ActorContext, AsyncContext, Context, Handler, Supervised};
 use time::OffsetDateTime;
+use tracing::{debug, info, warn};
 
 use crate::agent_fs::{
     AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread,
@@ -263,6 +264,11 @@ impl LeadAgent {
         use actix::fut::WrapFuture as _;
         use actix::ActorFutureExt as _;
 
+        debug!(
+            model = %self.snapshot.model(),
+            history_len = self.history.len(),
+            "calling adapter"
+        );
         let adapter = Arc::clone(&self.adapter);
         let messages = self.history.clone();
         let params = reeve_adapter::Params {
@@ -275,11 +281,17 @@ impl LeadAgent {
             .map(|result, actor, inner_ctx| match result {
                 Ok(response) => {
                     actor.in_flight = false;
+                    info!(
+                        input_tokens = response.tokens.input,
+                        output_tokens = response.tokens.output,
+                        "response received"
+                    );
                     actor.handle_response(&response, inner_ctx);
                 }
                 Err(err) => {
                     actor.in_flight = false;
                     actor.history.pop();
+                    warn!(err = %err, "adapter call failed");
                     // Adapter error: log to journal (best-effort) then go idle.
                     // The primary error is the adapter failure; a journal error
                     // here does not compound the failure.
@@ -303,6 +315,7 @@ impl Actor for LeadAgent {
     /// Initialize the agent: record the start event, write idle status, and
     /// start the inbox/cur/ watcher that forwards verified envelopes.
     fn started(&mut self, ctx: &mut Context<Self>) {
+        info!(adapter = %self.snapshot.adapter_id, "lead agent ready");
         self.append_system_entry("agent started", ctx);
         self.set_idle(ctx);
 
@@ -315,6 +328,7 @@ impl Supervised for LeadAgent {
     /// Recover after a supervised restart: restore idle status without
     /// re-logging the start event.
     fn restarting(&mut self, ctx: &mut Context<Self>) {
+        warn!("lead agent restarting");
         self.in_flight = false;
         self.set_idle(ctx);
     }
@@ -337,6 +351,7 @@ impl Handler<ProcessInbound> for LeadAgent {
             let _ = self.conversation.append(&entry);
             return;
         }
+        info!(message_id = %msg.message_id, "processing");
         self.in_flight = true;
         if self.status_writer.write("working").is_err() {
             ctx.stop();
@@ -419,7 +434,7 @@ fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<LeadAgent>) {
 /// silently; the agent can still be spawned and respond if messages are
 /// delivered after the next restart.
 fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<LeadAgent>) {
-    use notify::{EventKind, RecursiveMode, Watcher as _};
+    use notify::{RecursiveMode, Watcher as _};
     use std::sync::mpsc;
 
     let (tx, rx) = mpsc::channel();
@@ -445,25 +460,16 @@ fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<LeadAgent>) {
     // only after the loop exits — a deadlock). A detached `std::thread` is
     // not owned by the tokio runtime and is killed by the OS when the process
     // exits normally.
+    let inbox_cur = inbox_cur.to_owned();
     let _ = std::thread::spawn(move || {
         // Hold watcher alive for the duration of the loop.
         let _watcher = watcher;
-        while let Ok(Ok(event)) = rx.recv() {
-            if matches!(event.kind, EventKind::Create(_)) {
-                for path in event.paths {
-                    if let Some(payload) = read_envelope_payload(&path) {
-                        let message_id = path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("unknown")
-                            .to_owned();
-                        addr.do_send(ProcessInbound {
-                            payload,
-                            message_id,
-                        });
-                    }
-                }
-            }
+        // Scan on every notification regardless of event kind. Discriminating
+        // event types is fragile: on macOS FSEvents an atomic rename(2) produces
+        // Modify(Name(To)) not Create, and the mapping varies by platform.
+        // scan_cur is idempotent via the delivery ledger.
+        while rx.recv().is_ok() {
+            scan_cur(&inbox_cur, &addr);
         }
     });
 }

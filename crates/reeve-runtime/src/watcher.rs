@@ -90,10 +90,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use notify::event::{CreateKind, EventKind, ModifyKind, RenameMode};
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
 use reeve_types::{IdentityId, KeyId, MessageId};
 use time::{Duration, OffsetDateTime};
+
+use tracing::{debug, error, info, warn};
 
 use crate::audit::{AuditError, AuditEvent, AuditLog};
 use crate::fs_util::set_nofollow;
@@ -353,6 +354,16 @@ impl Watcher {
     /// Phase 6 replaces this with a tokio task and a `CancellationToken`;
     /// for the walking skeleton a blocking loop is sufficient.
     pub fn run(&self, agent_id: IdentityId, inbox: &AgentInbox) -> Result<(), WatcherError> {
+        match self.run_inner(agent_id, inbox) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                error!(err = %e, "watcher loop error");
+                Err(e)
+            }
+        }
+    }
+
+    fn run_inner(&self, agent_id: IdentityId, inbox: &AgentInbox) -> Result<(), WatcherError> {
         // Subscribe BEFORE scanning so no file is missed in the gap.
         let (tx, rx) = std::sync::mpsc::channel();
         let mut fs_watcher =
@@ -362,27 +373,18 @@ impl Watcher {
             .map_err(WatcherError::Notify)?;
 
         // Crash-recovery scan: picks up files left from a prior run.
+        debug!("scanning inbox/new/ for existing files");
         self.scan_new(agent_id, inbox)?;
 
         for event_result in &rx {
-            let event = event_result.map_err(WatcherError::Notify)?;
-            // Accept both Create and Rename-Into events. On macOS, an atomic
-            // rename(2) from inbox/tmp/ into inbox/new/ generates a
-            // Modify(Name(To)) event rather than a Create event, so both
-            // must be handled to catch TUI-submitted messages.
-            let is_new_file = matches!(event.kind, EventKind::Create(CreateKind::File))
-                || matches!(
-                    event.kind,
-                    EventKind::Modify(ModifyKind::Name(
-                        RenameMode::To | RenameMode::Both | RenameMode::Any
-                    ))
-                );
-            if !is_new_file {
-                continue;
-            }
-            for path in event.paths {
-                self.process_file(&path, agent_id, inbox)?;
-            }
+            event_result.map_err(WatcherError::Notify)?;
+            // Scan the directory on every event regardless of kind.
+            // Discriminating event types is fragile: on macOS FSEvents, an
+            // atomic rename(2) produces Modify(Name(To)) not Create, and the
+            // mapping varies by platform and filesystem. Scanning on any change
+            // is robust — process_file is idempotent via the delivery and
+            // replay ledgers.
+            self.scan_new(agent_id, inbox)?;
         }
 
         Ok(())
@@ -447,6 +449,7 @@ impl Watcher {
                     return Ok(ProcessOutcome::AlreadyProcessed);
                 }
                 if already_delivered {
+                    debug!(message_id = %envelope.message_id, "skipped already-delivered");
                     return Ok(ProcessOutcome::AlreadyDelivered {
                         message_id: envelope.message_id,
                     });
@@ -469,6 +472,11 @@ impl Watcher {
                         at: now,
                     })
                     .map_err(WatcherError::Audit)?;
+                info!(
+                    message_id = %envelope.message_id,
+                    sender_id = %sender.identity_id,
+                    "delivered"
+                );
                 Ok(ProcessOutcome::Delivered {
                     message_id: envelope.message_id,
                     sender_id: sender.identity_id,
@@ -485,6 +493,7 @@ impl Watcher {
                 }
                 emit_quarantine_audit(&self.audit, &reason, identifying.as_ref(), agent_id, now)
                     .map_err(WatcherError::Verification)?;
+                warn!(reason = %reason, "quarantined");
                 Ok(ProcessOutcome::Quarantined { reason })
             }
         }
