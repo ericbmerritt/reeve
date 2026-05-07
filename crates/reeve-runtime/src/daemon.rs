@@ -18,12 +18,12 @@ use std::time::{Duration, SystemTime};
 
 use tracing::{debug, info};
 
+use crate::agent::Agent;
 use crate::agent_fs::AgentDirs;
 use crate::audit::AuditLog;
 use crate::config::{install_defaults, load_persona_config, load_team_config};
 use crate::identity_registry::IdentityRegistry;
 use crate::inbox::AgentInbox;
-use crate::lead_agent::LeadAgent;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
 use crate::model_resolution::{resolve_model, write_spawn_snapshot};
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
@@ -518,7 +518,7 @@ fn run_actor_system(
 /// Pre-computed inputs for [`launch_actors`]; produced by the fallible
 /// [`prepare_agent_startup`] step that runs before the actix system starts.
 struct AgentStartup {
-    lead_agent: LeadAgent,
+    lead_agent: Agent,
     inbox: AgentInbox,
     agent_id: reeve_types::IdentityId,
     watcher: Arc<Watcher>,
@@ -609,7 +609,7 @@ fn prepare_agent_startup(
     // 9. Construct the lead agent value.
     let system_prompt = persona_config.system_prompt.clone();
     let lead_agent =
-        LeadAgent::new(Arc::clone(adapter), &dirs, snapshot, system_prompt).map_err(|e| {
+        Agent::new(Arc::clone(adapter), &dirs, snapshot, system_prompt).map_err(|e| {
             DaemonError::Resource {
                 component: "lead agent",
                 source: Box::new(e),
@@ -641,12 +641,18 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) {
     // HeartbeatActor: touches the heartbeat file every second.
     actix::Supervisor::start(move |_| HeartbeatActor::new(state_dir));
 
-    // LeadAgent: processes inbound envelopes via the model adapter.
-    actix::Supervisor::start(move |_| lead_agent);
+    // Agent: processes inbound envelopes via the model adapter.
+    let lead_addr = actix::Supervisor::start(move |_| lead_agent);
 
     // WatcherActor: watches the lead inbox and dispatches verified messages.
     let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
-    watcher_addr.do_send(WatchInbox { agent_id, inbox });
+    watcher_addr.do_send(WatchInbox {
+        agent_id,
+        inbox,
+        on_quarantine: Some(Box::new(move |reason| {
+            lead_addr.do_send(crate::agent::QuarantineEvent { reason });
+        })),
+    });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

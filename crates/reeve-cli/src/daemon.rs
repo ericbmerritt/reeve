@@ -138,7 +138,7 @@ fn format_status(
         DaemonStatus::Stale { pid } => {
             writeln!(
                 out,
-                "stalled, PID {pid} (process alive but heartbeat stopped — run: daemon stop)"
+                "stale, PID {pid} (process alive but heartbeat stopped — run: daemon stop)"
             )?;
         }
         DaemonStatus::NotRunning => {
@@ -155,8 +155,7 @@ fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
     // (default: debug for reeve crates, warn for everything else).
     // Output goes to the file handle on stderr, which daemon_log_stdio()
     // redirected to state_dir/daemon.log.
-    let filter = std::env::var("REEVE_LOG")
-        .unwrap_or_else(|_| "reeve=debug,warn".to_owned());
+    let filter = std::env::var("REEVE_LOG").unwrap_or_else(|_| "reeve=debug,warn".to_owned());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_target(true)
@@ -279,7 +278,7 @@ mod tests {
         let mut buf = Vec::<u8>::new();
         format_status(DaemonStatus::NotRunning, &mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("no runtime"), "got: {output:?}");
+        assert!(output.contains("not running"), "got: {output:?}");
 
         // Stale
         let mut buf = Vec::<u8>::new();

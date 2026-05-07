@@ -270,15 +270,15 @@ mod tests {
         assert_eq!(entries[0].kind, EntryKind::Inbound);
         assert_eq!(
             entries[0].kind.speaker_label("lead"),
-            "lead",
-            "inbound speaker_label should return persona name"
+            "you",
+            "inbound speaker_label should return 'you' (the operator)"
         );
         assert_eq!(entries[0].text, "hello");
         assert_eq!(entries[1].kind, EntryKind::Outbound);
         assert_eq!(
             entries[1].kind.speaker_label("lead"),
-            "you",
-            "outbound speaker_label should return 'you'"
+            "lead",
+            "outbound speaker_label should return the persona name"
         );
         assert_eq!(entries[1].text, "world");
     }

@@ -25,8 +25,8 @@ impl EntryKind {
     /// Display label for this entry kind, given the persona name.
     pub fn speaker_label<'a>(&self, persona_name: &'a str) -> &'a str {
         match self {
-            Self::Inbound => persona_name,
-            Self::Outbound => "you",
+            Self::Inbound => "you",
+            Self::Outbound => persona_name,
             Self::System => "system",
         }
     }

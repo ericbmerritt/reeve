@@ -353,8 +353,13 @@ impl Watcher {
     ///
     /// Phase 6 replaces this with a tokio task and a `CancellationToken`;
     /// for the walking skeleton a blocking loop is sufficient.
-    pub fn run(&self, agent_id: IdentityId, inbox: &AgentInbox) -> Result<(), WatcherError> {
-        match self.run_inner(agent_id, inbox) {
+    pub fn run(
+        &self,
+        agent_id: IdentityId,
+        inbox: &AgentInbox,
+        on_quarantine: impl Fn(String) + Send,
+    ) -> Result<(), WatcherError> {
+        match self.run_inner(agent_id, inbox, &on_quarantine) {
             Ok(()) => Ok(()),
             Err(e) => {
                 error!(err = %e, "watcher loop error");
@@ -363,7 +368,12 @@ impl Watcher {
         }
     }
 
-    fn run_inner(&self, agent_id: IdentityId, inbox: &AgentInbox) -> Result<(), WatcherError> {
+    fn run_inner(
+        &self,
+        agent_id: IdentityId,
+        inbox: &AgentInbox,
+        on_quarantine: &(impl Fn(String) + Send),
+    ) -> Result<(), WatcherError> {
         // Subscribe BEFORE scanning so no file is missed in the gap.
         let (tx, rx) = std::sync::mpsc::channel();
         let mut fs_watcher =
@@ -374,7 +384,7 @@ impl Watcher {
 
         // Crash-recovery scan: picks up files left from a prior run.
         debug!("scanning inbox/new/ for existing files");
-        self.scan_new(agent_id, inbox)?;
+        self.scan_new(agent_id, inbox, on_quarantine)?;
 
         for event_result in &rx {
             event_result.map_err(WatcherError::Notify)?;
@@ -384,7 +394,7 @@ impl Watcher {
             // mapping varies by platform and filesystem. Scanning on any change
             // is robust — process_file is idempotent via the delivery and
             // replay ledgers.
-            self.scan_new(agent_id, inbox)?;
+            self.scan_new(agent_id, inbox, on_quarantine)?;
         }
 
         Ok(())
@@ -679,7 +689,12 @@ impl Watcher {
     /// Iterates `inbox/new/`, skipping symlinks and non-files. Calls
     /// [`Watcher::process_file`] on each regular file. Stops on the first
     /// system error; returns `Ok(())` after a complete pass.
-    fn scan_new(&self, agent_id: IdentityId, inbox: &AgentInbox) -> Result<(), WatcherError> {
+    fn scan_new(
+        &self,
+        agent_id: IdentityId,
+        inbox: &AgentInbox,
+        on_quarantine: &(impl Fn(String) + Send),
+    ) -> Result<(), WatcherError> {
         let entries = fs::read_dir(inbox.new_dir()).map_err(|source| WatcherError::Io {
             path: inbox.new_dir().to_path_buf(),
             source,
@@ -697,7 +712,10 @@ impl Watcher {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 continue;
             }
-            self.process_file(&path, agent_id, inbox)?;
+            let outcome = self.process_file(&path, agent_id, inbox)?;
+            if let ProcessOutcome::Quarantined { reason } = outcome {
+                on_quarantine(reason.to_string());
+            }
         }
         Ok(())
     }
@@ -1054,7 +1072,9 @@ mod tests {
         );
         place_in_new(&ctx.inbox, "leftover.json", &bytes);
 
-        ctx.watcher.scan_new(ctx.recipient_id, &ctx.inbox).unwrap();
+        ctx.watcher
+            .scan_new(ctx.recipient_id, &ctx.inbox, &|_| {})
+            .unwrap();
 
         assert!(
             ctx.inbox.cur().join("leftover.json").exists(),
@@ -1258,7 +1278,9 @@ mod tests {
         let link = ctx.inbox.new_dir().join("symlink.json");
         symlink(&target, &link).unwrap();
 
-        ctx.watcher.scan_new(ctx.recipient_id, &ctx.inbox).unwrap();
+        ctx.watcher
+            .scan_new(ctx.recipient_id, &ctx.inbox, &|_| {})
+            .unwrap();
         assert!(link.exists(), "symlink should remain untouched by scan");
     }
 

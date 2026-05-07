@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use reeve_runtime::{AuditLog, IdentityRegistry, OperatorSecretStore as _};
-use secrecy::ExposeSecret as _;
 use reeve_types::IdentityId;
+use secrecy::ExposeSecret as _;
 
 mod adapter;
 mod daemon;

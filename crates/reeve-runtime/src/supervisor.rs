@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use actix::{Actor, ActorContext, AsyncContext, Context, Handler, Message, Supervised};
 use reeve_types::IdentityId;
+use time;
 use tracing::{debug, info, warn};
 
 use crate::fs_util::{apply_file_mode_options, ensure_directory, set_nofollow};
@@ -38,6 +39,16 @@ const RUNTIME_SUBDIR: &str = "runtime";
 
 /// Interval between heartbeat file updates.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How often [`WatcherActor`] runs `cur/` rotation housekeeping.
+const ROTATION_INTERVAL: Duration = Duration::from_mins(5);
+
+/// Files older than this are moved from `cur/` to `archive/` on each rotation.
+///
+/// `cur/` is an in-flight buffer; the conversation journal is the durable
+/// record. 24 hours gives the operator a comfortable window to inspect recent
+/// deliveries in place while bounding directory growth.
+const CUR_RETENTION: time::Duration = time::Duration::hours(24);
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
@@ -58,6 +69,10 @@ pub struct WatchInbox {
     pub agent_id: IdentityId,
     /// Handle to the agent's inbox directory layout.
     pub inbox: AgentInbox,
+    /// Called with the quarantine reason string whenever the watcher pipeline
+    /// rejects an envelope to `quarantine/`. Use this to surface transport
+    /// failures in the agent's conversation thread. `None` disables the hook.
+    pub on_quarantine: Option<Box<dyn Fn(String) + Send + 'static>>,
 }
 
 impl Message for WatchInbox {
@@ -189,12 +204,17 @@ fn touch_heartbeat(path: &std::path::Path) -> io::Result<()> {
 /// [`Watcher::run`]: crate::watcher::Watcher::run
 pub struct WatcherActor {
     watcher: Arc<Watcher>,
+    /// Inboxes registered via [`WatchInbox`]; iterated on each rotation tick.
+    inboxes: Vec<AgentInbox>,
 }
 
 impl WatcherActor {
     /// Construct a watcher actor from an existing [`Watcher`] handle.
     pub fn new(watcher: Arc<Watcher>) -> Self {
-        Self { watcher }
+        Self {
+            watcher,
+            inboxes: Vec::new(),
+        }
     }
 
     /// Return the shared watcher handle.
@@ -208,17 +228,33 @@ impl WatcherActor {
 
 impl Actor for WatcherActor {
     type Context = Context<Self>;
+
+    fn started(&mut self, ctx: &mut Context<Self>) {
+        ctx.run_interval(ROTATION_INTERVAL, |actor, _ctx| {
+            let now = time::OffsetDateTime::now_utc();
+            for inbox in &actor.inboxes {
+                match actor.watcher.rotate_cur(inbox, CUR_RETENTION, now) {
+                    Ok(outcome) if outcome.archived > 0 => {
+                        debug!(archived = outcome.archived, "rotated cur/ to archive/");
+                    }
+                    Ok(_) => {}
+                    Err(e) => warn!(err = %e, "cur/ rotation error"),
+                }
+            }
+        });
+    }
 }
 
 impl Supervised for WatcherActor {
-    // No additional wiring needed on restart; pending_inboxes persists on the
+    // No additional wiring needed on restart; inboxes persists on the
     // actor value across restarts because `restarting` receives `&mut self`.
 }
 
 impl Handler<WatchInbox> for WatcherActor {
     type Result = ();
 
-    /// Start watching the inbox in a blocking thread.
+    /// Start watching the inbox in a blocking thread and register the inbox
+    /// for periodic `cur/` rotation.
     ///
     /// [`Watcher::run`] is a blocking loop; `spawn_blocking` keeps it off the
     /// async executor. Errors in the watcher loop are logged and the loop
@@ -226,10 +262,13 @@ impl Handler<WatchInbox> for WatcherActor {
     fn handle(&mut self, msg: WatchInbox, _ctx: &mut Context<Self>) {
         let watcher = Arc::clone(&self.watcher);
         let agent_id = msg.agent_id;
-        let inbox = msg.inbox;
+        let inbox = msg.inbox.clone();
+        self.inboxes.push(msg.inbox);
+        let on_quarantine = msg.on_quarantine;
         info!(inbox_root = %inbox.root().display(), "watcher started for inbox");
         tokio::task::spawn_blocking(move || {
-            let _ = watcher.run(agent_id, &inbox);
+            let cb = on_quarantine.unwrap_or_else(|| Box::new(|_| {}));
+            let _ = watcher.run(agent_id, &inbox, cb);
         });
     }
 }

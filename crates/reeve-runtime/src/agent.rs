@@ -30,7 +30,7 @@ use crate::model_resolution::SpawnSnapshot;
 
 /// Errors produced by the lead agent actor and its constructor.
 #[derive(Debug)]
-pub enum LeadAgentError {
+pub enum AgentError {
     /// Filesystem or JSONL journal error.
     Fs(AgentFsError),
     /// Error returned by the model adapter.
@@ -46,7 +46,7 @@ pub enum LeadAgentError {
     Json(serde_json::Error),
 }
 
-impl fmt::Display for LeadAgentError {
+impl fmt::Display for AgentError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fs(source) => write!(f, "agent fs error: {source}"),
@@ -59,7 +59,7 @@ impl fmt::Display for LeadAgentError {
     }
 }
 
-impl std::error::Error for LeadAgentError {
+impl std::error::Error for AgentError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Fs(source) => Some(source),
@@ -71,6 +71,19 @@ impl std::error::Error for LeadAgentError {
 }
 
 // ── ProcessInbound message ────────────────────────────────────────────────────
+
+/// Notify the lead agent that an inbound envelope was quarantined.
+///
+/// The agent appends a system entry to the conversation thread so the operator
+/// can see transport rejections without reading daemon logs.
+pub struct QuarantineEvent {
+    /// Human-readable quarantine reason (e.g. `"signature_invalid"`).
+    pub reason: String,
+}
+
+impl actix::Message for QuarantineEvent {
+    type Result = ();
+}
 
 /// Deliver an inbound envelope payload to the lead agent for processing.
 ///
@@ -88,13 +101,13 @@ impl actix::Message for ProcessInbound {
     type Result = ();
 }
 
-// ── LeadAgent actor ───────────────────────────────────────────────────────────
+// ── Agent actor ───────────────────────────────────────────────────────────
 
 /// Supervised actix actor that implements the lead agent's message loop.
 ///
 /// Calls the registered adapter with the accumulated conversation history
 /// and records all exchanges in an append-only JSONL journal.
-pub struct LeadAgent {
+pub struct Agent {
     /// Adapter used for all model calls.
     adapter: Arc<dyn reeve_adapter::Adapter>,
     /// Resolved adapter and persona information captured at spawn time.
@@ -130,8 +143,8 @@ pub struct LeadAgent {
 /// Default maximum tokens for the adapter response.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
-impl LeadAgent {
-    /// Construct a `LeadAgent`.
+impl Agent {
+    /// Construct a `Agent`.
     ///
     /// Opens the conversation journal and creates atomic writers for the
     /// status and cost files. Does not start the actor; call
@@ -141,12 +154,11 @@ impl LeadAgent {
         dirs: &AgentDirs,
         snapshot: SpawnSnapshot,
         system_prompt: String,
-    ) -> Result<Self, LeadAgentError> {
+    ) -> Result<Self, AgentError> {
         let conversation =
-            ConversationThread::open(&dirs.conversation_path()).map_err(LeadAgentError::Fs)?;
-        let status_writer =
-            AtomicFileWriter::new(dirs.status_path()).map_err(LeadAgentError::Fs)?;
-        let cost_writer = AtomicFileWriter::new(dirs.cost_path()).map_err(LeadAgentError::Fs)?;
+            ConversationThread::open(&dirs.conversation_path()).map_err(AgentError::Fs)?;
+        let status_writer = AtomicFileWriter::new(dirs.status_path()).map_err(AgentError::Fs)?;
+        let cost_writer = AtomicFileWriter::new(dirs.cost_path()).map_err(AgentError::Fs)?;
         let inbox_cur = dirs.inbox_root().join("cur");
         Ok(Self {
             adapter,
@@ -309,7 +321,7 @@ impl LeadAgent {
 
 // ── Actor impl ────────────────────────────────────────────────────────────────
 
-impl Actor for LeadAgent {
+impl Actor for Agent {
     type Context = Context<Self>;
 
     /// Initialize the agent: record the start event, write idle status, and
@@ -324,7 +336,7 @@ impl Actor for LeadAgent {
     }
 }
 
-impl Supervised for LeadAgent {
+impl Supervised for Agent {
     /// Recover after a supervised restart: restore idle status without
     /// re-logging the start event.
     fn restarting(&mut self, ctx: &mut Context<Self>) {
@@ -336,7 +348,7 @@ impl Supervised for LeadAgent {
 
 // ── Handler<ProcessInbound> ───────────────────────────────────────────────────
 
-impl Handler<ProcessInbound> for LeadAgent {
+impl Handler<ProcessInbound> for Agent {
     type Result = ();
 
     fn handle(&mut self, msg: ProcessInbound, ctx: &mut Context<Self>) {
@@ -365,6 +377,17 @@ impl Handler<ProcessInbound> for LeadAgent {
             content: reeve_adapter::MessageContent::Text(msg.payload),
         });
         self.spawn_adapter_call(ctx);
+    }
+}
+
+// ── Handler<QuarantineEvent> ──────────────────────────────────────────────────
+
+impl Handler<QuarantineEvent> for Agent {
+    type Result = ();
+
+    fn handle(&mut self, msg: QuarantineEvent, ctx: &mut Context<Self>) {
+        warn!(reason = %msg.reason, "envelope quarantined");
+        self.append_system_entry(&format!("quarantined: {}", msg.reason), ctx);
     }
 }
 
@@ -405,7 +428,7 @@ fn read_envelope_payload(path: &Path) -> Option<String> {
 ///
 /// Used at startup to process envelopes that arrived before the watcher
 /// subscribed (crash-recovery scan).
-fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<LeadAgent>) {
+fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<Agent>) {
     let Ok(entries) = std::fs::read_dir(inbox_cur) else {
         return;
     };
@@ -426,14 +449,14 @@ fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<LeadAgent>) {
 }
 
 /// Watch `inbox/cur/` for `Create` events and forward each new verified
-/// envelope to the [`LeadAgent`] as a [`ProcessInbound`] message.
+/// envelope to the [`Agent`] as a [`ProcessInbound`] message.
 ///
 /// Subscribes to filesystem events first, then performs a one-shot startup
 /// scan so envelopes deposited before this function ran are not silently
 /// dropped (crash-recovery). If `notify` setup fails the function returns
 /// silently; the agent can still be spawned and respond if messages are
 /// delivered after the next restart.
-fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<LeadAgent>) {
+fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<Agent>) {
     use notify::{RecursiveMode, Watcher as _};
     use std::sync::mpsc;
 
@@ -484,7 +507,7 @@ mod tests {
     use actix::Supervisor;
     use tempfile::tempdir;
 
-    use super::{LeadAgent, ProcessInbound};
+    use super::{Agent, ProcessInbound};
     use crate::agent_fs::{AgentDirs, ConversationEntry};
     use crate::model_resolution::SpawnSnapshot;
 
@@ -566,14 +589,14 @@ mod tests {
         }
     }
 
-    // L1: LeadAgent::new succeeds with a valid adapter and provisioned dirs.
+    // L1: Agent::new succeeds with a valid adapter and provisioned dirs.
     #[test]
     fn lead_agent_new_creates_valid_actor() {
         let tmp = tempdir().unwrap();
         let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let result = LeadAgent::new(adapter, &dirs, mock_snapshot(), String::new());
-        assert!(result.is_ok(), "LeadAgent::new should succeed");
+        let result = Agent::new(adapter, &dirs, mock_snapshot(), String::new());
+        assert!(result.is_ok(), "Agent::new should succeed");
     }
 
     // L2: After the actor starts, the status file contains "idle".
@@ -584,7 +607,7 @@ mod tests {
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
         let status_path = dirs.status_path();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = LeadAgent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let _addr = Supervisor::start(move |_| agent);
@@ -619,7 +642,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = LeadAgent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -711,7 +734,7 @@ mod tests {
         );
     }
 
-    // L6: LeadAgentError Display impls are non-empty and informative.
+    // L6: AgentError Display impls are non-empty and informative.
     #[test]
     fn lead_agent_error_display_impls() {
         use std::io;
@@ -719,9 +742,9 @@ mod tests {
 
         use crate::agent_fs::AgentFsError;
 
-        use super::LeadAgentError;
+        use super::AgentError;
 
-        let fs_err = LeadAgentError::Fs(AgentFsError::Io {
+        let fs_err = AgentError::Fs(AgentFsError::Io {
             path: PathBuf::from("agents/lead/status"),
             source: io::Error::from(io::ErrorKind::PermissionDenied),
         });
@@ -732,7 +755,7 @@ mod tests {
             "Fs variant missing context: {rendered}"
         );
 
-        let io_err = LeadAgentError::Io {
+        let io_err = AgentError::Io {
             path: PathBuf::from("agents/lead/cost"),
             source: io::Error::from(io::ErrorKind::NotFound),
         };
@@ -744,11 +767,11 @@ mod tests {
         );
 
         let serde_err = serde_json::from_str::<serde_json::Value>("bad").unwrap_err();
-        let json_err = LeadAgentError::Json(serde_err);
+        let json_err = AgentError::Json(serde_err);
         let rendered = json_err.to_string();
         assert!(!rendered.is_empty(), "Json variant display empty");
 
-        let adapter_err = LeadAgentError::Adapter(reeve_adapter::AdapterError::BadRequest {
+        let adapter_err = AgentError::Adapter(reeve_adapter::AdapterError::BadRequest {
             message: String::from("test"),
         });
         let rendered = adapter_err.to_string();
@@ -868,7 +891,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(SlowMockAdapter);
-        let agent = LeadAgent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -954,7 +977,7 @@ mod tests {
         let adapter = Arc::new(TwoPhaseAdapter {
             calls: calls_log_for_actor,
         });
-        let agent = LeadAgent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1046,7 +1069,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(AlwaysErrorAdapter);
-        let agent = LeadAgent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
         let status_path_outer = data_dir.join("agents").join("lead").join("status");
 
         actix::System::new().block_on(async move {
@@ -1132,6 +1155,75 @@ mod tests {
         assert!(
             msg.contains("context window exceeded"),
             "error message should include adapter error detail: {msg}"
+        );
+    }
+
+    // L-Q: A QuarantineEvent surfaces as a system entry in the conversation
+    // journal so transport rejections are visible without reading daemon logs.
+    #[test]
+    fn quarantine_event_appends_system_entry() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |_| agent);
+
+            // Wait for the actor to start.
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "actor did not start within 5 seconds",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(super::QuarantineEvent {
+                reason: String::from("signature_invalid"),
+            });
+
+            // Poll until journal has system(started) + system(quarantined) = 2.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                if content.lines().count() >= 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "quarantine system entry did not appear within 5 seconds",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let quarantine_entry = entries.iter().find(|e| {
+            e["type"] == "system"
+                && e["message"]
+                    .as_str()
+                    .map(|m| m.contains("quarantined") && m.contains("signature_invalid"))
+                    .unwrap_or(false)
+        });
+        assert!(
+            quarantine_entry.is_some(),
+            "journal missing quarantine system entry; entries: {entries:?}"
         );
     }
 }
