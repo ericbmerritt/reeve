@@ -136,10 +136,13 @@ fn format_status(
             writeln!(out, "alive, PID {pid}, heartbeat {age:.1}s ago")?;
         }
         DaemonStatus::Stale { pid } => {
-            writeln!(out, "stale, PID {pid} (heartbeat old or absent)")?;
+            writeln!(
+                out,
+                "stalled, PID {pid} (process alive but heartbeat stopped — run: daemon stop)"
+            )?;
         }
         DaemonStatus::NotRunning => {
-            writeln!(out, "no runtime")?;
+            writeln!(out, "not running")?;
         }
     }
     Ok(())
@@ -148,6 +151,18 @@ fn format_status(
 // ── run-internal ──────────────────────────────────────────────────────────────
 
 fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize structured logging. REEVE_LOG controls the filter
+    // (default: debug for reeve crates, warn for everything else).
+    // Output goes to the file handle on stderr, which daemon_log_stdio()
+    // redirected to state_dir/daemon.log.
+    let filter = std::env::var("REEVE_LOG")
+        .unwrap_or_else(|_| "reeve=debug,warn".to_owned());
+    tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+        .with_target(true)
+        .with_thread_ids(false)
+        .init();
+
     let state_dir = default_state_dir()?;
     let data_dir = IdentityRegistry::default_data_dir()?;
     let adapter = build_adapter_for_daemon()?;

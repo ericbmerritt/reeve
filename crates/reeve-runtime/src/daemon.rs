@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use tracing::{debug, info};
+
 use crate::agent_fs::AgentDirs;
 use crate::audit::AuditLog;
 use crate::config::{install_defaults, load_persona_config, load_team_config};
@@ -176,6 +178,8 @@ fn process_alive(pid: u32) -> bool {
     {
         std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .map(|s| s.success())
             .unwrap_or(false)
@@ -336,13 +340,28 @@ fn daemon_stop_unix(state_dir: &Path) -> Result<(), DaemonError> {
     }
 
     send_sigterm(pid)?;
-    wait_for_exit(pid, STOP_TIMEOUT)
+    match wait_for_exit(pid, STOP_TIMEOUT) {
+        Ok(()) => Ok(()),
+        Err(DaemonError::Timeout { .. }) => {
+            // SIGTERM was ignored (stalled actor loop, broken signal handler).
+            // Escalate to SIGKILL so `daemon stop` always terminates the process.
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+            wait_for_exit(pid, Duration::from_secs(2))
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(unix)]
 fn send_sigterm(pid: u32) -> Result<(), DaemonError> {
     let status = std::process::Command::new("kill")
         .args(["-15", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status()
         .map_err(|source| DaemonError::Signal { pid, source })?;
 
@@ -395,11 +414,14 @@ pub fn daemon_run(
     data_dir: &Path,
     adapter: &Arc<dyn reeve_adapter::Adapter>,
 ) -> Result<(), DaemonError> {
+    info!(pid = std::process::id(), "daemon starting");
     let _lock = acquire_lock(state_dir.clone())?;
     let (registry, replay, delivery, audit) = open_resources(data_dir)?;
     let watcher = Arc::new(Watcher::new(&registry, &replay, delivery, audit));
 
-    run_actor_system(state_dir, data_dir, watcher, adapter)
+    run_actor_system(state_dir, data_dir, watcher, adapter)?;
+    info!("daemon stopping cleanly");
+    Ok(())
 }
 
 /// Acquire the runtime lock, mapping `RuntimeLockError` into `DaemonError`.
@@ -454,6 +476,7 @@ fn run_actor_system(
 
     #[cfg(unix)]
     {
+        debug!("actix system starting");
         actix::System::new().block_on(async move {
             launch_actors(state_dir, startup);
             // Set up SIGTERM handler inside block_on — tokio::signal requires
@@ -469,6 +492,7 @@ fn run_actor_system(
             let system = actix::System::current();
             tokio::spawn(async move {
                 signal_stream.recv().await;
+                info!("SIGTERM received, shutting down");
                 system.stop();
                 let _ = shutdown_tx.send(());
             });
@@ -478,6 +502,7 @@ fn run_actor_system(
 
     #[cfg(not(unix))]
     {
+        debug!("actix system starting");
         actix::System::new().block_on(async move {
             launch_actors(state_dir, startup);
             // No signal API on this platform. This future never resolves; the
@@ -514,6 +539,7 @@ fn prepare_agent_startup(
         component: "config defaults",
         source: Box::new(e),
     })?;
+    debug!("installing default configs");
 
     // 2. Load the default team config.
     let team_path = data_dir.join("teams").join("default.toml");
@@ -521,6 +547,7 @@ fn prepare_agent_startup(
         component: "team config",
         source: Box::new(e),
     })?;
+    debug!(lead_role = %team.lead_role, "loaded team config");
 
     // 3. Locate the lead member entry.
     let lead_member = team
@@ -544,6 +571,7 @@ fn prepare_agent_startup(
         component: "persona config",
         source: Box::new(e),
     })?;
+    debug!(name = %lead_member.persona_name, "loaded persona config");
 
     // 5. Provision the lead agent directory tree.
     let dirs = AgentDirs::provision(data_dir, "lead").map_err(|e| DaemonError::Resource {
@@ -569,12 +597,14 @@ fn prepare_agent_startup(
             source: Box::new(e),
         })?;
     snapshot.agent_id = agent_id.to_string();
+    debug!(adapter_id = %snapshot.adapter_id, "resolved adapter");
 
     // 8. Write the spawn snapshot to disk (includes agent_id for TUI signing).
     write_spawn_snapshot(&dirs, &snapshot).map_err(|e| DaemonError::Resource {
         component: "spawn snapshot",
         source: Box::new(e),
     })?;
+    debug!(agent_id = %agent_id, "wrote spawn snapshot");
 
     // 9. Construct the lead agent value.
     let system_prompt = persona_config.system_prompt.clone();
