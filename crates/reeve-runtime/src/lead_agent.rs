@@ -306,11 +306,8 @@ impl Actor for LeadAgent {
         self.append_system_entry("agent started", ctx);
         self.set_idle(ctx);
 
-        let inbox_cur = self.inbox_cur.clone();
         let addr = ctx.address();
-        tokio::spawn(async move {
-            watch_inbox_cur(inbox_cur, addr).await;
-        });
+        watch_inbox_cur(&self.inbox_cur, addr);
     }
 }
 
@@ -421,7 +418,7 @@ fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<LeadAgent>) {
 /// dropped (crash-recovery). If `notify` setup fails the function returns
 /// silently; the agent can still be spawned and respond if messages are
 /// delivered after the next restart.
-async fn watch_inbox_cur(inbox_cur: PathBuf, addr: actix::Addr<LeadAgent>) {
+fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<LeadAgent>) {
     use notify::{EventKind, RecursiveMode, Watcher as _};
     use std::sync::mpsc;
 
@@ -430,16 +427,25 @@ async fn watch_inbox_cur(inbox_cur: PathBuf, addr: actix::Addr<LeadAgent>) {
         return;
     };
     if watcher
-        .watch(&inbox_cur, RecursiveMode::NonRecursive)
+        .watch(inbox_cur, RecursiveMode::NonRecursive)
         .is_err()
     {
         return;
     }
 
     // Crash-recovery: process files already in cur/ before the watch started.
-    scan_cur(&inbox_cur, &addr);
+    scan_cur(inbox_cur, &addr);
 
-    let _ = tokio::task::spawn_blocking(move || {
+    // Spawn a detached OS thread for the blocking event loop.
+    //
+    // `tokio::task::spawn_blocking` is intentionally NOT used here: tokio
+    // runtime shutdown waits for all `spawn_blocking` threads to complete,
+    // which would cause the runtime to hang indefinitely because the watcher
+    // loop exits only when the `RecommendedWatcher` is dropped (which happens
+    // only after the loop exits — a deadlock). A detached `std::thread` is
+    // not owned by the tokio runtime and is killed by the OS when the process
+    // exits normally.
+    let _ = std::thread::spawn(move || {
         // Hold watcher alive for the duration of the loop.
         let _watcher = watcher;
         while let Ok(Ok(event)) = rx.recv() {
@@ -459,8 +465,7 @@ async fn watch_inbox_cur(inbox_cur: PathBuf, addr: actix::Addr<LeadAgent>) {
                 }
             }
         }
-    })
-    .await;
+    });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

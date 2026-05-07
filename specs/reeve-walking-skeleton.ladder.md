@@ -246,7 +246,7 @@ The terminal UI as a separate process whose entire interaction with the runtime 
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| 🟡 in-progress  | 2026-05-07 |            |
+| ✅ complete     | 2026-05-07 | 2026-05-07 |
 
 Tags: polish, ux
 
