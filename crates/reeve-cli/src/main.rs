@@ -94,8 +94,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
-        // No subcommand: exit 0; clap's --help handles help requests.
-        None => Ok(()),
+        // No subcommand: detect system state and walk the operator through
+        // first-run setup, then attach the TUI.
+        None => cmd_reeve(),
         Some(Commands::Identity {
             command: IdentityCommands::Enroll,
         }) => cmd_enroll(),
@@ -115,6 +116,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Daemon { command }) => daemon::dispatch(&command),
         Some(Commands::Attach) => cmd_attach(),
     }
+}
+
+fn cmd_reeve() -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = IdentityRegistry::default_data_dir()?;
+    let registry = IdentityRegistry::open(data_dir.clone())?;
+
+    if !identity::has_operator(&registry)? {
+        // First-run enrollment flow.
+        writeln!(
+            io::stdout().lock(),
+            "Welcome to Reeve. Setting up your operator identity...",
+        )?;
+        let keychain = keychain::open_platform_keystore()?;
+        let display_name =
+            prompt::prompt_one_line("Display name: ", "display name must not be empty")?;
+        let stored = identity::enroll(&registry, &keychain, &display_name)?;
+        writeln!(
+            io::stdout().lock(),
+            "Enrolled: {} ({})",
+            stored.identity().display_name,
+            stored.identity().identity_id,
+        )?;
+    }
+
+    let secret_store = keychain::open_platform_secretstore()?;
+    if !adapter::has_api_key(&secret_store) {
+        writeln!(
+            io::stdout().lock(),
+            "No Anthropic API key configured. \
+             Run `reeve adapter set-key` to add one, then try again.",
+        )?;
+        return Ok(());
+    }
+
+    let state_dir = reeve_runtime::runtime_lock::default_state_dir()?;
+    match reeve_runtime::daemon_status(&state_dir) {
+        reeve_runtime::DaemonStatus::Alive { .. } | reeve_runtime::DaemonStatus::Stale { .. } => {
+            // Process is alive (or stale but present); proceed to attach.
+        }
+        reeve_runtime::DaemonStatus::NotRunning => {
+            writeln!(io::stdout().lock(), "Starting daemon...")?;
+            reeve_runtime::daemon_spawn(&state_dir)?;
+            // TODO: replace with a daemon readiness signal once the protocol lands.
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+    }
+
+    let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
+    reeve_tui::app::run(&dirs).map_err(Into::into)
 }
 
 fn cmd_enroll() -> Result<(), Box<dyn std::error::Error>> {

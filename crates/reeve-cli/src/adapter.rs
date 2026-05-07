@@ -74,6 +74,15 @@ pub(crate) enum AdapterSubcommand {
     },
 }
 
+// ── Presence check ─────────────────────────────────────────────────────────────
+
+/// Return `true` when an Anthropic API key is present and readable from
+/// `store`; any error (not-found or backend failure) is treated as "no key
+/// configured."
+pub(crate) fn has_api_key(store: &dyn OperatorSecretStore) -> bool {
+    store.retrieve_secret(labels::ANTHROPIC_API_KEY).is_ok()
+}
+
 // ── Public dispatch ─────────────────────────────────────────────────────────────
 
 /// Dispatch `reeve adapter` subcommands using the platform's default keychain.
