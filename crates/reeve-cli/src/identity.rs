@@ -324,7 +324,9 @@ pub(crate) fn unenroll(
 
 /// Return `true` when at least one [`IdentityType::Operator`] entry exists in
 /// `registry`.
-pub(crate) fn has_operator(registry: &IdentityRegistry) -> Result<bool, reeve_runtime::RegistryError> {
+pub(crate) fn has_operator(
+    registry: &IdentityRegistry,
+) -> Result<bool, reeve_runtime::RegistryError> {
     let stored = registry.list()?;
     Ok(find_existing_operator(&stored).is_some())
 }
