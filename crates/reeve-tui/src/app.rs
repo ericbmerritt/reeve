@@ -20,6 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use reeve_runtime::{IdentityRegistry, OperatorKeyStore};
+
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -132,6 +134,8 @@ fn reload_state(state: &mut AppState, dirs: &AgentDirs) {
 /// # Parameters
 ///
 /// - `dirs`: the lead agent's filesystem layout; used for status / cost / conversation reads and inbox writes.
+/// - `registry`: the identity registry, used by [`submit_message`] to locate the operator identity.
+/// - `keystore`: the platform keystore, used by [`submit_message`] to retrieve the operator signing key.
 ///
 /// # Errors
 ///
@@ -139,7 +143,11 @@ fn reload_state(state: &mut AppState, dirs: &AgentDirs) {
 /// [`TuiError::Watcher`] if the filesystem watcher cannot start, or
 /// [`TuiError::Submit`] if a message write fails (not currently surfaced to the
 /// user — future iterations should show an inline error).
-pub fn run(dirs: &AgentDirs) -> Result<(), TuiError> {
+pub fn run(
+    dirs: &AgentDirs,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<(), TuiError> {
     let (mut terminal, _guard) = setup_terminal()?;
 
     let needs_reload = Arc::new(AtomicBool::new(true)); // true = load immediately on start
@@ -166,7 +174,7 @@ pub fn run(dirs: &AgentDirs) -> Result<(), TuiError> {
         if event::poll(POLL_TIMEOUT).map_err(TuiError::Terminal)? {
             match event::read().map_err(TuiError::Terminal)? {
                 Event::Key(key) => {
-                    if handle_key(key, &mut state, dirs)? {
+                    if handle_key(key, &mut state, dirs, registry, keystore)? {
                         return Ok(());
                     }
                 }
@@ -186,6 +194,8 @@ fn handle_key(
     key: event::KeyEvent,
     state: &mut AppState,
     dirs: &AgentDirs,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
 ) -> Result<bool, TuiError> {
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
@@ -193,7 +203,7 @@ fn handle_key(
         }
 
         (KeyCode::Enter, KeyModifiers::NONE) => {
-            submit_input(state, dirs)?;
+            submit_input(state, dirs, registry, keystore)?;
         }
 
         (KeyCode::Backspace, _) => {
@@ -223,12 +233,17 @@ fn handle_key(
 /// If the buffer is empty or all-whitespace, does nothing.
 /// On submission error, the error propagates to the caller; future iterations
 /// could catch it and display an inline error message.
-fn submit_input(state: &mut AppState, dirs: &AgentDirs) -> Result<(), TuiError> {
+fn submit_input(
+    state: &mut AppState,
+    dirs: &AgentDirs,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<(), TuiError> {
     let payload = state.input.trim().to_owned();
     if payload.is_empty() {
         return Ok(());
     }
-    submit_message(&payload, dirs).map_err(TuiError::Submit)?;
+    submit_message(&payload, dirs, registry, keystore).map_err(TuiError::Submit)?;
     state.set_input(String::new());
     Ok(())
 }

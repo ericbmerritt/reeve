@@ -525,20 +525,32 @@ fn prepare_agent_startup(
         source: Box::new(e),
     })?;
 
-    // 6. Resolve the model adapter against this persona's preferences.
-    let snapshot =
+    // 6. Generate a transient identity for the lead agent's watcher slot.
+    //     The watcher uses this to key the ledger; for the walking skeleton a
+    //     fresh ID per boot is acceptable. A persistent agent-identity mapping
+    //     is a task for a later ladder.
+    //     Generated before the snapshot so the ID is recorded in agent.toml
+    //     for use by the TUI's envelope signing path.
+    let agent_id = reeve_types::IdentityId::new().map_err(|e| DaemonError::Resource {
+        component: "agent identity",
+        source: Box::new(e),
+    })?;
+
+    // 7. Resolve the model adapter against this persona's preferences.
+    let mut snapshot =
         resolve_model(&persona_config, &[adapter.as_ref()]).map_err(|e| DaemonError::Resource {
             component: "model resolution",
             source: Box::new(e),
         })?;
+    snapshot.agent_id = agent_id.to_string();
 
-    // 7. Write the spawn snapshot to disk.
+    // 8. Write the spawn snapshot to disk (includes agent_id for TUI signing).
     write_spawn_snapshot(&dirs, &snapshot).map_err(|e| DaemonError::Resource {
         component: "spawn snapshot",
         source: Box::new(e),
     })?;
 
-    // 8. Construct the lead agent value.
+    // 9. Construct the lead agent value.
     let system_prompt = persona_config.system_prompt.clone();
     let lead_agent =
         LeadAgent::new(Arc::clone(adapter), &dirs, snapshot, system_prompt).map_err(|e| {
@@ -548,17 +560,8 @@ fn prepare_agent_startup(
             }
         })?;
 
-    // 9. Build the inbox handle pointing to the lead's provisioned inbox.
+    // 10. Build the inbox handle pointing to the lead's provisioned inbox.
     let inbox = AgentInbox::from_path(dirs.inbox_root());
-
-    // 10. Generate a transient identity for the lead agent's watcher slot.
-    //     The watcher uses this to key the ledger; for the walking skeleton a
-    //     fresh ID per boot is acceptable. A persistent agent-identity mapping
-    //     is a task for a later ladder.
-    let agent_id = reeve_types::IdentityId::new().map_err(|e| DaemonError::Resource {
-        component: "agent identity",
-        source: Box::new(e),
-    })?;
 
     Ok(AgentStartup {
         lead_agent,

@@ -27,6 +27,11 @@ pub struct SpawnSnapshot {
     /// Resolved adapter identifier (e.g., `"claude-opus-4-7@anthropic-direct"`).
     pub adapter_id: String,
     // model is derived from adapter_id — not stored separately
+    /// The transient [`reeve_types::IdentityId`] generated for this boot session.
+    ///
+    /// Written by the daemon at spawn time so that external senders (e.g. the
+    /// TUI) can address signed envelopes to the correct watcher slot.
+    pub agent_id: String,
 }
 
 impl SpawnSnapshot {
@@ -37,6 +42,15 @@ impl SpawnSnapshot {
     /// validated adapter.
     pub fn model(&self) -> &str {
         parse_adapter_model(&self.adapter_id).unwrap_or("")
+    }
+
+    /// Parse `agent_id` as a `UUIDv7` and return a typed [`reeve_types::IdentityId`].
+    ///
+    /// Returns `None` when the stored string is absent or malformed — callers
+    /// should treat this as a stale snapshot written before this field existed.
+    pub fn agent_identity_id(&self) -> Option<reeve_types::IdentityId> {
+        let uuid: uuid::Uuid = self.agent_id.parse().ok()?;
+        reeve_types::IdentityId::try_from(uuid).ok()
     }
 }
 
@@ -129,6 +143,9 @@ pub fn resolve_model(
                 persona_version: 1,
                 capability_profile: persona.capability_profile.clone(),
                 adapter_id: adapter.id().to_owned(),
+                // agent_id is populated by the caller (prepare_agent_startup)
+                // before the snapshot is written to disk.
+                agent_id: String::new(),
             });
         }
     }
@@ -277,6 +294,7 @@ mod tests {
             persona_version: 1,
             capability_profile: Some(String::from("default")),
             adapter_id: String::from("claude-opus-4-7@anthropic-direct"),
+            agent_id: String::from("01930000-0000-7000-8000-000000000001"),
         };
 
         write_spawn_snapshot(&dirs, &snapshot).expect("write");
@@ -289,6 +307,7 @@ mod tests {
         assert_eq!(parsed.persona_version, snapshot.persona_version);
         assert_eq!(parsed.capability_profile, snapshot.capability_profile);
         assert_eq!(parsed.adapter_id, snapshot.adapter_id);
+        assert_eq!(parsed.agent_id, snapshot.agent_id);
         assert_eq!(parsed.model(), snapshot.model());
     }
 
@@ -300,6 +319,7 @@ mod tests {
             persona_version: 1,
             capability_profile: None,
             adapter_id: String::from("claude-opus-4-7@anthropic-direct"),
+            agent_id: String::from("01930000-0000-7000-8000-000000000002"),
         };
 
         let serialized = toml::to_string(&original).expect("serialize");
@@ -309,6 +329,7 @@ mod tests {
         assert_eq!(deserialized.persona_version, original.persona_version);
         assert_eq!(deserialized.capability_profile, original.capability_profile);
         assert_eq!(deserialized.adapter_id, original.adapter_id);
+        assert_eq!(deserialized.agent_id, original.agent_id);
         assert_eq!(deserialized.model(), original.model());
     }
 

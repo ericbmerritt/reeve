@@ -28,6 +28,7 @@ libc = { version = "0.2", default-features = false }
 rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }
+sha2 = { version = "0.10", default-features = false, features = ["std"] }
 security-framework = { version = "3", default-features = false }
 secret-service = { version = "5", default-features = false, features = ["rt-tokio-crypto-rust"] }
 tempfile = { version = "3", default-features = false }
