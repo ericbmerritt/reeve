@@ -556,6 +556,7 @@ mod tests {
             persona_version: 1,
             capability_profile: None,
             adapter_id: String::from("mock@test"),
+            agent_id: String::new(),
         }
     }
 

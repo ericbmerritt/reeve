@@ -1756,14 +1756,17 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "notify",
+ "rand_core 0.6.4",
  "ratatui",
  "reeve-runtime",
  "reeve-transport",
  "reeve-types",
  "serde_json",
+ "sha2",
  "tempfile",
  "time",
  "tokio",
+ "toml",
 ]
 
 [[package]]

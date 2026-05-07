@@ -2,6 +2,7 @@
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use reeve_runtime::{AuditLog, IdentityRegistry};
@@ -164,7 +165,8 @@ fn cmd_reeve() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
-    reeve_tui::app::run(&dirs).map_err(Into::into)
+    let keystore = Arc::new(keychain::open_platform_keystore()?);
+    reeve_tui::app::run(&dirs, &registry, keystore.as_ref()).map_err(Into::into)
 }
 
 fn cmd_enroll() -> Result<(), Box<dyn std::error::Error>> {
@@ -277,8 +279,10 @@ fn cmd_attach() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let data_dir = IdentityRegistry::default_data_dir()?;
+    let registry = IdentityRegistry::open(data_dir.clone())?;
     let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
-    reeve_tui::app::run(&dirs).map_err(Into::into)
+    let keystore = Arc::new(keychain::open_platform_keystore()?);
+    reeve_tui::app::run(&dirs, &registry, keystore.as_ref()).map_err(Into::into)
 }
 
 fn prompt_display_name() -> Result<String, Box<dyn std::error::Error>> {
