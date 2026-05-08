@@ -17,7 +17,7 @@
 //!   adapter, dispatches any tool calls, and returns to `"idle"` once the
 //!   loop terminates.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
@@ -52,6 +52,11 @@ pub enum AgentError {
     },
     /// JSON serialization or deserialization error.
     Json(serde_json::Error),
+    /// The `tools` slice passed to [`Agent::new`] contained two bindings with
+    /// the same tool name. The agent cannot route to two recipients under one
+    /// name, and the adapter would reject a request with duplicate tool names
+    /// anyway.
+    DuplicateToolName(String),
 }
 
 impl fmt::Display for AgentError {
@@ -63,6 +68,9 @@ impl fmt::Display for AgentError {
                 write!(f, "agent IO at {}: {source}", path.display())
             }
             Self::Json(source) => write!(f, "agent json error: {source}"),
+            Self::DuplicateToolName(name) => {
+                write!(f, "duplicate tool name in agent constructor: {name}")
+            }
         }
     }
 }
@@ -74,6 +82,7 @@ impl std::error::Error for AgentError {
             Self::Adapter(source) => Some(source),
             Self::Io { source, .. } => Some(source),
             Self::Json(source) => Some(source),
+            Self::DuplicateToolName(_) => None,
         }
     }
 }
@@ -165,7 +174,7 @@ pub struct Agent {
     tool_routes: HashMap<String, Recipient<InvokeTool>>,
     /// `tool_use_id`s of tool calls dispatched in the current batch but not
     /// yet answered. Empty when no tool batch is in flight.
-    pending_tool_calls: HashSet<String>,
+    pending_tool_use_ids: HashSet<String>,
     /// Tool-result content blocks accumulated for the next user turn.
     /// Drained when the batch completes and the next adapter call fires.
     pending_results: Vec<reeve_adapter::MessageContent>,
@@ -182,6 +191,62 @@ pub struct Agent {
                   renaming would obscure the field's purpose"
     )]
     agent_id: reeve_types::IdentityId,
+    /// Inbound messages received while a turn is in flight. Drained at the
+    /// end of each turn (`FinishReason::EndTurn`); their payloads form the
+    /// next user turn so the model integrates the operator's follow-ups
+    /// instead of the runtime dropping them.
+    pending_inbound: VecDeque<ProcessInbound>,
+    /// `message_id`s the agent has already accepted (whether processed or
+    /// queued). Duplicate `ProcessInbound` messages with the same id are
+    /// dropped silently.
+    ///
+    /// Why: the `inbox/cur/` watcher scans the entire directory on every
+    /// filesystem event for cross-platform robustness, so a single arriving
+    /// envelope can produce multiple `ProcessInbound` messages for the same
+    /// file (one per scan that observes it). Without this dedup the agent
+    /// would re-process the same envelope after each subsequent arrival.
+    ///
+    /// Bounded by [`SEEN_MESSAGE_IDS_CAP`]: oldest entries are evicted in
+    /// FIFO order. Eviction is safe because `inbox/cur/` rotation moves
+    /// envelopes to `archive/` after the cur retention window, so an
+    /// envelope evicted from this set has also vanished from the directory
+    /// the watcher scans.
+    seen_message_ids: SeenIds,
+}
+
+/// Maximum number of `message_id`s the agent retains for dedup. 4096 covers
+/// a comfortably high message arrival rate over the 24-hour cur/ retention
+/// window (one message every ~21 seconds for a full day).
+const SEEN_MESSAGE_IDS_CAP: usize = 4096;
+
+/// Bounded FIFO set of `message_id`s. Insertion is O(1); when the set hits
+/// [`SEEN_MESSAGE_IDS_CAP`] the oldest entry is evicted to make room. Used
+/// for inbound dedup; see the field-level comment on [`Agent::seen_message_ids`].
+#[derive(Debug, Default)]
+struct SeenIds {
+    set: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl SeenIds {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Insert `id`. Returns `true` if the id is new (insert took effect),
+    /// `false` if it was already present (caller should treat as duplicate).
+    fn insert(&mut self, id: String) -> bool {
+        if !self.set.insert(id.clone()) {
+            return false;
+        }
+        self.order.push_back(id);
+        if self.order.len() > SEEN_MESSAGE_IDS_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.set.remove(&oldest);
+            }
+        }
+        true
+    }
 }
 
 /// Default maximum tokens for the adapter response.
@@ -239,6 +304,9 @@ impl Agent {
         let mut tool_descriptors = Vec::with_capacity(tools.len());
         let mut tool_routes = HashMap::with_capacity(tools.len());
         for (descriptor, recipient) in tools {
+            if tool_routes.contains_key(&descriptor.name) {
+                return Err(AgentError::DuplicateToolName(descriptor.name));
+            }
             tool_routes.insert(descriptor.name.clone(), recipient);
             tool_descriptors.push(descriptor);
         }
@@ -256,10 +324,12 @@ impl Agent {
             inbox_cur,
             tool_descriptors,
             tool_routes,
-            pending_tool_calls: HashSet::new(),
+            pending_tool_use_ids: HashSet::new(),
             pending_results: Vec::new(),
             tool_iteration: 0,
             agent_id,
+            pending_inbound: VecDeque::new(),
+            seen_message_ids: SeenIds::new(),
         })
     }
 
@@ -348,10 +418,17 @@ impl Agent {
         if response.finish_reason == reeve_adapter::FinishReason::ToolUse {
             self.dispatch_tool_calls(&response.tool_calls, ctx);
         } else {
-            // Turn complete.
-            self.in_flight = false;
+            // Turn complete. Reset the tool iteration counter, then either
+            // start a queued turn (if messages arrived during this one) or
+            // go idle. `in_flight` stays true across queued-turn handoff so
+            // a third message arriving in this window stays queued.
             self.tool_iteration = 0;
-            self.set_idle(ctx);
+            if self.pending_inbound.is_empty() {
+                self.in_flight = false;
+                self.set_idle(ctx);
+            } else {
+                self.drain_pending_into_turn(ctx);
+            }
         }
     }
 
@@ -368,7 +445,7 @@ impl Agent {
         ctx: &mut Context<Self>,
     ) {
         debug_assert!(
-            self.pending_tool_calls.is_empty() && self.pending_results.is_empty(),
+            self.pending_tool_use_ids.is_empty() && self.pending_results.is_empty(),
             "dispatch_tool_calls invoked with non-empty pending state"
         );
 
@@ -388,7 +465,7 @@ impl Agent {
 
             match self.tool_routes.get(&tc.name) {
                 Some(route) => {
-                    self.pending_tool_calls.insert(tc.id.clone());
+                    self.pending_tool_use_ids.insert(tc.id.clone());
                     route.do_send(InvokeTool {
                         tool_use_id: tc.id.clone(),
                         name: tc.name.clone(),
@@ -411,7 +488,7 @@ impl Agent {
             }
         }
 
-        if self.pending_tool_calls.is_empty() {
+        if self.pending_tool_use_ids.is_empty() {
             // All tools were unknown; advance immediately.
             self.advance_after_tools(ctx);
         } else {
@@ -463,6 +540,11 @@ impl Agent {
 
     /// Append the outbound and model-call entries to the conversation journal.
     ///
+    /// Skips the outbound entry when `text` is empty — for example, an
+    /// assistant turn that consists only of tool-use blocks with no preamble
+    /// text. The model-call entry is always recorded since it carries token
+    /// and cost telemetry that does not depend on text presence.
+    ///
     /// Returns `true` on success. On failure stops the actor and returns
     /// `false`.
     fn append_outbound_and_model_call(
@@ -471,13 +553,15 @@ impl Agent {
         response: &reeve_adapter::Response,
         ctx: &mut Context<Self>,
     ) -> bool {
-        let outbound = ConversationEntry::Outbound {
-            payload: text.to_owned(),
-            timestamp_utc: OffsetDateTime::now_utc(),
-        };
-        if self.conversation.append(&outbound).is_err() {
-            ctx.stop();
-            return false;
+        if !text.is_empty() {
+            let outbound = ConversationEntry::Outbound {
+                payload: text.to_owned(),
+                timestamp_utc: OffsetDateTime::now_utc(),
+            };
+            if self.conversation.append(&outbound).is_err() {
+                ctx.stop();
+                return false;
+            }
         }
 
         let model_call = ConversationEntry::ModelCall {
@@ -513,6 +597,7 @@ impl Agent {
                 ctx,
             );
             self.in_flight = false;
+            self.tool_iteration = 0;
             self.set_idle(ctx);
             return;
         }
@@ -583,13 +668,17 @@ impl Actor for Agent {
 impl Supervised for Agent {
     /// Recover after a supervised restart: restore idle status without
     /// re-logging the start event. Clears any in-flight tool batch state
-    /// so a fresh inbound message starts cleanly.
+    /// and any queued inbound messages so a fresh inbound message starts
+    /// cleanly. Queued messages are dropped on restart because the prior
+    /// turn's history is gone — replaying them out of context would surprise
+    /// the model.
     fn restarting(&mut self, ctx: &mut Context<Self>) {
         warn!("agent restarting");
         self.in_flight = false;
         self.tool_iteration = 0;
-        self.pending_tool_calls.clear();
+        self.pending_tool_use_ids.clear();
         self.pending_results.clear();
+        self.pending_inbound.clear();
         self.set_idle(ctx);
     }
 }
@@ -600,17 +689,34 @@ impl Handler<ProcessInbound> for Agent {
     type Result = ();
 
     fn handle(&mut self, msg: ProcessInbound, ctx: &mut Context<Self>) {
-        if self.in_flight {
-            let entry = ConversationEntry::System {
-                message: format!(
-                    "message {} discarded: adapter call in flight",
-                    msg.message_id
-                ),
-                timestamp_utc: OffsetDateTime::now_utc(),
-            };
-            let _ = self.conversation.append(&entry);
+        // Dedup by message_id. The inbox/cur/ watcher scans the whole
+        // directory on every filesystem event, so the same envelope can
+        // arrive as ProcessInbound multiple times.
+        if !self.seen_message_ids.insert(msg.message_id.clone()) {
+            debug!(message_id = %msg.message_id, "dropping duplicate inbound");
             return;
         }
+        if self.in_flight {
+            // Queue the message; it will be processed at the end of the
+            // current turn. The inbound journal entry is deferred until we
+            // actually consume it so the journal stays in turn-causal order.
+            debug!(
+                message_id = %msg.message_id,
+                queue_depth = self.pending_inbound.len() + 1,
+                "queueing inbound until current turn ends"
+            );
+            self.pending_inbound.push_back(msg);
+            return;
+        }
+        self.start_turn_with(msg, ctx);
+    }
+}
+
+impl Agent {
+    /// Begin a turn from a single fresh inbound message. Sets `in_flight`,
+    /// flips status to working, journals the inbound, pushes the user turn
+    /// to history, and fires the adapter call.
+    fn start_turn_with(&mut self, msg: ProcessInbound, ctx: &mut Context<Self>) {
         info!(message_id = %msg.message_id, "processing");
         self.in_flight = true;
         if self.status_writer.write("working").is_err() {
@@ -623,6 +729,51 @@ impl Handler<ProcessInbound> for Agent {
         self.history.push(reeve_adapter::Message {
             role: reeve_adapter::Role::User,
             content: vec![reeve_adapter::MessageContent::Text(msg.payload)],
+        });
+        self.spawn_adapter_call(ctx);
+    }
+
+    /// Begin a turn from the queued inbound messages accumulated during the
+    /// previous turn. Each queued message contributes its own inbound journal
+    /// entry; their payloads are concatenated (separated by a blank line)
+    /// into a single user-turn content block so the model sees one alternating
+    /// turn rather than several consecutive user turns.
+    fn drain_pending_into_turn(&mut self, ctx: &mut Context<Self>) {
+        debug_assert!(
+            self.in_flight,
+            "drain_pending_into_turn called while not in flight"
+        );
+        debug_assert!(
+            !self.pending_inbound.is_empty(),
+            "drain_pending_into_turn called with empty queue"
+        );
+        let mut combined = String::new();
+        while let Some(msg) = self.pending_inbound.pop_front() {
+            if !self.append_inbound(&msg.message_id, &msg.payload, ctx) {
+                return;
+            }
+            if msg.payload.is_empty() {
+                // Empty payloads are journaled (operator visibility) but
+                // omitted from the user turn — Anthropic rejects empty
+                // text content with HTTP 400.
+                continue;
+            }
+            if !combined.is_empty() {
+                combined.push_str("\n\n");
+            }
+            combined.push_str(&msg.payload);
+        }
+        if combined.is_empty() {
+            // All queued payloads were empty. No user turn to send; just go
+            // back to idle.
+            self.in_flight = false;
+            self.tool_iteration = 0;
+            self.set_idle(ctx);
+            return;
+        }
+        self.history.push(reeve_adapter::Message {
+            role: reeve_adapter::Role::User,
+            content: vec![reeve_adapter::MessageContent::Text(combined)],
         });
         self.spawn_adapter_call(ctx);
     }
@@ -645,7 +796,7 @@ impl Handler<ToolResult> for Agent {
     type Result = ();
 
     fn handle(&mut self, msg: ToolResult, ctx: &mut Context<Self>) {
-        if !self.pending_tool_calls.remove(&msg.tool_use_id) {
+        if !self.pending_tool_use_ids.remove(&msg.tool_use_id) {
             // Late-arriving result (timeout already fired) or stray result
             // for an unknown tool_use_id. Drop it silently.
             debug!(tool_use_id = %msg.tool_use_id, "ignoring stale tool result");
@@ -657,7 +808,7 @@ impl Handler<ToolResult> for Agent {
             "tool result received"
         );
         self.append_tool_result(&msg.tool_use_id, &msg.content, msg.is_error, ctx);
-        if self.pending_tool_calls.is_empty() {
+        if self.pending_tool_use_ids.is_empty() {
             self.advance_after_tools(ctx);
         }
     }
@@ -669,11 +820,11 @@ impl Handler<ToolBatchTimeout> for Agent {
     type Result = ();
 
     fn handle(&mut self, _msg: ToolBatchTimeout, ctx: &mut Context<Self>) {
-        if self.pending_tool_calls.is_empty() {
+        if self.pending_tool_use_ids.is_empty() {
             // Batch already completed; this is a stale timeout.
             return;
         }
-        let timed_out: Vec<String> = self.pending_tool_calls.drain().collect();
+        let timed_out: Vec<String> = self.pending_tool_use_ids.drain().collect();
         warn!(
             count = timed_out.len(),
             "tool batch timed out; synthesizing error results"
@@ -720,8 +871,12 @@ fn read_envelope_payload(path: &Path) -> Option<String> {
 
 /// Send one [`ProcessInbound`] message for each path in the `cur/` directory.
 ///
-/// Used at startup to process envelopes that arrived before the watcher
-/// subscribed (crash-recovery scan).
+/// Called both at startup (crash-recovery for envelopes deposited before the
+/// watcher subscribed) and on every filesystem event in `cur/`. Calling on
+/// every event guarantees no envelope is missed across the variations of
+/// `FSEvents` and `inotify` behavior, but it also produces duplicate
+/// `ProcessInbound` messages for envelopes still on disk. The agent dedups
+/// these by `message_id` in [`Handler<ProcessInbound>`].
 fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<Agent>) {
     let Ok(entries) = std::fs::read_dir(inbox_cur) else {
         return;
@@ -782,9 +937,10 @@ fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<Agent>) {
         // Hold watcher alive for the duration of the loop.
         let _watcher = watcher;
         // Scan on every notification regardless of event kind. Discriminating
-        // event types is fragile: on macOS FSEvents an atomic rename(2) produces
-        // Modify(Name(To)) not Create, and the mapping varies by platform.
-        // scan_cur is idempotent via the delivery ledger.
+        // event types is fragile: on macOS FSEvents an atomic rename(2)
+        // produces Modify(Name(To)) not Create, and the mapping varies by
+        // platform. Re-scanning produces duplicate ProcessInbound messages
+        // for envelopes still on disk; the agent dedups them by message_id.
         while rx.recv().is_ok() {
             scan_cur(&inbox_cur, &addr);
         }
@@ -1030,6 +1186,88 @@ mod tests {
         assert_eq!(inbound["payload"], "hello");
     }
 
+    // L-Dedup: A duplicate ProcessInbound (same message_id) is silently
+    // dropped — only the first delivery produces an inbound journal entry
+    // and triggers an adapter call. This guards against the cur/ watcher
+    // re-sending envelopes on every filesystem event.
+    #[test]
+    fn agent_drops_duplicate_inbound_message_id() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let agent = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
+
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |_| agent);
+
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(std::time::Instant::now() <= deadline, "actor start timeout");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // Send the same message_id three times back to back. Only the
+            // first should produce a turn.
+            for _ in 0..3 {
+                addr.do_send(ProcessInbound {
+                    payload: String::from("hello"),
+                    message_id: String::from("dup-1"),
+                });
+            }
+
+            // Wait until the turn completes (one outbound entry).
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                if content.lines().any(|l| l.contains("\"outbound\"")) {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "turn did not complete; content:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // Give the actor a beat to process any stragglers (shouldn't be any).
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            actix::System::current().stop();
+        });
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let inbounds = entries.iter().filter(|e| e["type"] == "inbound").count();
+        assert_eq!(
+            inbounds, 1,
+            "duplicate message_ids should only journal once; entries: {entries:?}"
+        );
+        let model_calls = entries.iter().filter(|e| e["type"] == "model_call").count();
+        assert_eq!(
+            model_calls, 1,
+            "duplicate message_ids should fire one adapter call; entries: {entries:?}"
+        );
+    }
+
     // L4: extract_response_text returns the first text block from a content slice.
     #[test]
     fn extract_response_text_returns_first_text() {
@@ -1197,11 +1435,18 @@ mod tests {
         }
     }
 
-    // L-B: A second ProcessInbound arriving while an adapter call is in flight
-    // is silently discarded; the journal records a system entry with "discarded"
-    // and the discarded message_id, and there is only one Inbound entry.
+    // L-B: A second ProcessInbound arriving while a turn is in flight is
+    // queued, not dropped. Both messages produce inbound journal entries in
+    // arrival order, and the journal contains no "discarded" system entries.
+    // Two adapter calls fire (one per turn) — verified via two model_call
+    // entries.
     #[test]
-    fn lead_agent_second_message_discarded_while_in_flight() {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-message integration test with status, journal, and \
+                  model-call assertions; splitting fragments the narrative"
+    )]
+    fn lead_agent_second_message_queues_during_in_flight() {
         let tmp = tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
@@ -1246,8 +1491,24 @@ mod tests {
                 message_id: String::from("msg-2"),
             });
 
-            // Wait for the slow adapter call to complete plus some margin.
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            // Wait for the journal to contain two model_call entries (two
+            // adapter calls fired) — that is the signal both turns ran.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                let model_calls = content
+                    .lines()
+                    .filter(|line| line.contains("\"model_call\""))
+                    .count();
+                if model_calls >= 2 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "two adapter calls did not complete within 5 seconds; content:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
 
             actix::System::current().stop();
         });
@@ -1258,30 +1519,34 @@ mod tests {
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
 
-        // There must be a system entry containing "discarded" and "msg-2".
+        // No "discarded" system entries.
         let discarded = entries.iter().find(|e| {
             e["type"] == "system"
                 && e["message"]
                     .as_str()
-                    .map(|m| m.contains("discarded") && m.contains("msg-2"))
+                    .map(|m| m.contains("discarded"))
                     .unwrap_or(false)
         });
         assert!(
-            discarded.is_some(),
-            "journal missing 'discarded msg-2' system entry; entries: {entries:?}"
+            discarded.is_none(),
+            "no 'discarded' system entries should appear; entries: {entries:?}"
         );
 
-        // There must be exactly one Inbound entry (for "first", not "second").
+        // Two inbound entries, in arrival order.
         let inbound_entries: Vec<_> = entries.iter().filter(|e| e["type"] == "inbound").collect();
         assert_eq!(
             inbound_entries.len(),
-            1,
-            "expected exactly one inbound entry; entries: {entries:?}"
+            2,
+            "expected two inbound entries; entries: {entries:?}"
         );
-        assert_eq!(
-            inbound_entries[0]["payload"], "first",
-            "only the first message should be journaled as inbound"
-        );
+        assert_eq!(inbound_entries[0]["payload"], "first");
+        assert_eq!(inbound_entries[0]["message_id"], "msg-1");
+        assert_eq!(inbound_entries[1]["payload"], "second");
+        assert_eq!(inbound_entries[1]["message_id"], "msg-2");
+
+        // Two model_call entries (one per turn).
+        let model_calls = entries.iter().filter(|e| e["type"] == "model_call").count();
+        assert_eq!(model_calls, 2);
     }
 
     // L9: After an adapter error, the history is cleaned (user message popped),
@@ -1935,5 +2200,339 @@ mod tests {
             tool_use_count <= max_iterations,
             "too many tool_use entries: {tool_use_count}",
         );
+    }
+
+    // ── Adapter that returns ToolUse with NO text on call 1 ───────────────────
+
+    struct EmptyTextThenEndAdapter {
+        calls: Arc<std::sync::Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl reeve_adapter::Adapter for EmptyTextThenEndAdapter {
+        fn id(&self) -> &'static str {
+            "empty-text-then-end@test"
+        }
+
+        fn capabilities(&self) -> reeve_adapter::Capabilities {
+            reeve_adapter::Capabilities::new()
+        }
+
+        async fn call(
+            &self,
+            _messages: &[reeve_adapter::Message],
+            _tools: &[reeve_adapter::Tool],
+            _params: &reeve_adapter::Params,
+        ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+            let mut count = self.calls.lock().unwrap();
+            *count += 1;
+            let n = *count;
+            drop(count);
+            if n == 1 {
+                // Tool-use turn with no preamble text (only tool_use blocks).
+                Ok(reeve_adapter::Response::new_tool_use(
+                    vec![],
+                    vec![reeve_adapter::ToolCall {
+                        id: "tu_1".to_owned(),
+                        name: "echo".to_owned(),
+                        arguments: serde_json::json!({ "text": "x" }),
+                    }],
+                    reeve_adapter::TokenCounts {
+                        input: 1,
+                        output: 1,
+                        cached: 0,
+                    },
+                    reeve_adapter::CostEstimate { microdollars: 1 },
+                ))
+            } else {
+                Ok(reeve_adapter::Response::new_text(
+                    vec![reeve_adapter::MessageContent::Text("done".to_owned())],
+                    reeve_adapter::TokenCounts {
+                        input: 1,
+                        output: 1,
+                        cached: 0,
+                    },
+                    reeve_adapter::CostEstimate { microdollars: 1 },
+                ))
+            }
+        }
+    }
+
+    // L-T3: When the model returns a tool-use turn with no accompanying text,
+    // the agent does NOT write an empty outbound entry. The model_call entry
+    // is still recorded because it carries token/cost telemetry independent
+    // of whether the turn had text.
+    #[test]
+    fn agent_skips_empty_outbound_for_tool_only_turn() {
+        use crate::tool::EchoTool;
+        use actix::Actor as _;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+        let calls = Arc::new(std::sync::Mutex::new(0u32));
+        let adapter = Arc::new(EmptyTextThenEndAdapter {
+            calls: Arc::clone(&calls),
+        });
+
+        actix::System::new().block_on(async move {
+            let echo_addr = EchoTool.start();
+            let tools: Vec<(
+                reeve_adapter::Tool,
+                actix::Recipient<crate::tool::InvokeTool>,
+            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+
+            let agent = Agent::new(
+                adapter,
+                &dirs,
+                mock_snapshot(),
+                String::new(),
+                reeve_types::IdentityId::new().unwrap(),
+                tools,
+            )
+            .unwrap();
+            let addr = Supervisor::start(move |_| agent);
+
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(std::time::Instant::now() <= deadline, "actor start timeout");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(ProcessInbound {
+                payload: "go".to_owned(),
+                message_id: "m-1".to_owned(),
+            });
+
+            // Wait until the second outbound (with "done") appears.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                if content.contains("\"done\"") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "loop did not finish; content:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        // Exactly one outbound entry, and it carries the final-turn text.
+        let outbounds: Vec<&serde_json::Value> =
+            entries.iter().filter(|e| e["type"] == "outbound").collect();
+        assert_eq!(
+            outbounds.len(),
+            1,
+            "expected exactly one outbound; entries: {entries:?}"
+        );
+        assert_eq!(outbounds[0]["payload"], "done");
+
+        // Both model_calls present (telemetry retained even on tool-only turns).
+        let model_calls = entries.iter().filter(|e| e["type"] == "model_call").count();
+        assert_eq!(model_calls, 2, "both model_call entries should be present");
+    }
+
+    // ── Adapter that calls a tool the agent does not have registered ─────────
+
+    struct UnknownToolThenEndAdapter {
+        calls: Arc<std::sync::Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl reeve_adapter::Adapter for UnknownToolThenEndAdapter {
+        fn id(&self) -> &'static str {
+            "unknown-tool@test"
+        }
+
+        fn capabilities(&self) -> reeve_adapter::Capabilities {
+            reeve_adapter::Capabilities::new()
+        }
+
+        async fn call(
+            &self,
+            _messages: &[reeve_adapter::Message],
+            _tools: &[reeve_adapter::Tool],
+            _params: &reeve_adapter::Params,
+        ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+            let mut count = self.calls.lock().unwrap();
+            *count += 1;
+            let n = *count;
+            drop(count);
+            if n == 1 {
+                Ok(reeve_adapter::Response::new_tool_use(
+                    vec![],
+                    vec![reeve_adapter::ToolCall {
+                        id: "tu_x".to_owned(),
+                        name: "nonexistent_tool".to_owned(),
+                        arguments: serde_json::json!({}),
+                    }],
+                    reeve_adapter::TokenCounts {
+                        input: 1,
+                        output: 1,
+                        cached: 0,
+                    },
+                    reeve_adapter::CostEstimate { microdollars: 1 },
+                ))
+            } else {
+                Ok(reeve_adapter::Response::new_text(
+                    vec![reeve_adapter::MessageContent::Text("recovered".to_owned())],
+                    reeve_adapter::TokenCounts {
+                        input: 1,
+                        output: 1,
+                        cached: 0,
+                    },
+                    reeve_adapter::CostEstimate { microdollars: 1 },
+                ))
+            }
+        }
+    }
+
+    // L-T4: When the model calls a tool that is not registered, the agent
+    // synthesizes a tool_result with is_error: true and continues the loop.
+    // The model recovers on the next turn. No tool actor is needed for the
+    // unknown tool — the agent handles it locally.
+    #[test]
+    fn agent_recovers_from_unknown_tool_name() {
+        use crate::tool::EchoTool;
+        use actix::Actor as _;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+        let calls = Arc::new(std::sync::Mutex::new(0u32));
+        let adapter = Arc::new(UnknownToolThenEndAdapter {
+            calls: Arc::clone(&calls),
+        });
+
+        actix::System::new().block_on(async move {
+            // Register only EchoTool; the model will call "nonexistent_tool".
+            let echo_addr = EchoTool.start();
+            let tools: Vec<(
+                reeve_adapter::Tool,
+                actix::Recipient<crate::tool::InvokeTool>,
+            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+
+            let agent = Agent::new(
+                adapter,
+                &dirs,
+                mock_snapshot(),
+                String::new(),
+                reeve_types::IdentityId::new().unwrap(),
+                tools,
+            )
+            .unwrap();
+            let addr = Supervisor::start(move |_| agent);
+
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(std::time::Instant::now() <= deadline, "actor start timeout");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(ProcessInbound {
+                payload: "go".to_owned(),
+                message_id: "m-1".to_owned(),
+            });
+
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                if content.contains("\"recovered\"") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "loop did not recover; content:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        // The synthetic tool_result is in the journal with is_error=true.
+        let tool_result = entries
+            .iter()
+            .find(|e| e["type"] == "tool_result")
+            .expect("tool_result missing");
+        assert_eq!(tool_result["tool_use_id"], "tu_x");
+        assert_eq!(tool_result["is_error"], true);
+        assert!(
+            tool_result["content"]
+                .as_str()
+                .unwrap()
+                .contains("nonexistent_tool"),
+            "tool_result content should name the unknown tool: {tool_result:?}"
+        );
+
+        // Adapter was called twice (one to dispatch, one to recover).
+        assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    // L-Dup: Agent::new returns DuplicateToolName when two tool bindings
+    // share a name.
+    #[test]
+    fn agent_new_rejects_duplicate_tool_names() {
+        use crate::tool::EchoTool;
+        use actix::Actor as _;
+
+        let tmp = tempdir().unwrap();
+        let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
+        let adapter = Arc::new(MockAdapter::new("mock@test"));
+
+        actix::System::new().block_on(async move {
+            let a = EchoTool.start();
+            let b = EchoTool.start();
+            // Both bindings declare the same name (EchoTool::descriptor()
+            // returns "echo").
+            let tools = vec![
+                (EchoTool::descriptor(), a.recipient()),
+                (EchoTool::descriptor(), b.recipient()),
+            ];
+            let result = Agent::new(
+                adapter,
+                &dirs,
+                mock_snapshot(),
+                String::new(),
+                reeve_types::IdentityId::new().unwrap(),
+                tools,
+            );
+            match result {
+                Err(super::AgentError::DuplicateToolName(name)) => {
+                    assert_eq!(name, "echo");
+                }
+                Err(other) => panic!("expected DuplicateToolName, got {other:?}"),
+                Ok(_) => panic!("expected error, got Ok"),
+            }
+            actix::System::current().stop();
+        });
     }
 }

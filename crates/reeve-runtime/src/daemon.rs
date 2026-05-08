@@ -477,8 +477,13 @@ fn run_actor_system(
     #[cfg(unix)]
     {
         debug!("actix system starting");
-        actix::System::new().block_on(async move {
-            launch_actors(state_dir, startup);
+        let mut launch_err: Option<DaemonError> = None;
+        actix::System::new().block_on(async {
+            if let Err(e) = launch_actors(state_dir, startup) {
+                launch_err = Some(e);
+                actix::System::current().stop();
+                return;
+            }
             // Set up SIGTERM handler inside block_on — tokio::signal requires
             // an active runtime, which actix provides only once block_on starts.
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -498,18 +503,29 @@ fn run_actor_system(
             });
             let _ = shutdown_rx.await;
         });
+        if let Some(e) = launch_err {
+            return Err(e);
+        }
     }
 
     #[cfg(not(unix))]
     {
         debug!("actix system starting");
-        actix::System::new().block_on(async move {
-            launch_actors(state_dir, startup);
+        let mut launch_err: Option<DaemonError> = None;
+        actix::System::new().block_on(async {
+            if let Err(e) = launch_actors(state_dir, startup) {
+                launch_err = Some(e);
+                actix::System::current().stop();
+                return;
+            }
             // No signal API on this platform. This future never resolves; the
             // process must be killed externally. Non-Unix is not a supported
             // deployment target.
             std::future::pending::<()>().await;
         });
+        if let Some(e) = launch_err {
+            return Err(e);
+        }
     }
 
     Ok(())
@@ -517,8 +533,15 @@ fn run_actor_system(
 
 /// Pre-computed inputs for [`launch_actors`]; produced by the fallible
 /// [`prepare_agent_startup`] step that runs before the actix system starts.
+///
+/// The [`Agent`] value itself is constructed inside [`launch_actors`] so it
+/// can hold [`actix::Recipient`]s to tool actors that only exist once the
+/// actix runtime is up.
 struct AgentStartup {
-    lead_agent: Agent,
+    adapter: Arc<dyn reeve_adapter::Adapter>,
+    dirs: AgentDirs,
+    snapshot: crate::model_resolution::SpawnSnapshot,
+    system_prompt: String,
     inbox: AgentInbox,
     agent_id: reeve_types::IdentityId,
     watcher: Arc<Watcher>,
@@ -606,21 +629,18 @@ fn prepare_agent_startup(
     })?;
     debug!(agent_id = %agent_id, "wrote spawn snapshot");
 
-    // 9. Construct the lead agent value.
-    let system_prompt = persona_config.system_prompt.clone();
-    let lead_agent =
-        Agent::new(Arc::clone(adapter), &dirs, snapshot, system_prompt).map_err(|e| {
-            DaemonError::Resource {
-                component: "lead agent",
-                source: Box::new(e),
-            }
-        })?;
-
-    // 10. Build the inbox handle pointing to the lead's provisioned inbox.
+    // 9. Build the inbox handle pointing to the lead's provisioned inbox.
     let inbox = AgentInbox::from_path(dirs.inbox_root());
 
+    let system_prompt = persona_config.system_prompt.clone();
+
+    // Agent::new is deferred to launch_actors so it can take Recipient<InvokeTool>
+    // handles to tool actors started inside the actix runtime.
     Ok(AgentStartup {
-        lead_agent,
+        adapter: Arc::clone(adapter),
+        dirs,
+        snapshot,
+        system_prompt,
         inbox,
         agent_id,
         watcher,
@@ -630,9 +650,14 @@ fn prepare_agent_startup(
 /// Start all supervised actors inside the running actix system.
 ///
 /// Must be called from within an actix `block_on` context.
-fn launch_actors(state_dir: PathBuf, startup: AgentStartup) {
+fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), DaemonError> {
+    use actix::Actor as _;
+
     let AgentStartup {
-        lead_agent,
+        adapter,
+        dirs,
+        snapshot,
+        system_prompt,
         inbox,
         agent_id,
         watcher,
@@ -641,7 +666,24 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) {
     // HeartbeatActor: touches the heartbeat file every second.
     actix::Supervisor::start(move |_| HeartbeatActor::new(state_dir));
 
-    // Agent: processes inbound envelopes via the model adapter.
+    // EchoTool: temporary tool used to validate the agent's tool execution
+    // loop end-to-end. Replaced by spawn_agent / send_message in subsequent
+    // multi-agent ladder phases.
+    let echo_addr = crate::tool::EchoTool.start();
+    let tools: Vec<(
+        reeve_adapter::Tool,
+        actix::Recipient<crate::tool::InvokeTool>,
+    )> = vec![(crate::tool::EchoTool::descriptor(), echo_addr.recipient())];
+
+    // Agent: processes inbound envelopes via the model adapter and the tool
+    // execution loop.
+    let lead_agent =
+        Agent::new(adapter, &dirs, snapshot, system_prompt, agent_id, tools).map_err(|e| {
+            DaemonError::Resource {
+                component: "lead agent",
+                source: Box::new(e),
+            }
+        })?;
     let lead_addr = actix::Supervisor::start(move |_| lead_agent);
 
     // WatcherActor: watches the lead inbox and dispatches verified messages.
@@ -653,6 +695,8 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) {
             lead_addr.do_send(crate::agent::QuarantineEvent { reason });
         })),
     });
+
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
