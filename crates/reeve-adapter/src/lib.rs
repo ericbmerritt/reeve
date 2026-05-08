@@ -435,6 +435,27 @@ impl Response {
             latency: std::time::Duration::ZERO,
         }
     }
+
+    /// Construct a `Response` carrying tool calls (`finish_reason` set to
+    /// [`FinishReason::ToolUse`]).
+    ///
+    /// Used by mock adapters that drive the agent's tool execution loop in
+    /// tests. `latency` is set to zero.
+    pub fn new_tool_use(
+        content: Vec<MessageContent>,
+        tool_calls: Vec<ToolCall>,
+        tokens: TokenCounts,
+        cost: CostEstimate,
+    ) -> Self {
+        Self {
+            content,
+            tool_calls,
+            finish_reason: FinishReason::ToolUse,
+            tokens,
+            cost,
+            latency: std::time::Duration::ZERO,
+        }
+    }
 }
 
 /// A tool invocation the model requested.

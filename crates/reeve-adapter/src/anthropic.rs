@@ -156,10 +156,7 @@ impl std::fmt::Display for TranslationError {
                 )
             }
             Self::SystemMessageNotText => {
-                write!(
-                    f,
-                    "system-role message must be a single text block"
-                )
+                write!(f, "system-role message must be a single text block")
             }
         }
     }
@@ -178,7 +175,7 @@ impl From<TranslationError> for AdapterError {
 // ── Request translation ────────────────────────────────────────────────────────
 
 /// Translate one Reeve [`MessageContent`] block into the Anthropic wire shape.
-fn translate_content<'a>(block: &'a MessageContent) -> MessagesRequestContent<'a> {
+fn translate_content(block: &MessageContent) -> MessagesRequestContent<'_> {
     match block {
         MessageContent::Text(t) => MessagesRequestContent::Text { text: t.as_str() },
         MessageContent::ToolUse { id, name, input } => MessagesRequestContent::ToolUse {
@@ -208,7 +205,7 @@ fn extract_system_text(content: &[MessageContent]) -> Option<&str> {
     }
     match &content[0] {
         MessageContent::Text(t) => Some(t.as_str()),
-        _ => None,
+        MessageContent::ToolUse { .. } | MessageContent::ToolResult { .. } => None,
     }
 }
 
@@ -292,7 +289,8 @@ fn extract_system(messages: &[crate::Message]) -> Result<Option<&str>, Translati
         if msg.role != Role::System {
             continue;
         }
-        let text = extract_system_text(&msg.content).ok_or(TranslationError::SystemMessageNotText)?;
+        let text =
+            extract_system_text(&msg.content).ok_or(TranslationError::SystemMessageNotText)?;
         if found.is_some() {
             return Err(TranslationError::MultipleSystemMessages);
         }
@@ -506,9 +504,9 @@ mod tests {
 
     // ── AT5b: build_request with tool_use and tool_result blocks ─────────────
 
-    /// AT5b: an assistant turn carrying ToolUse blocks and a follow-up user
-    /// turn carrying ToolResult blocks both translate to the wire shape with
-    /// the correct `type` discriminator and field set.
+    /// `AT5b`: an assistant turn carrying `ToolUse` blocks and a follow-up
+    /// user turn carrying `ToolResult` blocks both translate to the wire shape
+    /// with the correct `type` discriminator and field set.
     #[test]
     fn at5b_build_request_round_trips_tool_blocks() {
         let assistant_turn = Message {
