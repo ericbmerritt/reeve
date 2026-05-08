@@ -304,7 +304,7 @@ mod tests {
     fn user_message(text: &str) -> Message {
         Message {
             role: Role::User,
-            content: MessageContent::Text(text.to_owned()),
+            content: vec![MessageContent::Text(text.to_owned())],
         }
     }
 

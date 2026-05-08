@@ -151,7 +151,7 @@ fn cmd_test(
     let adapter = reeve_adapter::ClaudeOpus47::new(secret);
     let messages = [Message {
         role: Role::User,
-        content: MessageContent::Text(prompt),
+        content: vec![MessageContent::Text(prompt)],
     }];
     let params = Params {
         max_tokens: TEST_MAX_TOKENS,
