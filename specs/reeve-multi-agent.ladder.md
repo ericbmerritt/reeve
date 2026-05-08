@@ -2,9 +2,9 @@
 
 ## Phase 1: Tool execution loop
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-08 | 2026-05-08 |
 
 Tags: runtime, adapter
 
@@ -47,8 +47,9 @@ causes the loop to abort, append a system entry, and return to idle.
 declares a single string argument; its handler returns the argument unchanged as
 the result. It is used to verify the complete loop end-to-end (adapter returns
 ToolUse → EchoTool executes → result returned to adapter → EndTurn) without
-needing real tool implementations. The EchoTool is removed when `spawn_agent`
-and `send_message` land in phase 3.
+needing real tool implementations. `EchoTool` is wired into the production
+daemon as well so the operator can exercise the loop manually from the TUI;
+both wirings are removed when `spawn_agent` and `send_message` land in phase 3.
 
 #### Delivers
 
@@ -57,8 +58,10 @@ and `send_message` land in phase 3.
 - `InvokeTool` and `ToolResult` message types in `reeve-runtime`
 - Tool actor convention: `descriptor()` + `Handler<InvokeTool>` with authority
   check slot (always Allow)
-- Tool execution loop in `LeadAgent` with `MAX_TOOL_ITERATIONS` bound
-- `EchoTool` actor wired for end-to-end loop testing
+- Tool execution loop in `Agent` with `MAX_TOOL_ITERATIONS` bound and a
+  per-batch `TOOL_TIMEOUT` watchdog
+- `EchoTool` actor wired into the production daemon for both end-to-end
+  testing and operator-driven manual verification
 
 #### Done When
 
