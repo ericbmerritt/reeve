@@ -184,17 +184,20 @@ impl Capabilities {
 
 // ── Message types ────────────────────────────────────────────────────────────
 
-/// A single message in a conversation, carrying a [`Role`] and
-/// [`MessageContent`].
+/// A single message (a "turn") in a conversation, carrying a [`Role`] and one
+/// or more [`MessageContent`] blocks.
+///
+/// A turn may carry multiple blocks: an assistant turn can mix text and
+/// tool-use blocks; a user turn can carry one or more tool-result blocks. The
+/// adapter is responsible for serializing the block array into the provider's
+/// wire format.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     /// Authorship — see [`Role`] for valid values and the typical
     /// system→user→assistant turn order.
     pub role: Role,
-    /// Message body — see [`MessageContent`] for the variants
-    /// (currently `Text(String)`; future variants for images and
-    /// tool blocks land in Task 16).
-    pub content: MessageContent,
+    /// One or more content blocks for this turn — see [`MessageContent`].
+    pub content: Vec<MessageContent>,
 }
 
 /// The author of a [`Message`].
@@ -209,15 +212,42 @@ pub enum Role {
     Assistant,
 }
 
-/// The content carried by a [`Message`].
+/// One block of content in a [`Message`].
 ///
-/// This enum is `#[non_exhaustive]`: future tasks will add variants for
-/// images, tool-use blocks, and tool-result blocks as needed.
+/// A turn carries one or more of these in `Message.content`. This enum is
+/// `#[non_exhaustive]`: future variants (images, reasoning blocks) may land
+/// without a breaking change.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum MessageContent {
     /// A plain UTF-8 text block.
     Text(String),
+    /// A tool invocation requested by the assistant in a prior turn. Sent back
+    /// to the provider verbatim as part of the assistant turn so it stays
+    /// paired with the matching `ToolResult` in the next user turn.
+    ToolUse {
+        /// Provider-assigned identifier for this invocation; echoed back in
+        /// the matching [`MessageContent::ToolResult`] block.
+        id: String,
+        /// Tool name the model invoked.
+        name: String,
+        /// Arguments the model supplied, conforming to the tool's input
+        /// schema.
+        input: serde_json::Value,
+    },
+    /// The result of a tool invocation, carried in a user turn that follows
+    /// an assistant turn containing the matching [`MessageContent::ToolUse`].
+    ToolResult {
+        /// Identifier of the [`MessageContent::ToolUse`] block this result
+        /// answers.
+        tool_use_id: String,
+        /// Tool output as a string. Structured outputs are serialized to JSON
+        /// upstream; Reeve does not impose a schema on this field.
+        content: String,
+        /// `true` if the tool execution failed; signals to the model that the
+        /// result represents an error condition.
+        is_error: bool,
+    },
 }
 
 // ── Tool ─────────────────────────────────────────────────────────────────────
@@ -862,10 +892,10 @@ mod tests {
     fn type_construction_compiles_and_round_trips() {
         let msg = Message {
             role: Role::User,
-            content: MessageContent::Text("hello".into()),
+            content: vec![MessageContent::Text("hello".into())],
         };
         assert_eq!(msg.role, Role::User);
-        assert_eq!(msg.content, MessageContent::Text("hello".into()));
+        assert_eq!(msg.content, vec![MessageContent::Text("hello".into())]);
 
         let tool = Tool {
             name: "search".into(),

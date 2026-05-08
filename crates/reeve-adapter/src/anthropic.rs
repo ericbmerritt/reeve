@@ -23,10 +23,39 @@ pub(crate) struct MessagesRequest<'a> {
 }
 
 /// A single message in the request conversation history.
+///
+/// `content` is always serialized as an array of typed blocks so a single
+/// turn can carry mixed text and tool-use / tool-result blocks. Anthropic
+/// also accepts a plain string for text-only turns; we use the array form
+/// uniformly for simplicity.
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct MessagesRequestMessage<'a> {
     pub(crate) role: &'a str,
-    pub(crate) content: &'a str,
+    pub(crate) content: Vec<MessagesRequestContent<'a>>,
+}
+
+/// A single content block in a request message.
+///
+/// Mirrors Anthropic's wire shape: `{ "type": "text", "text": "..." }`,
+/// `{ "type": "tool_use", "id": "...", "name": "...", "input": {...} }`, or
+/// `{ "type": "tool_result", "tool_use_id": "...", "content": "...",
+///   "is_error": false }`.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub(crate) enum MessagesRequestContent<'a> {
+    Text {
+        text: &'a str,
+    },
+    ToolUse {
+        id: &'a str,
+        name: &'a str,
+        input: &'a serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: &'a str,
+        content: &'a str,
+        is_error: bool,
+    },
 }
 
 /// A tool definition forwarded to the model.
@@ -112,6 +141,9 @@ pub(crate) enum TranslationError {
     /// Multiple `Role::System` messages were supplied. Anthropic accepts only
     /// one system prompt (the `system` field on the request body).
     MultipleSystemMessages,
+    /// A `Role::System` message contained a non-text block, or more than one
+    /// block. The system prompt must be a single text block.
+    SystemMessageNotText,
 }
 
 impl std::fmt::Display for TranslationError {
@@ -121,6 +153,12 @@ impl std::fmt::Display for TranslationError {
                 write!(
                     f,
                     "multiple system-role messages supplied; Anthropic accepts only one"
+                )
+            }
+            Self::SystemMessageNotText => {
+                write!(
+                    f,
+                    "system-role message must be a single text block"
                 )
             }
         }
@@ -139,14 +177,38 @@ impl From<TranslationError> for AdapterError {
 
 // ── Request translation ────────────────────────────────────────────────────────
 
-/// Extract the textual content from a [`MessageContent`].
+/// Translate one Reeve [`MessageContent`] block into the Anthropic wire shape.
+fn translate_content<'a>(block: &'a MessageContent) -> MessagesRequestContent<'a> {
+    match block {
+        MessageContent::Text(t) => MessagesRequestContent::Text { text: t.as_str() },
+        MessageContent::ToolUse { id, name, input } => MessagesRequestContent::ToolUse {
+            id: id.as_str(),
+            name: name.as_str(),
+            input,
+        },
+        MessageContent::ToolResult {
+            tool_use_id,
+            content,
+            is_error,
+        } => MessagesRequestContent::ToolResult {
+            tool_use_id: tool_use_id.as_str(),
+            content: content.as_str(),
+            is_error: *is_error,
+        },
+    }
+}
+
+/// Extract a system-prompt string from a single-block, text-only message.
 ///
-/// `MessageContent::Text` is the only current variant, so this function
-/// is infallible. When new variants land, decide per the call site
-/// whether to drop, error, or translate.
-fn extract_text_content(content: &MessageContent) -> &str {
-    match content {
-        MessageContent::Text(t) => t.as_str(),
+/// System prompts must be plain text. Returns `None` if the message contains
+/// any non-text block or has more than one block.
+fn extract_system_text(content: &[MessageContent]) -> Option<&str> {
+    if content.len() != 1 {
+        return None;
+    }
+    match &content[0] {
+        MessageContent::Text(t) => Some(t.as_str()),
+        _ => None,
     }
 }
 
@@ -191,10 +253,11 @@ pub(crate) fn build_request<'a>(
             Role::Assistant => "assistant",
             Role::System => unreachable!("system filtered above"),
         };
-        let text = extract_text_content(&msg.content);
+        let blocks: Vec<MessagesRequestContent<'_>> =
+            msg.content.iter().map(translate_content).collect();
         wire_messages.push(MessagesRequestMessage {
             role: role_str,
-            content: text,
+            content: blocks,
         });
     }
 
@@ -221,14 +284,15 @@ pub(crate) fn build_request<'a>(
 ///
 /// Returns `Ok(None)` if no system message exists, `Ok(Some(&str))` for
 /// exactly one, and `Err(TranslationError::MultipleSystemMessages)` for two or
-/// more.
+/// more. A system-role message that does not consist of a single text block
+/// is rejected as `Err(TranslationError::SystemMessageNotText)`.
 fn extract_system(messages: &[crate::Message]) -> Result<Option<&str>, TranslationError> {
     let mut found: Option<&str> = None;
     for msg in messages {
         if msg.role != Role::System {
             continue;
         }
-        let text = extract_text_content(&msg.content);
+        let text = extract_system_text(&msg.content).ok_or(TranslationError::SystemMessageNotText)?;
         if found.is_some() {
             return Err(TranslationError::MultipleSystemMessages);
         }
@@ -307,21 +371,21 @@ mod tests {
     fn user_text(text: &str) -> Message {
         Message {
             role: Role::User,
-            content: MessageContent::Text(text.to_owned()),
+            content: vec![MessageContent::Text(text.to_owned())],
         }
     }
 
     fn system_text(text: &str) -> Message {
         Message {
             role: Role::System,
-            content: MessageContent::Text(text.to_owned()),
+            content: vec![MessageContent::Text(text.to_owned())],
         }
     }
 
     fn assistant_text(text: &str) -> Message {
         Message {
             role: Role::Assistant,
-            content: MessageContent::Text(text.to_owned()),
+            content: vec![MessageContent::Text(text.to_owned())],
         }
     }
 
@@ -348,7 +412,11 @@ mod tests {
         assert!(req.temperature.is_none());
         assert_eq!(req.messages.len(), 1);
         assert_eq!(req.messages[0].role, "user");
-        assert_eq!(req.messages[0].content, "hello");
+        assert_eq!(req.messages[0].content.len(), 1);
+        assert!(matches!(
+            &req.messages[0].content[0],
+            MessagesRequestContent::Text { text } if *text == "hello",
+        ));
         assert!(req.tools.is_empty());
     }
 
@@ -434,6 +502,60 @@ mod tests {
         assert_eq!(req.tools[0].name, "web_search");
         assert_eq!(req.tools[0].description, "Search the web.");
         assert_eq!(*req.tools[0].input_schema, schema);
+    }
+
+    // ── AT5b: build_request with tool_use and tool_result blocks ─────────────
+
+    /// AT5b: an assistant turn carrying ToolUse blocks and a follow-up user
+    /// turn carrying ToolResult blocks both translate to the wire shape with
+    /// the correct `type` discriminator and field set.
+    #[test]
+    fn at5b_build_request_round_trips_tool_blocks() {
+        let assistant_turn = Message {
+            role: Role::Assistant,
+            content: vec![
+                MessageContent::Text("calling search...".to_owned()),
+                MessageContent::ToolUse {
+                    id: "call_1".to_owned(),
+                    name: "web_search".to_owned(),
+                    input: json!({ "q": "rust async" }),
+                },
+            ],
+        };
+        let user_turn = Message {
+            role: Role::User,
+            content: vec![MessageContent::ToolResult {
+                tool_use_id: "call_1".to_owned(),
+                content: "[result text]".to_owned(),
+                is_error: false,
+            }],
+        };
+        let messages = [user_text("hi"), assistant_turn, user_turn];
+        let params = base_params();
+        let req = build_request(&messages, &[], &params, "claude-opus-4-7").expect("ok");
+        // Serialize to JSON and assert on the wire-level shape so we catch
+        // accidental tag/field renames.
+        let json = serde_json::to_value(&req).expect("serialize");
+        let msgs = json["messages"].as_array().expect("messages array");
+        assert_eq!(msgs.len(), 3);
+
+        // Assistant turn: text + tool_use blocks.
+        let assistant_blocks = msgs[1]["content"].as_array().expect("array");
+        assert_eq!(assistant_blocks.len(), 2);
+        assert_eq!(assistant_blocks[0]["type"], "text");
+        assert_eq!(assistant_blocks[0]["text"], "calling search...");
+        assert_eq!(assistant_blocks[1]["type"], "tool_use");
+        assert_eq!(assistant_blocks[1]["id"], "call_1");
+        assert_eq!(assistant_blocks[1]["name"], "web_search");
+        assert_eq!(assistant_blocks[1]["input"], json!({ "q": "rust async" }));
+
+        // User turn: tool_result block with snake_case `tool_use_id`.
+        let user_blocks = msgs[2]["content"].as_array().expect("array");
+        assert_eq!(user_blocks.len(), 1);
+        assert_eq!(user_blocks[0]["type"], "tool_result");
+        assert_eq!(user_blocks[0]["tool_use_id"], "call_1");
+        assert_eq!(user_blocks[0]["content"], "[result text]");
+        assert_eq!(user_blocks[0]["is_error"], false);
     }
 
     // ── AT6: parse_response happy path ───────────────────────────────────────

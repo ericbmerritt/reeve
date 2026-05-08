@@ -215,7 +215,7 @@ impl Agent {
         let text = extract_response_text(&response.content);
         self.history.push(reeve_adapter::Message {
             role: reeve_adapter::Role::Assistant,
-            content: reeve_adapter::MessageContent::Text(text.clone()),
+            content: vec![reeve_adapter::MessageContent::Text(text.clone())],
         });
 
         if !self.append_outbound_and_model_call(&text, response, ctx) {
@@ -374,7 +374,7 @@ impl Handler<ProcessInbound> for Agent {
         }
         self.history.push(reeve_adapter::Message {
             role: reeve_adapter::Role::User,
-            content: reeve_adapter::MessageContent::Text(msg.payload),
+            content: vec![reeve_adapter::MessageContent::Text(msg.payload)],
         });
         self.spawn_adapter_call(ctx);
     }
@@ -1053,7 +1053,7 @@ mod tests {
         );
         assert_eq!(
             calls[1][0].content,
-            reeve_adapter::MessageContent::Text("second message".to_owned()),
+            vec![reeve_adapter::MessageContent::Text("second message".to_owned())],
             "second adapter call should carry the second user message"
         );
     }
