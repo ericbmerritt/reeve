@@ -235,6 +235,30 @@ pub enum ConversationEntry {
         #[serde(with = "time::serde::rfc3339")]
         timestamp_utc: OffsetDateTime,
     },
+    /// A tool invocation requested by the agent in an assistant turn. Paired
+    /// with a [`ConversationEntry::ToolResult`] entry by `tool_use_id`.
+    ToolUse {
+        /// Provider-assigned identifier echoed in the matching result.
+        tool_use_id: String,
+        /// Tool name the agent invoked.
+        name: String,
+        /// Arguments the agent supplied.
+        input: serde_json::Value,
+        #[serde(with = "time::serde::rfc3339")]
+        timestamp_utc: OffsetDateTime,
+    },
+    /// The result of a tool invocation, paired by `tool_use_id` to the
+    /// originating [`ConversationEntry::ToolUse`] entry.
+    ToolResult {
+        /// Identifier of the [`ConversationEntry::ToolUse`] this answers.
+        tool_use_id: String,
+        /// Tool output as a string (structured outputs are JSON-encoded).
+        content: String,
+        /// `true` when the tool execution failed.
+        is_error: bool,
+        #[serde(with = "time::serde::rfc3339")]
+        timestamp_utc: OffsetDateTime,
+    },
 }
 
 // ── ConversationThread ────────────────────────────────────────────────────────

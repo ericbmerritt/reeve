@@ -305,7 +305,7 @@ pub(crate) fn collect_text(content: &[MessageContent]) -> String {
         .iter()
         .filter_map(|c| match c {
             MessageContent::Text(t) => Some(t.as_str()),
-            _ => None,
+            MessageContent::ToolUse { .. } | MessageContent::ToolResult { .. } | _ => None,
         })
         .collect();
     if parts.is_empty() {

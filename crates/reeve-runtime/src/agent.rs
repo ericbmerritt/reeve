@@ -1,23 +1,30 @@
-//! Lead agent actor: receive inbound envelopes, call the adapter, and record
-//! the conversation journal, status, and cost.
+//! Agent actor: receive inbound envelopes, drive the adapter / tool-call loop,
+//! and record the conversation journal, status, and cost.
 //!
-//! A single supervised actor that processes one [`ProcessInbound`] message at a time.
-//! Inbound messages drive a round-trip through the registered adapter, and each
-//! exchange is appended to the JSONL conversation journal maintained by
-//! [`ConversationThread`].
+//! A single supervised actor that processes one [`ProcessInbound`] message at
+//! a time. An inbound message drives the agent through one or more adapter
+//! calls — text-only turns finish in one call; tool-use turns drive a loop:
+//! the model returns tool calls, the agent dispatches them as [`InvokeTool`]
+//! messages to the registered tool actors, collects [`ToolResult`] replies
+//! into the conversation history, and calls the adapter again. The loop
+//! terminates on `FinishReason::EndTurn` or when [`MAX_TOOL_ITERATIONS`] is
+//! reached (runaway guard).
 //!
 //! Lifecycle:
 //! - `started` — writes `"idle"` to the status file and records a system entry.
 //! - `restarting` — re-writes `"idle"` after supervisor-driven restart.
 //! - `Handler<ProcessInbound>` — transitions status to `"working"`, calls the
-//!   adapter, then transitions back to `"idle"` on completion or error.
+//!   adapter, dispatches any tool calls, and returns to `"idle"` once the
+//!   loop terminates.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use actix::{Actor, ActorContext, AsyncContext, Context, Handler, Supervised};
+use actix::{Actor, ActorContext, AsyncContext, Context, Handler, Recipient, Supervised};
 use time::OffsetDateTime;
 use tracing::{debug, info, warn};
 
@@ -25,10 +32,11 @@ use crate::agent_fs::{
     AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread,
 };
 use crate::model_resolution::SpawnSnapshot;
+use crate::tool::{InvokeTool, ToolResult};
 
 // ── Error type ────────────────────────────────────────────────────────────────
 
-/// Errors produced by the lead agent actor and its constructor.
+/// Errors produced by the agent actor and its constructor.
 #[derive(Debug)]
 pub enum AgentError {
     /// Filesystem or JSONL journal error.
@@ -52,9 +60,9 @@ impl fmt::Display for AgentError {
             Self::Fs(source) => write!(f, "agent fs error: {source}"),
             Self::Adapter(source) => write!(f, "adapter error: {source}"),
             Self::Io { path, source } => {
-                write!(f, "lead agent IO at {}: {source}", path.display())
+                write!(f, "agent IO at {}: {source}", path.display())
             }
-            Self::Json(source) => write!(f, "lead agent json error: {source}"),
+            Self::Json(source) => write!(f, "agent json error: {source}"),
         }
     }
 }
@@ -72,7 +80,7 @@ impl std::error::Error for AgentError {
 
 // ── ProcessInbound message ────────────────────────────────────────────────────
 
-/// Notify the lead agent that an inbound envelope was quarantined.
+/// Notify the agent that an inbound envelope was quarantined.
 ///
 /// The agent appends a system entry to the conversation thread so the operator
 /// can see transport rejections without reading daemon logs.
@@ -85,7 +93,7 @@ impl actix::Message for QuarantineEvent {
     type Result = ();
 }
 
-/// Deliver an inbound envelope payload to the lead agent for processing.
+/// Deliver an inbound envelope payload to the agent for processing.
 ///
 /// The actor appends the payload to its conversation journal, calls the
 /// adapter with the full in-memory history, and records the response and token
@@ -101,9 +109,22 @@ impl actix::Message for ProcessInbound {
     type Result = ();
 }
 
+// ── ToolBatchTimeout (internal) ───────────────────────────────────────────────
+
+/// Self-message scheduled when a tool batch is dispatched. Fires after
+/// [`TOOL_TIMEOUT`] elapses; the handler synthesizes error results for any
+/// tool calls still pending and resumes the adapter loop. Late-arriving
+/// `ToolResult` messages are ignored (their `tool_use_id` is no longer in
+/// the pending set).
+struct ToolBatchTimeout;
+
+impl actix::Message for ToolBatchTimeout {
+    type Result = ();
+}
+
 // ── Agent actor ───────────────────────────────────────────────────────────
 
-/// Supervised actix actor that implements the lead agent's message loop.
+/// Supervised actix actor that implements the agent's message loop.
 ///
 /// Calls the registered adapter with the accumulated conversation history
 /// and records all exchanges in an append-only JSONL journal.
@@ -138,28 +159,90 @@ pub struct Agent {
     history: Vec<reeve_adapter::Message>,
     /// Path to `agents/lead/inbox/cur/`. Watched for new verified envelopes.
     inbox_cur: PathBuf,
+    /// Tool descriptors advertised to the adapter on every call.
+    tool_descriptors: Vec<reeve_adapter::Tool>,
+    /// Routes from tool name to the receiving tool actor.
+    tool_routes: HashMap<String, Recipient<InvokeTool>>,
+    /// `tool_use_id`s of tool calls dispatched in the current batch but not
+    /// yet answered. Empty when no tool batch is in flight.
+    pending_tool_calls: HashSet<String>,
+    /// Tool-result content blocks accumulated for the next user turn.
+    /// Drained when the batch completes and the next adapter call fires.
+    pending_results: Vec<reeve_adapter::MessageContent>,
+    /// Adapter calls executed for the current `ProcessInbound`. Reset to 0
+    /// at the start of each inbound message; incremented before each call.
+    /// Capped by [`MAX_TOOL_ITERATIONS`].
+    tool_iteration: u32,
+    /// Identity of the agent itself, supplied as `sender_id` on every
+    /// [`InvokeTool`] dispatch. The authority hook reads this when deciding
+    /// whether the invocation is permitted.
+    #[expect(
+        clippy::struct_field_names,
+        reason = "agent_id is the conventional name for the actor's identity; \
+                  renaming would obscure the field's purpose"
+    )]
+    agent_id: reeve_types::IdentityId,
 }
 
 /// Default maximum tokens for the adapter response.
 const DEFAULT_MAX_TOKENS: u32 = 4096;
 
+/// Maximum number of consecutive tool-use rounds the agent will execute for
+/// one inbound message before aborting with a runaway-guard system entry.
+///
+/// A turn that needs more than this many tool calls in succession is almost
+/// always a model loop, not a useful chain. The agent records the abort and
+/// returns to idle so the operator can intervene.
+const MAX_TOOL_ITERATIONS: u32 = 16;
+
+/// How long the agent waits for all tool actors to reply with [`ToolResult`]
+/// before synthesizing error results for any still-pending invocations.
+///
+/// 30 seconds covers ordinary tool latency (filesystem, lightweight subprocess
+/// calls) without leaving the agent stuck on a wedged tool actor. Tools with
+/// genuinely long-running work should structure their handler to return
+/// quickly with an in-progress acknowledgment and stream completion separately
+/// — that pattern is not used by any tool yet.
+const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
+
 impl Agent {
-    /// Construct a `Agent`.
+    /// Construct an `Agent`.
     ///
     /// Opens the conversation journal and creates atomic writers for the
     /// status and cost files. Does not start the actor; call
     /// [`actix::Supervisor::start`] with a closure that invokes this.
+    ///
+    /// `tools` carries the adapter-facing descriptor and the actor route for
+    /// each tool the agent may invoke. The descriptor is forwarded to the
+    /// model on every adapter call; the route receives [`InvokeTool`]
+    /// messages when the model returns a matching tool call. An agent with
+    /// an empty tools vector behaves as a text-only agent.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "agent constructor wires together six independent collaborators; \
+                  bundling into a struct trades complexity for indirection"
+    )]
     pub fn new(
         adapter: Arc<dyn reeve_adapter::Adapter>,
         dirs: &AgentDirs,
         snapshot: SpawnSnapshot,
         system_prompt: String,
+        agent_id: reeve_types::IdentityId,
+        tools: Vec<(reeve_adapter::Tool, Recipient<InvokeTool>)>,
     ) -> Result<Self, AgentError> {
         let conversation =
             ConversationThread::open(&dirs.conversation_path()).map_err(AgentError::Fs)?;
         let status_writer = AtomicFileWriter::new(dirs.status_path()).map_err(AgentError::Fs)?;
         let cost_writer = AtomicFileWriter::new(dirs.cost_path()).map_err(AgentError::Fs)?;
         let inbox_cur = dirs.inbox_root().join("cur");
+
+        let mut tool_descriptors = Vec::with_capacity(tools.len());
+        let mut tool_routes = HashMap::with_capacity(tools.len());
+        for (descriptor, recipient) in tools {
+            tool_routes.insert(descriptor.name.clone(), recipient);
+            tool_descriptors.push(descriptor);
+        }
+
         Ok(Self {
             adapter,
             snapshot,
@@ -171,6 +254,12 @@ impl Agent {
             in_flight: false,
             history: Vec::new(),
             inbox_cur,
+            tool_descriptors,
+            tool_routes,
+            pending_tool_calls: HashSet::new(),
+            pending_results: Vec::new(),
+            tool_iteration: 0,
+            agent_id,
         })
     }
 
@@ -209,13 +298,33 @@ impl Agent {
         true
     }
 
-    /// Record the adapter response: journal outbound + model-call entries,
-    /// update cost, and return to idle.
+    /// Record an adapter response and either continue the tool loop or
+    /// finish the turn.
+    ///
+    /// Common bookkeeping (journal entries, history, cost) runs every time.
+    /// The branch on `finish_reason` drives the outcome:
+    /// - [`reeve_adapter::FinishReason::ToolUse`] dispatches the requested
+    ///   tool calls; the agent stays `in_flight` and waits for `ToolResult`
+    ///   messages.
+    /// - Any other variant (typically `EndTurn`) ends the turn and returns
+    ///   the agent to idle.
     fn handle_response(&mut self, response: &reeve_adapter::Response, ctx: &mut Context<Self>) {
         let text = extract_response_text(&response.content);
+
+        // Push the assistant turn to history with both text and tool_use
+        // blocks, in that order, so the next adapter call carries the full
+        // turn context the model emitted.
+        let mut assistant_blocks: Vec<reeve_adapter::MessageContent> = response.content.clone();
+        for tc in &response.tool_calls {
+            assistant_blocks.push(reeve_adapter::MessageContent::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.arguments.clone(),
+            });
+        }
         self.history.push(reeve_adapter::Message {
             role: reeve_adapter::Role::Assistant,
-            content: vec![reeve_adapter::MessageContent::Text(text.clone())],
+            content: assistant_blocks,
         });
 
         if !self.append_outbound_and_model_call(&text, response, ctx) {
@@ -236,7 +345,120 @@ impl Agent {
             return;
         }
 
-        self.set_idle(ctx);
+        if response.finish_reason == reeve_adapter::FinishReason::ToolUse {
+            self.dispatch_tool_calls(&response.tool_calls, ctx);
+        } else {
+            // Turn complete.
+            self.in_flight = false;
+            self.tool_iteration = 0;
+            self.set_idle(ctx);
+        }
+    }
+
+    /// Dispatch a batch of tool calls returned by the model and arm the
+    /// timeout watchdog.
+    ///
+    /// Each call produces a [`ConversationEntry::ToolUse`] journal entry and
+    /// an [`InvokeTool`] message to the matching tool actor. Calls whose
+    /// `name` does not resolve to a registered tool are answered immediately
+    /// with a synthetic error result rather than dispatched.
+    fn dispatch_tool_calls(
+        &mut self,
+        tool_calls: &[reeve_adapter::ToolCall],
+        ctx: &mut Context<Self>,
+    ) {
+        debug_assert!(
+            self.pending_tool_calls.is_empty() && self.pending_results.is_empty(),
+            "dispatch_tool_calls invoked with non-empty pending state"
+        );
+
+        let reply_to: Recipient<ToolResult> = ctx.address().recipient();
+
+        for tc in tool_calls {
+            let entry = ConversationEntry::ToolUse {
+                tool_use_id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.arguments.clone(),
+                timestamp_utc: OffsetDateTime::now_utc(),
+            };
+            if self.conversation.append(&entry).is_err() {
+                ctx.stop();
+                return;
+            }
+
+            match self.tool_routes.get(&tc.name) {
+                Some(route) => {
+                    self.pending_tool_calls.insert(tc.id.clone());
+                    route.do_send(InvokeTool {
+                        tool_use_id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        input: tc.arguments.clone(),
+                        sender_id: self.agent_id,
+                        reply_to: reply_to.clone(),
+                    });
+                }
+                None => {
+                    // Unknown tool: synthesize an error result locally so the
+                    // adapter loop continues. The model will see the error and
+                    // can correct course.
+                    self.append_tool_result(
+                        &tc.id,
+                        &format!("unknown tool: {}", tc.name),
+                        true,
+                        ctx,
+                    );
+                }
+            }
+        }
+
+        if self.pending_tool_calls.is_empty() {
+            // All tools were unknown; advance immediately.
+            self.advance_after_tools(ctx);
+        } else {
+            ctx.run_later(TOOL_TIMEOUT, |_actor, inner_ctx| {
+                inner_ctx.address().do_send(ToolBatchTimeout);
+            });
+        }
+    }
+
+    /// Append a tool-result journal entry and accumulate the corresponding
+    /// content block for the next user turn.
+    fn append_tool_result(
+        &mut self,
+        tool_use_id: &str,
+        content: &str,
+        is_error: bool,
+        ctx: &mut Context<Self>,
+    ) {
+        let entry = ConversationEntry::ToolResult {
+            tool_use_id: tool_use_id.to_owned(),
+            content: content.to_owned(),
+            is_error,
+            timestamp_utc: OffsetDateTime::now_utc(),
+        };
+        if self.conversation.append(&entry).is_err() {
+            ctx.stop();
+            return;
+        }
+        self.pending_results
+            .push(reeve_adapter::MessageContent::ToolResult {
+                tool_use_id: tool_use_id.to_owned(),
+                content: content.to_owned(),
+                is_error,
+            });
+    }
+
+    /// Push the accumulated tool-result blocks to history as a user turn and
+    /// fire the next adapter call.
+    fn advance_after_tools(&mut self, ctx: &mut Context<Self>) {
+        let blocks = std::mem::take(&mut self.pending_results);
+        if !blocks.is_empty() {
+            self.history.push(reeve_adapter::Message {
+                role: reeve_adapter::Role::User,
+                content: blocks,
+            });
+        }
+        self.spawn_adapter_call(ctx);
     }
 
     /// Append the outbound and model-call entries to the conversation journal.
@@ -272,36 +494,58 @@ impl Agent {
     }
 
     /// Spawn the async adapter call into the actor's context.
-    fn spawn_adapter_call(&self, ctx: &mut Context<Self>) {
+    ///
+    /// Increments [`Self::tool_iteration`] before firing. If the iteration
+    /// would exceed [`MAX_TOOL_ITERATIONS`] the call is aborted, a system
+    /// entry is recorded, and the agent returns to idle — the runaway guard.
+    fn spawn_adapter_call(&mut self, ctx: &mut Context<Self>) {
         use actix::fut::WrapFuture as _;
         use actix::ActorFutureExt as _;
+
+        self.tool_iteration += 1;
+        if self.tool_iteration > MAX_TOOL_ITERATIONS {
+            warn!(
+                iteration = self.tool_iteration,
+                "tool loop exceeded MAX_TOOL_ITERATIONS; aborting"
+            );
+            self.append_system_entry(
+                &format!("tool loop aborted: exceeded {MAX_TOOL_ITERATIONS} iterations"),
+                ctx,
+            );
+            self.in_flight = false;
+            self.set_idle(ctx);
+            return;
+        }
 
         debug!(
             model = %self.snapshot.model(),
             history_len = self.history.len(),
+            iteration = self.tool_iteration,
             "calling adapter"
         );
         let adapter = Arc::clone(&self.adapter);
         let messages = self.history.clone();
+        let tools = self.tool_descriptors.clone();
         let params = reeve_adapter::Params {
             max_tokens: DEFAULT_MAX_TOKENS,
             system_prompt: Some(self.system_prompt.clone()),
             ..reeve_adapter::Params::default()
         };
-        let fut = async move { adapter.call(&messages, &[], &params).await }
+        let fut = async move { adapter.call(&messages, &tools, &params).await }
             .into_actor(self)
             .map(|result, actor, inner_ctx| match result {
                 Ok(response) => {
-                    actor.in_flight = false;
                     info!(
                         input_tokens = response.tokens.input,
                         output_tokens = response.tokens.output,
+                        finish_reason = ?response.finish_reason,
                         "response received"
                     );
                     actor.handle_response(&response, inner_ctx);
                 }
                 Err(err) => {
                     actor.in_flight = false;
+                    actor.tool_iteration = 0;
                     actor.history.pop();
                     warn!(err = %err, "adapter call failed");
                     // Adapter error: log to journal (best-effort) then go idle.
@@ -327,7 +571,7 @@ impl Actor for Agent {
     /// Initialize the agent: record the start event, write idle status, and
     /// start the inbox/cur/ watcher that forwards verified envelopes.
     fn started(&mut self, ctx: &mut Context<Self>) {
-        info!(adapter = %self.snapshot.adapter_id, "lead agent ready");
+        info!(adapter = %self.snapshot.adapter_id, "agent ready");
         self.append_system_entry("agent started", ctx);
         self.set_idle(ctx);
 
@@ -338,10 +582,14 @@ impl Actor for Agent {
 
 impl Supervised for Agent {
     /// Recover after a supervised restart: restore idle status without
-    /// re-logging the start event.
+    /// re-logging the start event. Clears any in-flight tool batch state
+    /// so a fresh inbound message starts cleanly.
     fn restarting(&mut self, ctx: &mut Context<Self>) {
-        warn!("lead agent restarting");
+        warn!("agent restarting");
         self.in_flight = false;
+        self.tool_iteration = 0;
+        self.pending_tool_calls.clear();
+        self.pending_results.clear();
         self.set_idle(ctx);
     }
 }
@@ -388,6 +636,52 @@ impl Handler<QuarantineEvent> for Agent {
     fn handle(&mut self, msg: QuarantineEvent, ctx: &mut Context<Self>) {
         warn!(reason = %msg.reason, "envelope quarantined");
         self.append_system_entry(&format!("quarantined: {}", msg.reason), ctx);
+    }
+}
+
+// ── Handler<ToolResult> ───────────────────────────────────────────────────────
+
+impl Handler<ToolResult> for Agent {
+    type Result = ();
+
+    fn handle(&mut self, msg: ToolResult, ctx: &mut Context<Self>) {
+        if !self.pending_tool_calls.remove(&msg.tool_use_id) {
+            // Late-arriving result (timeout already fired) or stray result
+            // for an unknown tool_use_id. Drop it silently.
+            debug!(tool_use_id = %msg.tool_use_id, "ignoring stale tool result");
+            return;
+        }
+        debug!(
+            tool_use_id = %msg.tool_use_id,
+            is_error = msg.is_error,
+            "tool result received"
+        );
+        self.append_tool_result(&msg.tool_use_id, &msg.content, msg.is_error, ctx);
+        if self.pending_tool_calls.is_empty() {
+            self.advance_after_tools(ctx);
+        }
+    }
+}
+
+// ── Handler<ToolBatchTimeout> ─────────────────────────────────────────────────
+
+impl Handler<ToolBatchTimeout> for Agent {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ToolBatchTimeout, ctx: &mut Context<Self>) {
+        if self.pending_tool_calls.is_empty() {
+            // Batch already completed; this is a stale timeout.
+            return;
+        }
+        let timed_out: Vec<String> = self.pending_tool_calls.drain().collect();
+        warn!(
+            count = timed_out.len(),
+            "tool batch timed out; synthesizing error results"
+        );
+        for id in timed_out {
+            self.append_tool_result(&id, "tool call timed out", true, ctx);
+        }
+        self.advance_after_tools(ctx);
     }
 }
 
@@ -595,7 +889,14 @@ mod tests {
         let tmp = tempdir().unwrap();
         let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let result = Agent::new(adapter, &dirs, mock_snapshot(), String::new());
+        let result = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        );
         assert!(result.is_ok(), "Agent::new should succeed");
     }
 
@@ -607,7 +908,15 @@ mod tests {
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
         let status_path = dirs.status_path();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         actix::System::new().block_on(async move {
             let _addr = Supervisor::start(move |_| agent);
@@ -642,7 +951,15 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -891,7 +1208,15 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(SlowMockAdapter);
-        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -963,6 +1288,11 @@ mod tests {
     // so the next ProcessInbound sends only that new message to the adapter —
     // not the failed one.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "two-phase integration test with sequential poll loops; \
+                  splitting fragments the narrative"
+    )]
     fn lead_agent_retry_after_error_sends_clean_history() {
         use std::sync::{Arc as StdArc, Mutex};
 
@@ -977,7 +1307,15 @@ mod tests {
         let adapter = Arc::new(TwoPhaseAdapter {
             calls: calls_log_for_actor,
         });
-        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1053,7 +1391,9 @@ mod tests {
         );
         assert_eq!(
             calls[1][0].content,
-            vec![reeve_adapter::MessageContent::Text("second message".to_owned())],
+            vec![reeve_adapter::MessageContent::Text(
+                "second message".to_owned()
+            )],
             "second adapter call should carry the second user message"
         );
     }
@@ -1062,6 +1402,11 @@ mod tests {
     // the user message is removed from history, and the journal has a
     // "adapter call failed: ..." system entry.
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "integration test with sequential poll loops for journal and \
+                  status assertions; splitting fragments the narrative"
+    )]
     fn lead_agent_adapter_error_returns_to_idle() {
         let tmp = tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -1069,7 +1414,15 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(AlwaysErrorAdapter);
-        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
         let status_path_outer = data_dir.join("agents").join("lead").join("status");
 
         actix::System::new().block_on(async move {
@@ -1168,7 +1521,15 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = Agent::new(adapter, &dirs, mock_snapshot(), String::new()).unwrap();
+        let agent = Agent::new(
+            adapter,
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            Vec::new(),
+        )
+        .unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1224,6 +1585,355 @@ mod tests {
         assert!(
             quarantine_entry.is_some(),
             "journal missing quarantine system entry; entries: {entries:?}"
+        );
+    }
+
+    // ── Tool loop adapter: ToolUse on call 1, EndTurn on call 2 ───────────────
+
+    struct TwoTurnEchoAdapter {
+        calls: Arc<std::sync::Mutex<u32>>,
+    }
+
+    #[async_trait::async_trait]
+    impl reeve_adapter::Adapter for TwoTurnEchoAdapter {
+        fn id(&self) -> &'static str {
+            "two-turn-echo@test"
+        }
+
+        fn capabilities(&self) -> reeve_adapter::Capabilities {
+            reeve_adapter::Capabilities::new()
+        }
+
+        async fn call(
+            &self,
+            _messages: &[reeve_adapter::Message],
+            _tools: &[reeve_adapter::Tool],
+            _params: &reeve_adapter::Params,
+        ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+            let mut count = self.calls.lock().unwrap();
+            *count += 1;
+            let n = *count;
+            drop(count);
+            if n == 1 {
+                Ok(reeve_adapter::Response::new_tool_use(
+                    vec![reeve_adapter::MessageContent::Text(
+                        "calling echo".to_owned(),
+                    )],
+                    vec![reeve_adapter::ToolCall {
+                        id: "tu_1".to_owned(),
+                        name: "echo".to_owned(),
+                        arguments: serde_json::json!({ "text": "hello world" }),
+                    }],
+                    reeve_adapter::TokenCounts {
+                        input: 10,
+                        output: 5,
+                        cached: 0,
+                    },
+                    reeve_adapter::CostEstimate { microdollars: 5 },
+                ))
+            } else {
+                Ok(reeve_adapter::Response::new_text(
+                    vec![reeve_adapter::MessageContent::Text("done!".to_owned())],
+                    reeve_adapter::TokenCounts {
+                        input: 12,
+                        output: 3,
+                        cached: 0,
+                    },
+                    reeve_adapter::CostEstimate { microdollars: 3 },
+                ))
+            }
+        }
+    }
+
+    // L-T1: tool execution loop end-to-end. Adapter returns ToolUse on call 1,
+    // EchoTool fires, ToolResult flows back, adapter returns EndTurn on call 2,
+    // the agent goes idle. Journal must contain tool_use and tool_result entries
+    // with matching tool_use_id, and the final response text.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end loop test with multi-stage poll loops and journal \
+                  assertions; splitting fragments the narrative"
+    )]
+    fn agent_tool_loop_round_trips_through_echo_tool() {
+        use crate::tool::EchoTool;
+        use actix::Actor as _;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+        let calls_log = Arc::new(std::sync::Mutex::new(0u32));
+        let calls_log_assert = Arc::clone(&calls_log);
+        let adapter = Arc::new(TwoTurnEchoAdapter { calls: calls_log });
+
+        actix::System::new().block_on(async move {
+            // Start the EchoTool actor and assemble the route.
+            let echo_addr = EchoTool.start();
+            let tools: Vec<(
+                reeve_adapter::Tool,
+                actix::Recipient<crate::tool::InvokeTool>,
+            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+
+            let agent = Agent::new(
+                adapter,
+                &dirs,
+                mock_snapshot(),
+                String::new(),
+                reeve_types::IdentityId::new().unwrap(),
+                tools,
+            )
+            .unwrap();
+            let addr = Supervisor::start(move |_| agent);
+
+            // Wait for the actor to start.
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "actor did not start within 5 seconds",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(ProcessInbound {
+                payload: String::from("trigger"),
+                message_id: String::from("m-1"),
+            });
+
+            // Expect 8 entries:
+            //   system(started), inbound, outbound(call 1 text), model_call,
+            //   tool_use, tool_result, outbound(call 2 text), model_call.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                if content.lines().count() >= 8 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "tool loop did not complete within 5 seconds; got:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // Verify the agent returned to idle.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let status = std::fs::read_to_string(&status_path).unwrap_or_default();
+                if status == "idle" {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "status did not return to idle; got: {status}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        // Two adapter calls: call 1 ToolUse, call 2 EndTurn.
+        assert_eq!(*calls_log_assert.lock().unwrap(), 2);
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        // Tool-use entry with the expected name and input.
+        let tool_use = entries
+            .iter()
+            .find(|e| e["type"] == "tool_use")
+            .expect("tool_use entry missing");
+        assert_eq!(tool_use["tool_use_id"], "tu_1");
+        assert_eq!(tool_use["name"], "echo");
+        assert_eq!(
+            tool_use["input"],
+            serde_json::json!({ "text": "hello world" })
+        );
+
+        // Tool-result entry with matching id and the echoed content.
+        let tool_result = entries
+            .iter()
+            .find(|e| e["type"] == "tool_result")
+            .expect("tool_result entry missing");
+        assert_eq!(tool_result["tool_use_id"], "tu_1");
+        assert_eq!(tool_result["content"], "hello world");
+        assert_eq!(tool_result["is_error"], false);
+
+        // Final outbound entry carries the EndTurn text.
+        let outbounds: Vec<&serde_json::Value> =
+            entries.iter().filter(|e| e["type"] == "outbound").collect();
+        assert!(
+            outbounds.iter().any(|o| o["payload"] == "done!"),
+            "final 'done!' outbound not found; outbounds: {outbounds:?}"
+        );
+    }
+
+    // ── Adapter that always returns ToolUse — runaway guard test ──────────────
+
+    struct InfiniteToolAdapter {
+        counter: Arc<std::sync::atomic::AtomicU64>,
+    }
+
+    #[async_trait::async_trait]
+    impl reeve_adapter::Adapter for InfiniteToolAdapter {
+        fn id(&self) -> &'static str {
+            "infinite-tool@test"
+        }
+
+        fn capabilities(&self) -> reeve_adapter::Capabilities {
+            reeve_adapter::Capabilities::new()
+        }
+
+        async fn call(
+            &self,
+            _messages: &[reeve_adapter::Message],
+            _tools: &[reeve_adapter::Tool],
+            _params: &reeve_adapter::Params,
+        ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+            let n = self
+                .counter
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(reeve_adapter::Response::new_tool_use(
+                vec![],
+                vec![reeve_adapter::ToolCall {
+                    id: format!("tu_{n}"),
+                    name: "echo".to_owned(),
+                    arguments: serde_json::json!({ "text": "spin" }),
+                }],
+                reeve_adapter::TokenCounts {
+                    input: 1,
+                    output: 1,
+                    cached: 0,
+                },
+                reeve_adapter::CostEstimate { microdollars: 1 },
+            ))
+        }
+    }
+
+    // L-T2: A model that never stops calling tools eventually trips
+    // MAX_TOOL_ITERATIONS. The agent appends a system entry and goes idle
+    // rather than spinning forever.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "runaway-guard test with multi-stage poll loops and journal \
+                  assertions; splitting fragments the narrative"
+    )]
+    fn agent_tool_loop_aborts_at_max_iterations() {
+        use crate::tool::EchoTool;
+        use actix::Actor as _;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+        let adapter = Arc::new(InfiniteToolAdapter {
+            counter: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        });
+
+        actix::System::new().block_on(async move {
+            let echo_addr = EchoTool.start();
+            let tools: Vec<(
+                reeve_adapter::Tool,
+                actix::Recipient<crate::tool::InvokeTool>,
+            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+
+            let agent = Agent::new(
+                adapter,
+                &dirs,
+                mock_snapshot(),
+                String::new(),
+                reeve_types::IdentityId::new().unwrap(),
+                tools,
+            )
+            .unwrap();
+            let addr = Supervisor::start(move |_| agent);
+
+            // Wait for the actor to start.
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "actor did not start within 5 seconds",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(ProcessInbound {
+                payload: String::from("trigger"),
+                message_id: String::from("m-1"),
+            });
+
+            // Wait for the abort system entry to appear.
+            let deadline = std::time::Instant::now() + Duration::from_secs(15);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                if content.contains("tool loop aborted") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "abort system entry did not appear within 15 seconds; got:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Confirm idle.
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let status = std::fs::read_to_string(&status_path).unwrap_or_default();
+                if status == "idle" {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "status did not return to idle after abort; got: {status}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let abort = entries.iter().find(|e| {
+            e["type"] == "system"
+                && e["message"]
+                    .as_str()
+                    .map(|m| m.contains("tool loop aborted"))
+                    .unwrap_or(false)
+        });
+        assert!(
+            abort.is_some(),
+            "abort system entry missing; entries: {entries:?}"
+        );
+
+        // Number of tool_use entries must not exceed MAX_TOOL_ITERATIONS.
+        let tool_use_count = entries.iter().filter(|e| e["type"] == "tool_use").count();
+        let max_iterations = usize::try_from(super::MAX_TOOL_ITERATIONS).expect("u32 fits usize");
+        assert!(
+            tool_use_count <= max_iterations,
+            "too many tool_use entries: {tool_use_count}",
         );
     }
 }
