@@ -34,6 +34,111 @@ use crate::agent_fs::{
 use crate::model_resolution::SpawnSnapshot;
 use crate::tool::{InvokeTool, ToolResult};
 
+// ── History loader ────────────────────────────────────────────────────────────
+
+/// Reconstruct the in-memory conversation history from an existing journal.
+///
+/// `Inbound` entries become user-role messages; `Outbound` entries become
+/// assistant-role messages; `ToolUse` entries become assistant-role
+/// `ToolUse` content blocks; `ToolResult` entries become user-role
+/// `ToolResult` content blocks. `System` and `ModelCall` entries are
+/// skipped — they carry telemetry or annotations that do not belong in the
+/// adapter's context window.
+///
+/// **Consecutive same-role merging:** The Anthropic API requires that any
+/// preamble text and `tool_use` blocks for a single assistant turn appear in
+/// one message, and that all `tool_result` blocks for a single batch appear in
+/// one user message. The live recording path writes `Outbound` then `ToolUse`
+/// entries for a mixed turn, and multiple `ToolResult` entries for a batch.
+/// Consecutive journal entries that map to the same role are merged into one
+/// `Message` by appending their content blocks rather than pushing a new
+/// message, reconstructing the same shape the adapter originally received.
+///
+/// Returns `Ok(Vec::new())` when the journal file is absent (normal: first
+/// run). Returns `Err(io::Error)` for all other I/O failures (permission
+/// denied, disk fault, etc.).
+pub(crate) fn load_history_from_journal(
+    path: &Path,
+) -> Result<Vec<reeve_adapter::Message>, std::io::Error> {
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err),
+    };
+
+    let mut history: Vec<reeve_adapter::Message> = Vec::new();
+    for line in content.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let entry: ConversationEntry = serde_json::from_str(line)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+
+        let (role, block) = match entry {
+            ConversationEntry::Inbound { payload, .. } => (
+                reeve_adapter::Role::User,
+                reeve_adapter::MessageContent::Text(payload),
+            ),
+            ConversationEntry::Outbound { payload, .. } => (
+                reeve_adapter::Role::Assistant,
+                reeve_adapter::MessageContent::Text(payload),
+            ),
+            ConversationEntry::ToolUse {
+                tool_use_id,
+                name,
+                input,
+                ..
+            } => (
+                reeve_adapter::Role::Assistant,
+                reeve_adapter::MessageContent::ToolUse {
+                    id: tool_use_id,
+                    name,
+                    input,
+                },
+            ),
+            ConversationEntry::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+                ..
+            } => (
+                reeve_adapter::Role::User,
+                reeve_adapter::MessageContent::ToolResult {
+                    tool_use_id,
+                    content,
+                    is_error,
+                },
+            ),
+            ConversationEntry::System { .. } | ConversationEntry::ModelCall { .. } => continue,
+        };
+
+        match history.last_mut() {
+            Some(last) if last.role == role => {
+                last.content.push(block);
+            }
+            _ => {
+                history.push(reeve_adapter::Message {
+                    role,
+                    content: vec![block],
+                });
+            }
+        }
+    }
+    // Crash recovery: if the process died after writing an Inbound entry but
+    // before writing the Outbound reply, the history ends with a User message.
+    // Re-submitting that User turn would cause an API 400 ("messages: final
+    // assistant turn…"). Truncate trailing User messages — the watcher
+    // re-delivers the envelope, so the turn is not lost.
+    while history
+        .last()
+        .map(|m| m.role == reeve_adapter::Role::User)
+        .unwrap_or(false)
+    {
+        history.pop();
+    }
+    Ok(history)
+}
+
 // ── Error type ────────────────────────────────────────────────────────────────
 
 /// Errors produced by the agent actor and its constructor.
@@ -94,7 +199,9 @@ impl std::error::Error for AgentError {
 /// The agent appends a system entry to the conversation thread so the operator
 /// can see transport rejections without reading daemon logs.
 pub struct QuarantineEvent {
-    /// Human-readable quarantine reason (e.g. `"signature_invalid"`).
+    /// Human-readable quarantine reason (e.g. `"signature_invalid"`). Logged
+    /// and stored in the conversation journal; the caller is the trusted
+    /// operator-tier watcher and not user-supplied input.
     pub reason: String,
 }
 
@@ -196,6 +303,13 @@ pub struct Agent {
     /// next user turn so the model integrates the operator's follow-ups
     /// instead of the runtime dropping them.
     pending_inbound: VecDeque<ProcessInbound>,
+    /// Ed25519 keypair for this agent instance. Held in memory only; never
+    /// serialized. Used for envelope signing in later phases.
+    #[expect(
+        dead_code,
+        reason = "envelope signing consumed in a later phase; field committed now so the private key has exactly one in-memory home"
+    )]
+    keypair: reeve_types::Keypair,
     /// `message_id`s the agent has already accepted (whether processed or
     /// queued). Duplicate `ProcessInbound` messages with the same id are
     /// dropped silently.
@@ -284,7 +398,7 @@ impl Agent {
     /// an empty tools vector behaves as a text-only agent.
     #[expect(
         clippy::too_many_arguments,
-        reason = "agent constructor wires together six independent collaborators; \
+        reason = "agent constructor wires together seven independent collaborators; \
                   bundling into a struct trades complexity for indirection"
     )]
     pub fn new(
@@ -293,13 +407,20 @@ impl Agent {
         snapshot: SpawnSnapshot,
         system_prompt: String,
         agent_id: reeve_types::IdentityId,
+        keypair: reeve_types::Keypair,
         tools: Vec<(reeve_adapter::Tool, Recipient<InvokeTool>)>,
     ) -> Result<Self, AgentError> {
-        let conversation =
-            ConversationThread::open(&dirs.conversation_path()).map_err(AgentError::Fs)?;
+        let conversation_path = dirs.conversation_path();
+        let conversation = ConversationThread::open(&conversation_path).map_err(AgentError::Fs)?;
         let status_writer = AtomicFileWriter::new(dirs.status_path()).map_err(AgentError::Fs)?;
         let cost_writer = AtomicFileWriter::new(dirs.cost_path()).map_err(AgentError::Fs)?;
         let inbox_cur = dirs.inbox_root().join("cur");
+
+        let history =
+            load_history_from_journal(&conversation_path).map_err(|source| AgentError::Io {
+                path: conversation_path.clone(),
+                source,
+            })?;
 
         let mut tool_descriptors = Vec::with_capacity(tools.len());
         let mut tool_routes = HashMap::with_capacity(tools.len());
@@ -320,7 +441,7 @@ impl Agent {
             cost_writer,
             total_cost_microdollars: 0u64,
             in_flight: false,
-            history: Vec::new(),
+            history,
             inbox_cur,
             tool_descriptors,
             tool_routes,
@@ -328,6 +449,7 @@ impl Agent {
             pending_results: Vec::new(),
             tool_iteration: 0,
             agent_id,
+            keypair,
             pending_inbound: VecDeque::new(),
             seen_message_ids: SeenIds::new(),
         })
@@ -679,6 +801,10 @@ impl Supervised for Agent {
         self.pending_tool_use_ids.clear();
         self.pending_results.clear();
         self.pending_inbound.clear();
+        // Clear dedup set so the watcher's re-delivery of inbox/cur/ messages
+        // after the supervisor renews the FSEvents subscription is not silently
+        // dropped as duplicates.
+        self.seen_message_ids = SeenIds::new();
         self.set_idle(ctx);
     }
 }
@@ -934,7 +1060,7 @@ fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<Agent>) {
     // exits normally.
     let inbox_cur = inbox_cur.to_owned();
     let _ = std::thread::spawn(move || {
-        // Hold watcher alive for the duration of the loop.
+        // Dropping watcher cancels the watch subscription; keep it alive.
         let _watcher = watcher;
         // Scan on every notification regardless of event kind. Discriminating
         // event types is fragile: on macOS FSEvents an atomic rename(2)
@@ -1039,20 +1165,32 @@ mod tests {
         }
     }
 
+    fn mock_agent(
+        adapter: Arc<dyn reeve_adapter::Adapter>,
+        dirs: &AgentDirs,
+        tools: Vec<(
+            reeve_adapter::Tool,
+            actix::Recipient<crate::tool::InvokeTool>,
+        )>,
+    ) -> Result<Agent, super::AgentError> {
+        Agent::new(
+            adapter,
+            dirs,
+            mock_snapshot(),
+            String::new(),
+            reeve_types::IdentityId::new().unwrap(),
+            reeve_types::Keypair::generate(),
+            tools,
+        )
+    }
+
     // L1: Agent::new succeeds with a valid adapter and provisioned dirs.
     #[test]
     fn lead_agent_new_creates_valid_actor() {
         let tmp = tempdir().unwrap();
         let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let result = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        );
+        let result = mock_agent(adapter, &dirs, Vec::new());
         assert!(result.is_ok(), "Agent::new should succeed");
     }
 
@@ -1064,15 +1202,7 @@ mod tests {
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
         let status_path = dirs.status_path();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let _addr = Supervisor::start(move |_| agent);
@@ -1107,15 +1237,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1198,15 +1320,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1441,11 +1555,6 @@ mod tests {
     // Two adapter calls fire (one per turn) — verified via two model_call
     // entries.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-message integration test with status, journal, and \
-                  model-call assertions; splitting fragments the narrative"
-    )]
     fn lead_agent_second_message_queues_during_in_flight() {
         let tmp = tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -1453,15 +1562,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(SlowMockAdapter);
-        let agent = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1553,11 +1654,6 @@ mod tests {
     // so the next ProcessInbound sends only that new message to the adapter —
     // not the failed one.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "two-phase integration test with sequential poll loops; \
-                  splitting fragments the narrative"
-    )]
     fn lead_agent_retry_after_error_sends_clean_history() {
         use std::sync::{Arc as StdArc, Mutex};
 
@@ -1572,15 +1668,7 @@ mod tests {
         let adapter = Arc::new(TwoPhaseAdapter {
             calls: calls_log_for_actor,
         });
-        let agent = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1667,11 +1755,6 @@ mod tests {
     // the user message is removed from history, and the journal has a
     // "adapter call failed: ..." system entry.
     #[test]
-    #[expect(
-        clippy::too_many_lines,
-        reason = "integration test with sequential poll loops for journal and \
-                  status assertions; splitting fragments the narrative"
-    )]
     fn lead_agent_adapter_error_returns_to_idle() {
         let tmp = tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -1679,15 +1762,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(AlwaysErrorAdapter);
-        let agent = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
         let status_path_outer = data_dir.join("agents").join("lead").join("status");
 
         actix::System::new().block_on(async move {
@@ -1786,15 +1861,7 @@ mod tests {
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
         let adapter = Arc::new(MockAdapter::new("mock@test"));
-        let agent = Agent::new(
-            adapter,
-            &dirs,
-            mock_snapshot(),
-            String::new(),
-            reeve_types::IdentityId::new().unwrap(),
-            Vec::new(),
-        )
-        .unwrap();
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
             let addr = Supervisor::start(move |_| agent);
@@ -1941,15 +2008,7 @@ mod tests {
                 actix::Recipient<crate::tool::InvokeTool>,
             )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
 
-            let agent = Agent::new(
-                adapter,
-                &dirs,
-                mock_snapshot(),
-                String::new(),
-                reeve_types::IdentityId::new().unwrap(),
-                tools,
-            )
-            .unwrap();
+            let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
 
             // Wait for the actor to start.
@@ -2114,15 +2173,7 @@ mod tests {
                 actix::Recipient<crate::tool::InvokeTool>,
             )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
 
-            let agent = Agent::new(
-                adapter,
-                &dirs,
-                mock_snapshot(),
-                String::new(),
-                reeve_types::IdentityId::new().unwrap(),
-                tools,
-            )
-            .unwrap();
+            let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
 
             // Wait for the actor to start.
@@ -2284,15 +2335,7 @@ mod tests {
                 actix::Recipient<crate::tool::InvokeTool>,
             )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
 
-            let agent = Agent::new(
-                adapter,
-                &dirs,
-                mock_snapshot(),
-                String::new(),
-                reeve_types::IdentityId::new().unwrap(),
-                tools,
-            )
-            .unwrap();
+            let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
 
             let status_path = data_dir.join("agents").join("lead").join("status");
@@ -2430,15 +2473,7 @@ mod tests {
                 actix::Recipient<crate::tool::InvokeTool>,
             )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
 
-            let agent = Agent::new(
-                adapter,
-                &dirs,
-                mock_snapshot(),
-                String::new(),
-                reeve_types::IdentityId::new().unwrap(),
-                tools,
-            )
-            .unwrap();
+            let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
 
             let status_path = data_dir.join("agents").join("lead").join("status");
@@ -2517,14 +2552,7 @@ mod tests {
                 (EchoTool::descriptor(), a.recipient()),
                 (EchoTool::descriptor(), b.recipient()),
             ];
-            let result = Agent::new(
-                adapter,
-                &dirs,
-                mock_snapshot(),
-                String::new(),
-                reeve_types::IdentityId::new().unwrap(),
-                tools,
-            );
+            let result = mock_agent(adapter, &dirs, tools);
             match result {
                 Err(super::AgentError::DuplicateToolName(name)) => {
                     assert_eq!(name, "echo");
@@ -2534,5 +2562,502 @@ mod tests {
             }
             actix::System::current().stop();
         });
+    }
+
+    // ── load_history_from_journal unit tests ─────────────────────────────────
+
+    #[test]
+    fn load_history_from_journal_empty_file_returns_empty_vec() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn load_history_from_journal_missing_file_returns_empty_vec() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("nonexistent.jsonl");
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert!(history.is_empty());
+    }
+
+    #[test]
+    fn load_history_from_journal_inbound_becomes_user_message() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Pair Inbound with Outbound so the turn is complete; a trailing User
+        // would be truncated by crash-recovery logic.
+        let lines = [
+            r#"{"type":"inbound","message_id":"m1","payload":"hello","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].role, reeve_adapter::Role::User);
+        assert_eq!(
+            history[0].content,
+            vec![reeve_adapter::MessageContent::Text("hello".to_owned())]
+        );
+    }
+
+    #[test]
+    fn load_history_from_journal_outbound_becomes_assistant_message() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let line =
+            r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#;
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].role, reeve_adapter::Role::Assistant);
+        assert_eq!(
+            history[0].content,
+            vec![reeve_adapter::MessageContent::Text("world".to_owned())]
+        );
+    }
+
+    #[test]
+    fn load_history_from_journal_skips_system_and_model_call() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"system","message":"startup","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":10,"output_tokens":5,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            history.is_empty(),
+            "expected empty history for system/model_call only, got {history:?}"
+        );
+    }
+
+    #[test]
+    fn load_history_from_journal_reconstructs_tool_use_and_result() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Complete the tool turn with a final Outbound; a trailing ToolResult
+        // (User role) would be truncated by crash-recovery logic.
+        let lines = [
+            r#"{"type":"tool_use","tool_use_id":"tu1","name":"echo","input":{"text":"hi"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu1","content":"hi","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"done","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(history.len(), 3, "expected 3 messages, got {history:?}");
+
+        // tool_use → assistant turn
+        assert_eq!(history[0].role, reeve_adapter::Role::Assistant);
+        assert_eq!(
+            history[0].content,
+            vec![reeve_adapter::MessageContent::ToolUse {
+                id: "tu1".to_owned(),
+                name: "echo".to_owned(),
+                input: serde_json::json!({"text": "hi"}),
+            }]
+        );
+
+        // tool_result → user turn
+        assert_eq!(history[1].role, reeve_adapter::Role::User);
+        assert_eq!(
+            history[1].content,
+            vec![reeve_adapter::MessageContent::ToolResult {
+                tool_use_id: "tu1".to_owned(),
+                content: "hi".to_owned(),
+                is_error: false,
+            }]
+        );
+
+        // final outbound → assistant turn
+        assert_eq!(history[2].role, reeve_adapter::Role::Assistant);
+    }
+
+    #[test]
+    fn load_history_from_journal_interleaved_in_out() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"m1","payload":"ping","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"system","message":"note","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"pong","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"inbound","message_id":"m2","payload":"again","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"replied","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(history.len(), 4);
+        assert_eq!(history[0].role, reeve_adapter::Role::User);
+        assert_eq!(
+            history[0].content,
+            vec![reeve_adapter::MessageContent::Text("ping".to_owned())]
+        );
+        assert_eq!(history[1].role, reeve_adapter::Role::Assistant);
+        assert_eq!(
+            history[1].content,
+            vec![reeve_adapter::MessageContent::Text("pong".to_owned())]
+        );
+        assert_eq!(history[2].role, reeve_adapter::Role::User);
+        assert_eq!(
+            history[2].content,
+            vec![reeve_adapter::MessageContent::Text("again".to_owned())]
+        );
+        assert_eq!(history[3].role, reeve_adapter::Role::Assistant);
+        assert_eq!(
+            history[3].content,
+            vec![reeve_adapter::MessageContent::Text("replied".to_owned())]
+        );
+    }
+
+    // Crash recovery: two complete turns followed by a crash-interrupted
+    // Inbound — the trailing user message must be truncated so restart does
+    // not submit a double-user turn to the adapter.
+    #[test]
+    fn load_history_from_journal_truncates_trailing_user_message() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"m1","payload":"turn1","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"reply1","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"inbound","message_id":"m2","payload":"turn2","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            r#"{"type":"outbound","payload":"reply2","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            // Crash-interrupted: Inbound written, Outbound never written.
+            r#"{"type":"inbound","message_id":"m3","payload":"crashed","timestamp_utc":"2024-01-01T00:00:02Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(
+            history.len(),
+            4,
+            "trailing user message must be truncated; got {history:?}"
+        );
+        assert_eq!(
+            history.last().unwrap().role,
+            reeve_adapter::Role::Assistant,
+            "last message after truncation must be assistant"
+        );
+    }
+
+    // Edge case: a journal with only a single Inbound (very first turn
+    // interrupted) must truncate to an empty history.
+    #[test]
+    fn load_history_from_journal_single_inbound_truncated_to_empty() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let line = r#"{"type":"inbound","message_id":"m1","payload":"only","timestamp_utc":"2024-01-01T00:00:00Z"}"#;
+        std::fs::write(&path, line).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            history.is_empty(),
+            "single interrupted inbound must produce empty history; got {history:?}"
+        );
+    }
+
+    // Blank lines in the journal (e.g. trailing newline added by text editors)
+    // must be skipped rather than causing an InvalidData error.
+    #[test]
+    fn load_history_from_journal_skips_blank_lines() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let content = [
+            r#"{"type":"inbound","message_id":"m1","payload":"hello","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            "",
+            r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            "",
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "blank lines must be skipped; got {history:?}"
+        );
+        assert_eq!(history[0].role, reeve_adapter::Role::User);
+        assert_eq!(history[1].role, reeve_adapter::Role::Assistant);
+    }
+
+    // Supervisor restart must clear seen_message_ids so the watcher's
+    // re-delivery of inbox/cur/ envelopes is not silently dropped.
+    #[test]
+    fn restarting_clears_seen_message_ids() {
+        let tmp = tempdir().unwrap();
+        let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
+        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let mut agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
+
+        // Simulate a message that was seen before the restart.
+        agent
+            .seen_message_ids
+            .insert("msg-before-restart".to_owned());
+        assert!(
+            !agent
+                .seen_message_ids
+                .insert("msg-before-restart".to_owned()),
+            "id must be present before restarting"
+        );
+
+        // Call restarting directly (actix::Supervised::restarting takes &mut
+        // Context<Self> but we only need to verify the field reset here).
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |ctx: &mut actix::Context<Agent>| {
+                // Manually invoke the restarting path by stopping, which
+                // triggers restarting → started via Supervised. Instead,
+                // verify the invariant directly by inspecting state after
+                // construction; the restarting handler is tested by running
+                // an actor round-trip.
+                //
+                // Simpler approach: call restarting on a live context.
+                use actix::AsyncContext as _;
+                ctx.run_later(Duration::from_millis(0), |act, ctx| {
+                    use actix::Supervised as _;
+                    // Insert a sentinel before calling restarting.
+                    act.seen_message_ids.insert("sentinel".to_owned());
+                    act.restarting(ctx);
+                    // After restarting, the sentinel must be gone.
+                    assert!(
+                        act.seen_message_ids.insert("sentinel".to_owned()),
+                        "restarting must clear seen_message_ids"
+                    );
+                    actix::System::current().stop();
+                });
+                agent
+            });
+            let _ = addr;
+        });
+    }
+
+    #[test]
+    fn agent_new_loads_prior_history_and_appends_after_it() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+
+        // Pre-seed the journal with two entries.
+        {
+            let thread = crate::agent_fs::ConversationThread::open(&conversation_path).unwrap();
+            thread
+                .append(&ConversationEntry::Inbound {
+                    message_id: "prior-1".to_owned(),
+                    payload: "seed message".to_owned(),
+                    timestamp_utc: time::OffsetDateTime::now_utc(),
+                })
+                .unwrap();
+            thread
+                .append(&ConversationEntry::Outbound {
+                    payload: "seed reply".to_owned(),
+                    timestamp_utc: time::OffsetDateTime::now_utc(),
+                })
+                .unwrap();
+        }
+
+        // Verify that load_history_from_journal sees the 2 prior entries.
+        let prior_history = super::load_history_from_journal(&conversation_path).unwrap();
+        assert_eq!(
+            prior_history.len(),
+            2,
+            "load_history_from_journal must see 2 prior entries"
+        );
+        assert_eq!(prior_history[0].role, reeve_adapter::Role::User);
+        assert_eq!(prior_history[1].role, reeve_adapter::Role::Assistant);
+
+        // Agent::new reads the same path and loads the history.
+        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
+
+        // The agent carries the prior history in memory; verify via a turn.
+        let conv_path_outer = conversation_path.clone();
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |_| agent);
+
+            // Wait for started.
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(std::time::Instant::now() <= deadline, "actor start timeout");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(ProcessInbound {
+                payload: "new message".to_owned(),
+                message_id: "new-1".to_owned(),
+            });
+
+            // Wait until at least: prior 2 + system(started) + inbound + outbound + model_call = 6.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                if content.lines().count() >= 6 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "journal did not reach 6 entries; content:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // Prior entries must still be first.
+        let inbound_entries: Vec<_> = entries.iter().filter(|e| e["type"] == "inbound").collect();
+        assert!(
+            inbound_entries.len() >= 2,
+            "expected at least 2 inbound entries; got: {entries:?}"
+        );
+        assert_eq!(
+            inbound_entries[0]["message_id"], "prior-1",
+            "prior entry must appear before new entry"
+        );
+        let new_inbound = inbound_entries.iter().find(|e| e["message_id"] == "new-1");
+        assert!(
+            new_inbound.is_some(),
+            "new inbound entry missing; entries: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn load_history_from_journal_returns_err_on_invalid_line() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"m1","payload":"before","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            "not valid json at all",
+            r#"{"type":"outbound","payload":"after","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let result = super::load_history_from_journal(&path);
+        assert!(
+            result.is_err(),
+            "corrupt journal line must return Err, got Ok({:?})",
+            result.ok()
+        );
+        assert_eq!(
+            result.unwrap_err().kind(),
+            std::io::ErrorKind::InvalidData,
+            "corrupt journal line must return InvalidData"
+        );
+    }
+
+    #[test]
+    fn load_history_from_journal_merges_outbound_and_tool_use_into_one_message() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"outbound","payload":"text_preamble","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu1","name":"echo","input":{"text":"hi"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(
+            history.len(),
+            1,
+            "consecutive assistant entries must merge into one message; got {history:?}"
+        );
+        assert_eq!(history[0].role, reeve_adapter::Role::Assistant);
+        assert_eq!(
+            history[0].content,
+            vec![
+                reeve_adapter::MessageContent::Text("text_preamble".to_owned()),
+                reeve_adapter::MessageContent::ToolUse {
+                    id: "tu1".to_owned(),
+                    name: "echo".to_owned(),
+                    input: serde_json::json!({"text": "hi"}),
+                },
+            ],
+            "merged assistant message must contain Text block then ToolUse block"
+        );
+    }
+
+    #[test]
+    fn load_history_from_journal_merges_consecutive_tool_results_into_one_message() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Complete the tool turn with a final Outbound; trailing ToolResult
+        // entries (User role) would be truncated by crash-recovery logic.
+        let lines = [
+            r#"{"type":"tool_result","tool_use_id":"tu1","content":"result1","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu2","content":"result2","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"response","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let history = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(
+            history.len(),
+            2,
+            "two tool_results must merge into one user message + one assistant; got {history:?}"
+        );
+        assert_eq!(history[0].role, reeve_adapter::Role::User);
+        assert_eq!(
+            history[0].content,
+            vec![
+                reeve_adapter::MessageContent::ToolResult {
+                    tool_use_id: "tu1".to_owned(),
+                    content: "result1".to_owned(),
+                    is_error: false,
+                },
+                reeve_adapter::MessageContent::ToolResult {
+                    tool_use_id: "tu2".to_owned(),
+                    content: "result2".to_owned(),
+                    is_error: false,
+                },
+            ],
+            "merged user message must contain both ToolResult blocks"
+        );
+        assert_eq!(history[1].role, reeve_adapter::Role::Assistant);
+    }
+
+    // P2: A journal file that exists but cannot be read returns Err, not Ok.
+    #[test]
+    #[cfg(unix)]
+    fn load_history_from_journal_unreadable_file_returns_err() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // root bypasses DAC; chmod 0 does not deny reads.
+        let uid_output = std::process::Command::new("id")
+            .arg("-u")
+            .output()
+            .expect("id -u must be available on unix");
+        let uid = String::from_utf8_lossy(&uid_output.stdout)
+            .trim()
+            .parse::<u32>()
+            .unwrap_or(0);
+        if uid == 0 {
+            return;
+        }
+
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"system","message":"x","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = super::load_history_from_journal(&path);
+
+        // tempdir cleanup panics if it cannot unlink the file.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "unreadable file should return Err, got Ok({:?})",
+            result.ok()
+        );
     }
 }

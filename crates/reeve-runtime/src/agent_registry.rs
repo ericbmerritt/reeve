@@ -545,13 +545,20 @@ fn resolve_default_registry_path(
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     use std::fs;
     use std::os::unix::fs::symlink;
 
     use time::OffsetDateTime;
+
+    /// Returns the registry path for a given data directory, using the same
+    /// layout as `AgentRegistry::default_registry_path()` with `XDG_DATA_HOME`
+    /// set to `data_dir`. Use this in tests instead of hardcoding the path.
+    pub(crate) fn registry_path_for_data_dir(data_dir: &Path) -> PathBuf {
+        resolve_default_registry_path(Some(data_dir.as_os_str()), None).unwrap()
+    }
 
     fn sample_record(name: &str) -> AgentRecord {
         AgentRecord {
