@@ -193,6 +193,13 @@ impl AgentDirs {
     pub fn inbox_root(&self) -> PathBuf {
         self.root.join("inbox")
     }
+
+    /// Per-agent ed25519 seed file: `root/identity.key`.
+    ///
+    /// Written and read by [`crate::agent_registry::generate_or_load_keypair`].
+    pub fn identity_key_path(&self) -> PathBuf {
+        self.root.join("identity.key")
+    }
 }
 
 // ── ConversationEntry ─────────────────────────────────────────────────────────
@@ -399,7 +406,7 @@ impl AtomicFileWriter {
 // ── Private helpers ───────────────────────────────────────────────────────────
 
 /// Rejects names that would enable path traversal outside the `agents/` subtree.
-fn validate_agent_name(name: &str) -> Result<(), AgentFsError> {
+pub(crate) fn validate_agent_name(name: &str) -> Result<(), AgentFsError> {
     if name.is_empty() || name.contains('/') || name.contains('\0') || name == "." || name == ".." {
         return Err(AgentFsError::Io {
             path: PathBuf::from(name),

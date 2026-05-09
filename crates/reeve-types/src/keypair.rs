@@ -106,12 +106,7 @@ pub struct Keypair {
 impl Keypair {
     /// Generate a fresh ed25519 keypair using the OS RNG.
     pub fn generate() -> Self {
-        let signing_key = SigningKey::generate(&mut OsRng);
-        let verifying_key = signing_key.verifying_key();
-        Self {
-            private: PrivateKey { signing_key },
-            public: PublicKey::from_verifying_key(verifying_key),
-        }
+        Self::from_signing_key(SigningKey::generate(&mut OsRng))
     }
 
     /// Borrow the private half.
@@ -122,6 +117,24 @@ impl Keypair {
     /// Borrow the public half.
     pub fn public(&self) -> &PublicKey {
         &self.public
+    }
+
+    /// Reconstruct a keypair from a 32-byte signing seed retrieved from durable
+    /// storage (e.g., a key file or the OS keychain). The public key is derived
+    /// deterministically from the seed; no separate storage is required.
+    ///
+    /// The caller passes the seed inside a [`Zeroizing`] wrapper so the
+    /// in-memory copy is wiped on drop.
+    pub fn from_seed_bytes(seed: &Zeroizing<[u8; SECRET_KEY_LENGTH]>) -> Self {
+        Self::from_signing_key(SigningKey::from_bytes(seed))
+    }
+
+    fn from_signing_key(signing_key: SigningKey) -> Self {
+        let verifying_key = signing_key.verifying_key();
+        Self {
+            private: PrivateKey { signing_key },
+            public: PublicKey::from_verifying_key(verifying_key),
+        }
     }
 
     /// Decompose the keypair into its private and public halves.

@@ -6,6 +6,7 @@
 
 pub mod agent;
 pub mod agent_fs;
+pub mod agent_registry;
 pub mod audit;
 pub mod config;
 pub mod daemon;
@@ -26,6 +27,10 @@ pub mod watcher;
 pub use agent::{Agent, AgentError, ProcessInbound, QuarantineEvent};
 pub use agent_fs::{
     AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread,
+};
+pub use agent_registry::{
+    generate_or_load_keypair, AgentRecord, AgentRegistry, AgentRegistryError, AgentStatus,
+    ValidatedAgentName,
 };
 pub use audit::{AuditError, AuditEvent, AuditLog};
 pub use config::{

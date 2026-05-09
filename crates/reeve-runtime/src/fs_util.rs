@@ -6,6 +6,7 @@
 //! mode-bit checks without silent chmod. Callers map [`FsCheckError`] into
 //! their own typed error via `From`.
 
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _};
 use std::path::{Path, PathBuf};
@@ -249,6 +250,58 @@ pub(crate) fn read_nofollow_bounded(path: &Path, max_bytes: u64) -> io::Result<S
 
     String::from_utf8(buffer)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "file is not valid UTF-8"))
+}
+
+/// Error produced by [`resolve_xdg_base_dir`].
+#[derive(Debug)]
+pub(crate) enum XdgBaseError {
+    /// Neither `$HOME` nor `$XDG_DATA_HOME` was set (or both were empty).
+    MissingHome,
+    /// The supplied environment variable contains a relative path, which
+    /// would silently resolve against the process cwd at daemon-launch time.
+    RelativeDir {
+        var_name: &'static str,
+        path: PathBuf,
+    },
+}
+
+/// Resolve the XDG base data directory from the environment.
+///
+/// Returns the bare base `PathBuf` (no `reeve/...` suffix). Callers append
+/// their own subdirectory suffix and map `XdgBaseError` into their own error
+/// type.
+///
+/// Logic:
+/// - If `xdg` is `Some` and non-empty, use it. Reject relative paths.
+/// - Otherwise use `home`, appending `.local/share`. Reject relative paths.
+/// - If `home` is also absent, return `XdgBaseError::MissingHome`.
+pub(crate) fn resolve_xdg_base_dir(
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, XdgBaseError> {
+    match xdg {
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(XdgBaseError::RelativeDir {
+                    var_name: "XDG_DATA_HOME",
+                    path,
+                });
+            }
+            Ok(path)
+        }
+        _ => {
+            let home = home.ok_or(XdgBaseError::MissingHome)?;
+            let path = PathBuf::from(home);
+            if !path.is_absolute() {
+                return Err(XdgBaseError::RelativeDir {
+                    var_name: "HOME",
+                    path,
+                });
+            }
+            Ok(path.join(".local").join("share"))
+        }
+    }
 }
 
 #[cfg(test)]
