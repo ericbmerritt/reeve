@@ -28,6 +28,7 @@ use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
 use crate::model_resolution::{resolve_model, write_spawn_snapshot};
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
+use crate::spawn_coordinator::SpawnCoordinator;
 use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 use crate::watcher::Watcher;
 
@@ -588,6 +589,8 @@ struct AgentStartup {
     keypair: reeve_types::Keypair,
     agent_registry_path: PathBuf,
     watcher: Arc<Watcher>,
+    data_dir: PathBuf,
+    identity_registry: Arc<IdentityRegistry>,
 }
 
 /// Fallible preparation: load configs, provision directories, resolve the
@@ -795,6 +798,8 @@ fn prepare_agent_startup(
         keypair,
         agent_registry_path,
         watcher,
+        data_dir: data_dir.to_path_buf(),
+        identity_registry: Arc::clone(identity_registry),
     })
 }
 
@@ -812,18 +817,36 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
         inbox,
         agent_id,
         keypair,
-        agent_registry_path: _agent_registry_path,
+        agent_registry_path,
         watcher,
+        data_dir,
+        identity_registry,
     } = startup;
 
     // HeartbeatActor: touches the heartbeat file every second.
     actix::Supervisor::start(move |_| HeartbeatActor::new(state_dir));
 
-    let echo_addr = crate::tool::EchoTool.start();
+    let watcher_for_coord = Arc::clone(&watcher);
+    let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
+
+    let spawn_coordinator = SpawnCoordinator::new(
+        data_dir,
+        agent_registry_path,
+        identity_registry,
+        Arc::clone(&adapter),
+        watcher_for_coord,
+        watcher_addr.clone().recipient(),
+    );
+    let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
+
+    let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord_addr.recipient());
     let tools: Vec<(
         reeve_adapter::Tool,
         actix::Recipient<crate::tool::InvokeTool>,
-    )> = vec![(crate::tool::EchoTool::descriptor(), echo_addr.recipient())];
+    )> = vec![(
+        crate::tool::SpawnAgentTool::descriptor(),
+        spawn_agent_tool.start().recipient(),
+    )];
 
     // Agent: processes inbound envelopes via the model adapter and the tool
     // execution loop.
@@ -842,9 +865,7 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
     })?;
     let lead_addr = actix::Supervisor::start(move |_| lead_agent);
 
-    // WatcherActor: watches the lead inbox and dispatches verified messages.
     let lead_addr_clone = lead_addr.clone();
-    let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
     watcher_addr.do_send(WatchInbox {
         agent_id,
         inbox,
