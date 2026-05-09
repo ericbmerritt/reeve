@@ -19,7 +19,6 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -199,9 +198,7 @@ impl std::error::Error for AgentError {
 /// The agent appends a system entry to the conversation thread so the operator
 /// can see transport rejections without reading daemon logs.
 pub struct QuarantineEvent {
-    /// Human-readable quarantine reason (e.g. `"signature_invalid"`). Logged
-    /// and stored in the conversation journal; the caller is the trusted
-    /// operator-tier watcher and not user-supplied input.
+    /// Human-readable quarantine reason (e.g. `"signature_invalid"`).
     pub reason: String,
 }
 
@@ -273,8 +270,6 @@ pub struct Agent {
     /// retry with the full history. Reset the agent (restart) to clear the
     /// in-memory history.
     history: Vec<reeve_adapter::Message>,
-    /// Path to `agents/lead/inbox/cur/`. Watched for new verified envelopes.
-    inbox_cur: PathBuf,
     /// Tool descriptors advertised to the adapter on every call.
     tool_descriptors: Vec<reeve_adapter::Tool>,
     /// Routes from tool name to the receiving tool actor.
@@ -414,7 +409,6 @@ impl Agent {
         let conversation = ConversationThread::open(&conversation_path).map_err(AgentError::Fs)?;
         let status_writer = AtomicFileWriter::new(dirs.status_path()).map_err(AgentError::Fs)?;
         let cost_writer = AtomicFileWriter::new(dirs.cost_path()).map_err(AgentError::Fs)?;
-        let inbox_cur = dirs.inbox_root().join("cur");
 
         let history =
             load_history_from_journal(&conversation_path).map_err(|source| AgentError::Io {
@@ -442,7 +436,6 @@ impl Agent {
             total_cost_microdollars: 0u64,
             in_flight: false,
             history,
-            inbox_cur,
             tool_descriptors,
             tool_routes,
             pending_tool_use_ids: HashSet::new(),
@@ -775,15 +768,11 @@ impl Agent {
 impl Actor for Agent {
     type Context = Context<Self>;
 
-    /// Initialize the agent: record the start event, write idle status, and
-    /// start the inbox/cur/ watcher that forwards verified envelopes.
+    /// Initialize the agent: record the start event and write idle status.
     fn started(&mut self, ctx: &mut Context<Self>) {
         info!(adapter = %self.snapshot.adapter_id, "agent ready");
         self.append_system_entry("agent started", ctx);
         self.set_idle(ctx);
-
-        let addr = ctx.address();
-        watch_inbox_cur(&self.inbox_cur, addr);
     }
 }
 
@@ -801,9 +790,9 @@ impl Supervised for Agent {
         self.pending_tool_use_ids.clear();
         self.pending_results.clear();
         self.pending_inbound.clear();
-        // Clear dedup set so the watcher's re-delivery of inbox/cur/ messages
-        // after the supervisor renews the FSEvents subscription is not silently
-        // dropped as duplicates.
+        // scan_cur_and_dispatch runs once at startup via the WatchInbox handler;
+        // it does not re-run on supervisor restart. Clearing here ensures messages
+        // delivered after restart are not silently dropped as false duplicates.
         self.seen_message_ids = SeenIds::new();
         self.set_idle(ctx);
     }
@@ -815,9 +804,9 @@ impl Handler<ProcessInbound> for Agent {
     type Result = ();
 
     fn handle(&mut self, msg: ProcessInbound, ctx: &mut Context<Self>) {
-        // Dedup by message_id. The inbox/cur/ watcher scans the whole
-        // directory on every filesystem event, so the same envelope can
-        // arrive as ProcessInbound multiple times.
+        // Dedup by message_id. scan_cur_and_dispatch re-dispatches all
+        // files in cur/ on restart (at-least-once semantics); the same
+        // envelope can arrive multiple times.
         if !self.seen_message_ids.insert(msg.message_id.clone()) {
             debug!(message_id = %msg.message_id, "dropping duplicate inbound");
             return;
@@ -975,102 +964,6 @@ fn extract_response_text(content: &[reeve_adapter::MessageContent]) -> String {
         }
     }
     String::new()
-}
-
-// ── inbox/cur/ watcher ────────────────────────────────────────────────────────
-
-/// Read a verified envelope file from `inbox/cur/` and return the body as a
-/// UTF-8 string, or `None` if the file cannot be read or decoded.
-///
-/// The file is opened with `O_NOFOLLOW`. The body field of the [`Envelope`] is
-/// already decoded from its base64 wire representation by `serde_json`.
-fn read_envelope_payload(path: &Path) -> Option<String> {
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true);
-    crate::fs_util::set_nofollow(&mut options);
-    let mut file = options.open(path).ok()?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).ok()?;
-    let envelope: reeve_types::Envelope = serde_json::from_slice(&buf).ok()?;
-    String::from_utf8(envelope.body).ok()
-}
-
-/// Send one [`ProcessInbound`] message for each path in the `cur/` directory.
-///
-/// Called both at startup (crash-recovery for envelopes deposited before the
-/// watcher subscribed) and on every filesystem event in `cur/`. Calling on
-/// every event guarantees no envelope is missed across the variations of
-/// `FSEvents` and `inotify` behavior, but it also produces duplicate
-/// `ProcessInbound` messages for envelopes still on disk. The agent dedups
-/// these by `message_id` in [`Handler<ProcessInbound>`].
-fn scan_cur(inbox_cur: &Path, addr: &actix::Addr<Agent>) {
-    let Ok(entries) = std::fs::read_dir(inbox_cur) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if let Some(payload) = read_envelope_payload(&path) {
-            let message_id = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("unknown")
-                .to_owned();
-            addr.do_send(ProcessInbound {
-                payload,
-                message_id,
-            });
-        }
-    }
-}
-
-/// Watch `inbox/cur/` for `Create` events and forward each new verified
-/// envelope to the [`Agent`] as a [`ProcessInbound`] message.
-///
-/// Subscribes to filesystem events first, then performs a one-shot startup
-/// scan so envelopes deposited before this function ran are not silently
-/// dropped (crash-recovery). If `notify` setup fails the function returns
-/// silently; the agent can still be spawned and respond if messages are
-/// delivered after the next restart.
-fn watch_inbox_cur(inbox_cur: &Path, addr: actix::Addr<Agent>) {
-    use notify::{RecursiveMode, Watcher as _};
-    use std::sync::mpsc;
-
-    let (tx, rx) = mpsc::channel();
-    let Ok(mut watcher) = notify::RecommendedWatcher::new(tx, notify::Config::default()) else {
-        return;
-    };
-    if watcher
-        .watch(inbox_cur, RecursiveMode::NonRecursive)
-        .is_err()
-    {
-        return;
-    }
-
-    // Crash-recovery: process files already in cur/ before the watch started.
-    scan_cur(inbox_cur, &addr);
-
-    // Spawn a detached OS thread for the blocking event loop.
-    //
-    // `tokio::task::spawn_blocking` is intentionally NOT used here: tokio
-    // runtime shutdown waits for all `spawn_blocking` threads to complete,
-    // which would cause the runtime to hang indefinitely because the watcher
-    // loop exits only when the `RecommendedWatcher` is dropped (which happens
-    // only after the loop exits — a deadlock). A detached `std::thread` is
-    // not owned by the tokio runtime and is killed by the OS when the process
-    // exits normally.
-    let inbox_cur = inbox_cur.to_owned();
-    let _ = std::thread::spawn(move || {
-        // Dropping watcher cancels the watch subscription; keep it alive.
-        let _watcher = watcher;
-        // Scan on every notification regardless of event kind. Discriminating
-        // event types is fragile: on macOS FSEvents an atomic rename(2)
-        // produces Modify(Name(To)) not Create, and the mapping varies by
-        // platform. Re-scanning produces duplicate ProcessInbound messages
-        // for envelopes still on disk; the agent dedups them by message_id.
-        while rx.recv().is_ok() {
-            scan_cur(&inbox_cur, &addr);
-        }
-    });
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

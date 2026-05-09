@@ -96,10 +96,15 @@ pub enum Verdict {
     },
 }
 
-/// The reason an envelope was quarantined. Each variant corresponds to a
-/// distinct pipeline check, giving audit consumers enough information to
-/// diagnose operator misconfiguration, implementation bugs, or replay attacks
-/// without re-reading the raw bytes.
+/// Reason a message was quarantined rather than delivered.
+///
+/// Each variant identifies the cause so that audit consumers can triage:
+/// a [`RecipientMismatch`] may indicate a routing misconfiguration, while
+/// a [`RecipientNotFound`] may indicate a probing attempt or stale routing
+/// table.
+///
+/// [`RecipientMismatch`]: QuarantineReason::RecipientMismatch
+/// [`RecipientNotFound`]: QuarantineReason::RecipientNotFound
 #[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuarantineReason {
@@ -130,6 +135,13 @@ pub enum QuarantineReason {
     /// The replay ledger already contains this `(sender_id, message_id,
     /// nonce)` tuple.
     Replay,
+    /// `envelope.recipient_id` is not in the `AgentRegistry` — no agent with
+    /// that identity has ever been registered on this host.
+    RecipientNotFound { recipient_id: IdentityId },
+    /// The envelope body bytes are not valid UTF-8. The agent runtime only
+    /// delivers UTF-8 payloads; non-UTF-8 bodies are quarantined by the watcher
+    /// so the body is never silently dropped at dispatch time.
+    BodyNotUtf8,
 }
 
 impl fmt::Display for QuarantineReason {
@@ -144,6 +156,8 @@ impl fmt::Display for QuarantineReason {
             Self::KeyRevoked => f.write_str("key_revoked"),
             Self::SignatureInvalid => f.write_str("signature_invalid"),
             Self::Replay => f.write_str("replay"),
+            Self::RecipientNotFound { .. } => f.write_str("recipient_not_found"),
+            Self::BodyNotUtf8 => f.write_str("body_not_utf8"),
         }
     }
 }
@@ -160,7 +174,7 @@ pub struct EnvelopeIds {
 }
 
 impl EnvelopeIds {
-    fn from_envelope(env: &Envelope) -> Self {
+    pub(crate) fn from_envelope(env: &Envelope) -> Self {
         Self {
             sender_id: Some(env.sender_id),
             sender_key_id: Some(env.sender_key_id),
@@ -235,6 +249,11 @@ pub struct VerificationPipeline {
     clock_skew_tolerance: Duration,
 }
 
+struct HeaderCtx<'a> {
+    recipient_inbox_id: IdentityId,
+    is_known_recipient: &'a dyn Fn(IdentityId) -> bool,
+}
+
 impl VerificationPipeline {
     /// Construct a pipeline.
     ///
@@ -272,6 +291,7 @@ impl VerificationPipeline {
         &self,
         bytes: &[u8],
         recipient_inbox_id: IdentityId,
+        is_known_recipient: impl Fn(IdentityId) -> bool,
         now: OffsetDateTime,
     ) -> Result<Verdict, VerificationError> {
         if bytes.len() > MAX_ENVELOPE_BYTES {
@@ -290,7 +310,11 @@ impl VerificationPipeline {
 
         let ids = EnvelopeIds::from_envelope(&envelope);
 
-        if let Some(v) = self.check_header(&envelope, &ids, recipient_inbox_id, now) {
+        let hctx = HeaderCtx {
+            recipient_inbox_id,
+            is_known_recipient: &is_known_recipient,
+        };
+        if let Some(v) = self.check_header(&envelope, &ids, &hctx, now) {
             return Ok(v);
         }
 
@@ -335,14 +359,21 @@ impl VerificationPipeline {
         &self,
         envelope: &Envelope,
         ids: &EnvelopeIds,
-        recipient_inbox_id: IdentityId,
+        hctx: &HeaderCtx<'_>,
         now: OffsetDateTime,
     ) -> Option<Verdict> {
-        if envelope.recipient_id != recipient_inbox_id {
+        if envelope.recipient_id != hctx.recipient_inbox_id {
+            let reason = if (hctx.is_known_recipient)(envelope.recipient_id) {
+                QuarantineReason::RecipientMismatch {
+                    expected: hctx.recipient_inbox_id,
+                }
+            } else {
+                QuarantineReason::RecipientNotFound {
+                    recipient_id: envelope.recipient_id,
+                }
+            };
             return Some(Verdict::Quarantine {
-                reason: QuarantineReason::RecipientMismatch {
-                    expected: recipient_inbox_id,
-                },
+                reason,
                 identifying: Some(ids.clone()),
             });
         }
@@ -562,7 +593,7 @@ mod tests {
         let ctx = build_context();
         let result = ctx
             .pipeline
-            .verify(b"not json at all", ctx.recipient_id, now())
+            .verify(b"not json at all", ctx.recipient_id, |_| false, now())
             .unwrap();
         assert!(
             matches!(
@@ -593,7 +624,7 @@ mod tests {
 
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, now())
+            .verify(&bytes, ctx.recipient_id, |_| false, now())
             .unwrap();
         assert!(
             matches!(
@@ -620,7 +651,13 @@ mod tests {
             now(),
         );
         let bytes = serde_json::to_vec(&env).unwrap();
-        let result = ctx.pipeline.verify(&bytes, other_recipient, now()).unwrap();
+        // The envelope's recipient_id (ctx.recipient_id) IS a known agent, so
+        // the mismatch is a RecipientMismatch (not RecipientNotFound).
+        let known_id = ctx.recipient_id;
+        let result = ctx
+            .pipeline
+            .verify(&bytes, other_recipient, move |rid| rid == known_id, now())
+            .unwrap();
         assert!(
             matches!(
                 result,
@@ -648,7 +685,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, now())
+            .verify(&bytes, ctx.recipient_id, |_| false, now())
             .unwrap();
         assert!(
             matches!(
@@ -677,7 +714,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, now())
+            .verify(&bytes, ctx.recipient_id, |_| false, now())
             .unwrap();
         assert!(
             matches!(
@@ -708,7 +745,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, reference)
+            .verify(&bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             !matches!(
@@ -739,7 +776,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, now())
+            .verify(&bytes, ctx.recipient_id, |_| false, now())
             .unwrap();
         assert!(
             matches!(
@@ -768,7 +805,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, now())
+            .verify(&bytes, ctx.recipient_id, |_| false, now())
             .unwrap();
         assert!(
             matches!(
@@ -808,7 +845,9 @@ mod tests {
 
         let env = signed_envelope(&keypair, sender_id, key_record.key_id, recipient_id, now());
         let bytes = serde_json::to_vec(&env).unwrap();
-        let result = pipeline.verify(&bytes, recipient_id, now()).unwrap();
+        let result = pipeline
+            .verify(&bytes, recipient_id, |_| false, now())
+            .unwrap();
         assert!(
             matches!(
                 result,
@@ -859,7 +898,9 @@ mod tests {
             envelope_at,
         );
         let bytes = serde_json::to_vec(&env).unwrap();
-        let result = pipeline.verify(&bytes, recipient_id, now_ref).unwrap();
+        let result = pipeline
+            .verify(&bytes, recipient_id, |_| false, now_ref)
+            .unwrap();
         assert!(
             matches!(
                 result,
@@ -909,7 +950,9 @@ mod tests {
             envelope_at,
         );
         let bytes = serde_json::to_vec(&env).unwrap();
-        let result = pipeline.verify(&bytes, recipient_id, now_ref).unwrap();
+        let result = pipeline
+            .verify(&bytes, recipient_id, |_| false, now_ref)
+            .unwrap();
         assert!(
             !matches!(
                 result,
@@ -947,7 +990,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, reference)
+            .verify(&bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             matches!(
@@ -977,7 +1020,7 @@ mod tests {
 
         let first = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, reference)
+            .verify(&bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             matches!(first, Verdict::Deliver { .. }),
@@ -986,7 +1029,7 @@ mod tests {
 
         let second = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, reference)
+            .verify(&bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             matches!(
@@ -1026,7 +1069,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, reference)
+            .verify(&bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             matches!(
@@ -1055,7 +1098,7 @@ mod tests {
         let bytes = serde_json::to_vec(&env).unwrap();
         let result = ctx
             .pipeline
-            .verify(&bytes, ctx.recipient_id, reference)
+            .verify(&bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             matches!(
@@ -1116,7 +1159,9 @@ mod tests {
 
         // Verify.
         let bytes = serde_json::to_vec(&env).unwrap();
-        let result = pipeline.verify(&bytes, recipient_id, reference).unwrap();
+        let result = pipeline
+            .verify(&bytes, recipient_id, |_| false, reference)
+            .unwrap();
 
         let (delivered_env, delivered_sender, delivered_key) = match result {
             Verdict::Deliver {
@@ -1170,6 +1215,14 @@ mod tests {
             "signature_invalid"
         );
         assert_eq!(QuarantineReason::Replay.to_string(), "replay");
+        assert_eq!(
+            QuarantineReason::RecipientNotFound {
+                recipient_id: IdentityId::new().unwrap()
+            }
+            .to_string(),
+            "recipient_not_found"
+        );
+        assert_eq!(QuarantineReason::BodyNotUtf8.to_string(), "body_not_utf8");
     }
 
     // VP15: VerificationError Display and source chain are non-empty.
@@ -1197,7 +1250,7 @@ mod tests {
         let oversized = vec![0u8; MAX_ENVELOPE_BYTES + 1];
         let result = ctx
             .pipeline
-            .verify(&oversized, ctx.recipient_id, now())
+            .verify(&oversized, ctx.recipient_id, |_| false, now())
             .unwrap();
         assert!(
             matches!(
@@ -1236,7 +1289,7 @@ mod tests {
         let tampered_bytes = serde_json::to_vec(&env).unwrap();
         let forged_result = ctx
             .pipeline
-            .verify(&tampered_bytes, ctx.recipient_id, reference)
+            .verify(&tampered_bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             matches!(
@@ -1263,11 +1316,44 @@ mod tests {
 
         let valid_result = ctx
             .pipeline
-            .verify(&original_bytes, ctx.recipient_id, reference)
+            .verify(&original_bytes, ctx.recipient_id, |_| false, reference)
             .unwrap();
         assert!(
             matches!(valid_result, Verdict::Deliver { .. }),
             "legitimate envelope must deliver after a forged-signature attempt on the same replay key, got {valid_result:?}",
+        );
+    }
+
+    // VP18: envelope.recipient_id is not the inbox being watched AND the
+    // is_known_recipient closure returns false → RecipientNotFound.
+    #[test]
+    fn unknown_recipient_id_quarantines_with_recipient_not_found() {
+        let ctx = build_context();
+        let inbox_id = IdentityId::new().unwrap();
+        let env = signed_envelope(
+            &ctx.keypair,
+            ctx.sender_id,
+            ctx.key_record.key_id,
+            ctx.recipient_id,
+            now(),
+        );
+        let bytes = serde_json::to_vec(&env).unwrap();
+        // Verify as if this arrived in `inbox_id`'s inbox, but
+        // ctx.recipient_id is not registered in the agent registry.
+        let result = ctx
+            .pipeline
+            .verify(&bytes, inbox_id, |_| false, now())
+            .unwrap();
+        let expected_rid = ctx.recipient_id;
+        assert!(
+            matches!(
+                result,
+                Verdict::Quarantine {
+                    reason: QuarantineReason::RecipientNotFound { recipient_id },
+                    ..
+                } if recipient_id == expected_rid
+            ),
+            "expected RecipientNotFound for unknown recipient_id, got {result:?}",
         );
     }
 }

@@ -83,15 +83,16 @@
 //! future privilege-separation phase (one OS user per agent, or
 //! capability-based delivery) is the intended mitigation direction.
 
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use notify::{RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
-use reeve_types::{IdentityId, KeyId, MessageId};
+use reeve_types::{Envelope, IdentityId, KeyId, MessageId};
 use time::{Duration, OffsetDateTime};
 
 use tracing::{debug, error, info, warn};
@@ -102,8 +103,8 @@ use crate::identity_registry::IdentityRegistry;
 use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryKey, DeliveryLedger, LedgerError, ReplayLedger};
 use crate::verify::{
-    emit_quarantine_audit, QuarantineReason, Verdict, VerificationError, VerificationPipeline,
-    DEFAULT_CLOCK_SKEW, MAX_ENVELOPE_BYTES,
+    emit_quarantine_audit, EnvelopeIds, QuarantineReason, Verdict, VerificationError,
+    VerificationPipeline, DEFAULT_CLOCK_SKEW, MAX_ENVELOPE_BYTES,
 };
 
 /// Initial buffer capacity for envelope reads — bounded above by
@@ -304,6 +305,19 @@ pub struct Watcher {
     /// Audit log: receives `transport.delivered` and `transport.quarantine`
     /// events after each file is processed.
     audit: Arc<AuditLog>,
+    /// Path to the on-disk agent registry. Used to distinguish
+    /// [`crate::verify::QuarantineReason::RecipientMismatch`] (agent is
+    /// registered but addressed to the wrong inbox) from
+    /// [`crate::verify::QuarantineReason::RecipientNotFound`] (no agent with
+    /// that identity is registered on this host). When the registry is
+    /// unreadable the watcher falls back to treating all recipients as known,
+    /// producing `RecipientMismatch` rather than risking a mislabeled
+    /// quarantine.
+    agent_registry_path: PathBuf,
+    /// Live routing table: `identity_id` → actix recipient that accepts
+    /// [`ProcessInbound`] messages. Populated by [`Watcher::register_route`];
+    /// consulted in the `Deliver` arm of [`Watcher::process_file`].
+    routing_table: Arc<RwLock<HashMap<IdentityId, actix::Recipient<crate::agent::ProcessInbound>>>>,
 }
 
 impl Watcher {
@@ -322,6 +336,7 @@ impl Watcher {
         replay: &Arc<ReplayLedger>,
         delivery: Arc<DeliveryLedger>,
         audit: Arc<AuditLog>,
+        agent_registry_path: PathBuf,
     ) -> Self {
         let pipeline = Arc::new(VerificationPipeline::new(
             Arc::clone(registry),
@@ -333,6 +348,52 @@ impl Watcher {
             pipeline,
             delivery,
             audit,
+            agent_registry_path,
+            routing_table: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// Register a live agent recipient for routing. After registration,
+    /// verified envelopes addressed to `agent_id` are dispatched to
+    /// `recipient` instead of being held in `cur/` for deferred pickup.
+    pub fn register_route(
+        &self,
+        agent_id: IdentityId,
+        recipient: actix::Recipient<crate::agent::ProcessInbound>,
+    ) {
+        self.routing_table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(agent_id, recipient);
+    }
+
+    /// Send `envelope` to its registered actix recipient, if one is present in
+    /// the routing table. Logs a warning when no entry is found; the file
+    /// remains in `cur/` and will be dispatched on the next
+    /// `scan_cur_and_dispatch` call (e.g. crash-recovery).
+    ///
+    /// `payload` must be the UTF-8 decoded body. Callers are responsible for
+    /// ensuring the body is valid UTF-8 before calling this; the guard in
+    /// [`Watcher::process_file`] upholds this invariant on the normal path.
+    fn dispatch_envelope(&self, envelope: &Envelope, payload: String) {
+        let recipient = self
+            .routing_table
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&envelope.recipient_id)
+            .cloned();
+        if let Some(r) = recipient {
+            let message_id = envelope.message_id.to_string();
+            r.do_send(crate::agent::ProcessInbound {
+                payload,
+                message_id,
+            });
+        } else {
+            warn!(
+                recipient_id = %envelope.recipient_id,
+                message_id = %envelope.message_id,
+                "no routing entry for recipient; message in cur/ awaits crash-recovery"
+            );
         }
     }
 
@@ -423,6 +484,7 @@ impl Watcher {
         path: &Path,
         agent_id: IdentityId,
         inbox: &AgentInbox,
+        is_known_recipient: impl Fn(IdentityId) -> bool,
     ) -> Result<ProcessOutcome, WatcherError> {
         // path.file_name() returns None for paths ending in ".." or "/".
         // These shapes are unreachable from read_dir/notify CreateKind::File,
@@ -445,7 +507,7 @@ impl Watcher {
         let now = OffsetDateTime::now_utc();
         let verdict = self
             .pipeline
-            .verify(&bytes, agent_id, now)
+            .verify(&bytes, agent_id, is_known_recipient, now)
             .map_err(WatcherError::Verification)?;
         match verdict {
             Verdict::Deliver {
@@ -454,44 +516,36 @@ impl Watcher {
                 key_record,
                 already_delivered,
             } => {
-                let dest = inbox.cur().join(validated_name);
-                if !rename_disambiguating_enoent(path, &dest)? {
-                    return Ok(ProcessOutcome::AlreadyProcessed);
+                // Guard: body must be valid UTF-8 before the file moves to cur/.
+                // Non-UTF-8 bodies are quarantined here so dispatch_envelope
+                // and scan_cur_and_dispatch never receive bytes that cannot
+                // be converted to a String payload.
+                if std::str::from_utf8(&envelope.body).is_err() {
+                    let reason = QuarantineReason::BodyNotUtf8;
+                    let ids = EnvelopeIds::from_envelope(&envelope);
+                    let dest = quarantine_path(inbox.quarantine(), validated_name, &reason);
+                    if !rename_disambiguating_enoent(path, &dest)? {
+                        return Ok(ProcessOutcome::AlreadyProcessed);
+                    }
+                    emit_quarantine_audit(&self.audit, &reason, Some(&ids), agent_id, now)
+                        .map_err(WatcherError::Verification)?;
+                    warn!(
+                        message_id = %envelope.message_id,
+                        "quarantined: envelope body is not valid UTF-8"
+                    );
+                    return Ok(ProcessOutcome::Quarantined { reason });
                 }
-                if already_delivered {
-                    debug!(message_id = %envelope.message_id, "skipped already-delivered");
-                    return Ok(ProcessOutcome::AlreadyDelivered {
-                        message_id: envelope.message_id,
-                    });
-                }
-                self.delivery
-                    .record(
-                        DeliveryKey {
-                            recipient_id: agent_id,
-                            message_id: envelope.message_id,
-                        },
-                        now,
-                    )
-                    .map_err(WatcherError::Ledger)?;
-                self.audit
-                    .append(&AuditEvent::TransportDelivered {
-                        sender_id: sender.identity_id,
-                        sender_key_id: key_record.key_id,
-                        recipient_id: agent_id,
-                        message_id: envelope.message_id,
-                        at: now,
-                    })
-                    .map_err(WatcherError::Audit)?;
-                info!(
-                    message_id = %envelope.message_id,
-                    sender_id = %sender.identity_id,
-                    "delivered"
-                );
-                Ok(ProcessOutcome::Delivered {
-                    message_id: envelope.message_id,
-                    sender_id: sender.identity_id,
-                    sender_key_id: key_record.key_id,
-                })
+                self.handle_deliver(
+                    path,
+                    validated_name,
+                    inbox,
+                    agent_id,
+                    now,
+                    &envelope,
+                    &sender,
+                    &key_record,
+                    already_delivered,
+                )
             }
             Verdict::Quarantine {
                 reason,
@@ -507,6 +561,101 @@ impl Watcher {
                 Ok(ProcessOutcome::Quarantined { reason })
             }
         }
+    }
+
+    /// Open the agent registry and collect all registered `identity_id` values
+    /// into a set.
+    ///
+    /// Returns `Some(set)` on success and `None` when the registry cannot be
+    /// opened. `None` causes the caller to treat every recipient as known —
+    /// the conservative fallback that produces `RecipientMismatch` rather than
+    /// `RecipientNotFound`, avoiding a mislabeled quarantine reason when the
+    /// registry is transiently unreadable.
+    fn snapshot_known_recipients(&self) -> Option<HashSet<IdentityId>> {
+        match crate::agent_registry::AgentRegistry::open(self.agent_registry_path.clone()) {
+            Ok(r) => Some(r.list().map(|rec| rec.identity_id).collect()),
+            Err(e) => {
+                warn!(
+                    path = %self.agent_registry_path.display(),
+                    err = %e,
+                    "agent registry unavailable; assuming recipient may be known"
+                );
+                None
+            }
+        }
+    }
+
+    /// Handle a [`Verdict::Deliver`] from the verification pipeline.
+    ///
+    /// Moves the file to `cur/`, records delivery in the ledger, appends the
+    /// audit event, and dispatches [`crate::agent::ProcessInbound`] to the
+    /// registered recipient. Returns [`ProcessOutcome::AlreadyDelivered`]
+    /// without writing to the ledger when the message was already recorded.
+    /// The file is moved to `cur/` before the already-delivered check, so
+    /// already-delivered messages remain in `cur/` for crash-recovery replay.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "Verdict::Deliver fields passed directly; a one-use wrapper struct would add indirection without benefit"
+    )]
+    #[expect(
+        clippy::expect_used,
+        reason = "body is UTF-8 by invariant enforced in process_file; panicking is correct \
+                  because a ghost delivery (ledger + audit say delivered but agent gets nothing) \
+                  is worse than a crash"
+    )]
+    fn handle_deliver(
+        &self,
+        path: &Path,
+        validated_name: &str,
+        inbox: &AgentInbox,
+        agent_id: IdentityId,
+        now: OffsetDateTime,
+        envelope: &Envelope,
+        sender: &reeve_types::Identity,
+        key_record: &reeve_types::KeyRecord,
+        already_delivered: bool,
+    ) -> Result<ProcessOutcome, WatcherError> {
+        let dest = inbox.cur().join(validated_name);
+        if !rename_disambiguating_enoent(path, &dest)? {
+            return Ok(ProcessOutcome::AlreadyProcessed);
+        }
+        if already_delivered {
+            debug!(message_id = %envelope.message_id, "already delivered; skipping dispatch");
+            return Ok(ProcessOutcome::AlreadyDelivered {
+                message_id: envelope.message_id,
+            });
+        }
+        let payload = String::from_utf8(envelope.body.clone())
+            .expect("body is UTF-8 by invariant: process_file guard quarantines non-UTF-8 bodies");
+        self.delivery
+            .record(
+                DeliveryKey {
+                    recipient_id: agent_id,
+                    message_id: envelope.message_id,
+                },
+                now,
+            )
+            .map_err(WatcherError::Ledger)?;
+        self.audit
+            .append(&AuditEvent::TransportDelivered {
+                sender_id: sender.identity_id,
+                sender_key_id: key_record.key_id,
+                recipient_id: agent_id,
+                message_id: envelope.message_id,
+                at: now,
+            })
+            .map_err(WatcherError::Audit)?;
+        info!(
+            message_id = %envelope.message_id,
+            sender_id = %sender.identity_id,
+            "delivered"
+        );
+        self.dispatch_envelope(envelope, payload);
+        Ok(ProcessOutcome::Delivered {
+            message_id: envelope.message_id,
+            sender_id: sender.identity_id,
+            sender_key_id: key_record.key_id,
+        })
     }
 
     /// Emit a `transport.filename-rejected` audit event and return
@@ -686,15 +835,109 @@ impl Watcher {
         Ok(outcome)
     }
 
+    /// Scan `inbox/cur/` and dispatch [`crate::agent::ProcessInbound`] for
+    /// each envelope found. Called by [`crate::supervisor::WatcherActor`]
+    /// when registering a new inbox, so envelopes deposited in `cur/` during
+    /// a prior run are delivered on restart.
+    ///
+    /// `agent_id` is compared against `envelope.recipient_id` for each file.
+    /// Files whose `recipient_id` does not match `agent_id` are skipped with a
+    /// warning — defense-in-depth against stray files in `cur/`.
+    ///
+    /// Files in `cur/` have already passed the full verification pipeline.
+    /// This function dispatches them without re-verifying — callers must ensure
+    /// that `cur/` is only written by [`Watcher::handle_deliver`] after a
+    /// successful [`crate::verify::VerificationPipeline::verify`] call (and
+    /// the UTF-8 body guard that precedes it in [`Watcher::process_file`]).
+    ///
+    /// **At-least-once semantics.** This function intentionally re-dispatches
+    /// every file in `cur/` without consulting the delivery ledger. Files in
+    /// `cur/` may have been dispatched to the agent before a crash, but the
+    /// agent may not have processed them. Adding a ledger guard here would
+    /// silently skip messages that were dispatched-but-not-processed,
+    /// violating crash-recovery guarantees.
+    ///
+    /// The correct cleanup mechanism is `rotate_cur`, which archives verified
+    /// messages from `cur/` after the configured retention period.
+    pub(crate) fn scan_cur_and_dispatch(
+        inbox: &AgentInbox,
+        agent_id: IdentityId,
+        recipient: &actix::Recipient<crate::agent::ProcessInbound>,
+    ) {
+        let cur = inbox.cur();
+        let Ok(entries) = fs::read_dir(cur) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(metadata) = fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.file_type().is_symlink() {
+                debug!(path = %path.display(), "skipping symlink in cur/");
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            if let Some((payload, message_id, recipient_id)) = Self::read_cur_payload(&path) {
+                if recipient_id != agent_id {
+                    warn!(
+                        path = %path.display(),
+                        envelope_recipient_id = %recipient_id,
+                        inbox_agent_id = %agent_id,
+                        "cur/ envelope recipient mismatch; skipping dispatch",
+                    );
+                    continue;
+                }
+                recipient.do_send(crate::agent::ProcessInbound {
+                    payload,
+                    message_id,
+                });
+            }
+        }
+    }
+
+    /// Read an envelope file from `cur/` and return `(payload, message_id,
+    /// recipient_id)`.
+    ///
+    /// Opens with `O_NOFOLLOW`. Returns `None` when the file cannot be read
+    /// or parsed. Logs a warning and returns `None` when the body is not valid
+    /// UTF-8 so operators can detect files stuck in `cur/`.
+    ///
+    /// `message_id` is taken from `envelope.message_id`, not from the filename,
+    /// so crash-recovery dispatch is consistent with live delivery via
+    /// [`Watcher::dispatch_envelope`].
+    fn read_cur_payload(path: &Path) -> Option<(String, String, IdentityId)> {
+        let buf = read_nofollow(path).ok()?;
+        let envelope: Envelope = serde_json::from_slice(&buf).ok()?;
+        let message_id = envelope.message_id.to_string();
+        let recipient_id = envelope.recipient_id;
+        if let Ok(payload) = String::from_utf8(envelope.body) {
+            Some((payload, message_id, recipient_id))
+        } else {
+            warn!(
+                path = %path.display(),
+                message_id = %message_id,
+                "cur/ envelope body is not valid UTF-8; skipping crash-recovery dispatch"
+            );
+            None
+        }
+    }
+
     /// Iterates `inbox/new/`, skipping symlinks and non-files. Calls
     /// [`Watcher::process_file`] on each regular file. Stops on the first
     /// system error; returns `Ok(())` after a complete pass.
+    ///
+    /// Calls [`Watcher::snapshot_known_recipients`] once before the loop so
+    /// the registry is opened at most once per pass, not once per file.
     fn scan_new(
         &self,
         agent_id: IdentityId,
         inbox: &AgentInbox,
         on_quarantine: &(impl Fn(String) + Send),
     ) -> Result<(), WatcherError> {
+        let known = self.snapshot_known_recipients();
         let entries = fs::read_dir(inbox.new_dir()).map_err(|source| WatcherError::Io {
             path: inbox.new_dir().to_path_buf(),
             source,
@@ -712,7 +955,9 @@ impl Watcher {
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 continue;
             }
-            let outcome = self.process_file(&path, agent_id, inbox)?;
+            let outcome = self.process_file(&path, agent_id, inbox, |rid| {
+                known.as_ref().is_none_or(|s| s.contains(&rid))
+            })?;
             if let ProcessOutcome::Quarantined { reason } = outcome {
                 on_quarantine(reason.to_string());
             }
@@ -875,8 +1120,9 @@ fn validate_filename(name: &OsStr) -> Result<&str, FilenameError> {
 mod tests {
     use super::*;
 
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
+    use actix::{Actor, Context, Handler};
     use reeve_types::IdentityId;
     use tempfile::tempdir;
     use time::OffsetDateTime;
@@ -896,6 +1142,8 @@ mod tests {
         audit_dir: tempfile::TempDir,
         /// Keeps the inbox data directory alive for the test's duration.
         _inbox_data_dir: tempfile::TempDir,
+        /// Keeps the agent registry data directory alive for the test's duration.
+        _registry_data_dir: tempfile::TempDir,
     }
 
     fn build_ctx() -> TestCtx {
@@ -906,6 +1154,7 @@ mod tests {
         let delivery_dir = crate::test_support::secure_dir();
         let audit_data_dir = tempdir().unwrap();
         let inbox_data_dir = crate::test_support::secure_dir();
+        let registry_data_dir = crate::test_support::secure_dir();
 
         let registry = Arc::new(IdentityRegistry::open(reg_dir.keep()).unwrap());
         let replay = Arc::new(ReplayLedger::open(replay_dir.keep()).unwrap());
@@ -924,11 +1173,15 @@ mod tests {
         let layout = InboxLayout::open(inbox_data_dir.path().to_path_buf()).unwrap();
         let inbox = layout.provision(recipient_id).unwrap();
 
+        // The agent registry is empty — tests that exercise RecipientMismatch
+        // register the recipient_id explicitly before calling process_file.
+        let agent_registry_path = registry_data_dir.path().join("registry.toml");
         let watcher = Watcher::new(
             &registry,
             &replay,
             Arc::clone(&delivery),
             Arc::clone(&audit),
+            agent_registry_path,
         );
 
         TestCtx {
@@ -940,6 +1193,7 @@ mod tests {
             inbox,
             audit_dir: audit_data_dir,
             _inbox_data_dir: inbox_data_dir,
+            _registry_data_dir: registry_data_dir,
         }
     }
 
@@ -965,8 +1219,83 @@ mod tests {
             .collect()
     }
 
+    /// Register an agent record in the watcher's agent registry.
+    ///
+    /// Used by tests that need a known recipient in the registry before calling
+    /// `process_file` or `scan_cur_and_dispatch`.
+    fn register_in_ctx_registry(ctx: &TestCtx, name: &str, id: IdentityId, inbox_dir: PathBuf) {
+        use crate::agent_registry::{AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName};
+        let mut registry = AgentRegistry::open(ctx.watcher.agent_registry_path.clone()).unwrap();
+        registry
+            .register(AgentRecord {
+                name: ValidatedAgentName::new(name).unwrap(),
+                identity_id: id,
+                inbox_dir,
+                persona_name: None,
+                spawned_at: time::OffsetDateTime::now_utc(),
+                status: AgentStatus::Running,
+            })
+            .unwrap();
+    }
+
+    // Shared test-helper actors for tests that need a ProcessInbound recipient.
+    //
+    // `NotifyCollector` collects messages into a shared Vec. `field` controls
+    // which field of each message is collected. `notify`, when `Some`, fires a
+    // oneshot after the first message arrives.
+
+    enum CollectorField {
+        Payload,
+        MessageId,
+    }
+
+    struct NotifyCollector {
+        dispatched: Arc<Mutex<Vec<String>>>,
+        notify: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+        field: CollectorField,
+    }
+
+    impl Actor for NotifyCollector {
+        type Context = Context<Self>;
+    }
+
+    impl Handler<crate::agent::ProcessInbound> for NotifyCollector {
+        type Result = ();
+        fn handle(&mut self, msg: crate::agent::ProcessInbound, _ctx: &mut Context<Self>) {
+            let value = match self.field {
+                CollectorField::Payload => msg.payload,
+                CollectorField::MessageId => msg.message_id,
+            };
+            self.dispatched.lock().unwrap().push(value);
+            if let Some(sender) = self.notify.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    /// Start a `NotifyCollector` actor and return a `Recipient<ProcessInbound>`.
+    ///
+    /// Must be called inside an active `actix::System` context (e.g. inside
+    /// `block_on`). The `dispatched` arc is shared with the caller so values
+    /// can be read after the system stops. Pass `Arc::new(Mutex::new(None))`
+    /// for `notify` when no oneshot signal is needed.
+    fn make_collector(
+        field: CollectorField,
+        dispatched: Arc<Mutex<Vec<String>>>,
+        notify: Arc<Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
+    ) -> actix::Recipient<crate::agent::ProcessInbound> {
+        let addr = NotifyCollector {
+            dispatched,
+            notify,
+            field,
+        }
+        .start();
+        addr.recipient::<crate::agent::ProcessInbound>()
+    }
+
     // W1: valid signed envelope → Delivered, file in cur/, delivery ledger
-    // entry, audit transport.delivered.
+    // entry, audit transport.delivered. No route is registered, so
+    // dispatch_envelope logs a warning and 0 ProcessInbound messages are sent.
     #[test]
     fn valid_envelope_delivers_to_cur() {
         let ctx = build_ctx();
@@ -978,35 +1307,59 @@ mod tests {
         );
         let path = place_in_new(&ctx.inbox, "test1.json", &bytes);
 
-        let outcome = ctx
-            .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
-            .unwrap();
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
 
-        assert!(
-            matches!(outcome, ProcessOutcome::Delivered { message_id, .. } if message_id == env.message_id),
-            "expected Delivered, got {outcome:?}",
-        );
-        assert!(!path.exists(), "file should have been removed from new/");
-        assert!(
-            ctx.inbox.cur().join("test1.json").exists(),
-            "file should be in cur/",
-        );
+        // Run inside an actix System so we can observe whether any
+        // ProcessInbound messages are dispatched. No route is registered in
+        // the routing table, so dispatch_envelope must log a warning and skip.
+        actix::System::new().block_on(async move {
+            let _recipient = make_collector(
+                CollectorField::MessageId,
+                dispatched_clone,
+                Arc::new(Mutex::new(None)),
+            );
 
-        let delivery_key = DeliveryKey {
-            recipient_id: ctx.recipient_id,
-            message_id: env.message_id,
-        };
-        assert!(
-            ctx.watcher.delivery.contains(&delivery_key).unwrap(),
-            "delivery ledger should contain the key",
-        );
+            let outcome = ctx
+                .watcher
+                .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
+                .unwrap();
 
-        let lines = audit_lines(&ctx.audit_dir);
-        assert_eq!(lines.len(), 1, "expected one audit line");
-        assert_eq!(lines[0]["kind"], "transport.delivered");
-        assert_eq!(lines[0]["message_id"], env.message_id.to_string());
-        assert_eq!(lines[0]["recipient_id"], ctx.recipient_id.to_string());
+            assert!(
+                matches!(outcome, ProcessOutcome::Delivered { message_id, .. } if message_id == env.message_id),
+                "expected Delivered, got {outcome:?}",
+            );
+            assert!(!path.exists(), "file should have been removed from new/");
+            assert!(
+                ctx.inbox.cur().join("test1.json").exists(),
+                "file should be in cur/",
+            );
+
+            let delivery_key = DeliveryKey {
+                recipient_id: ctx.recipient_id,
+                message_id: env.message_id,
+            };
+            assert!(
+                ctx.watcher.delivery.contains(&delivery_key).unwrap(),
+                "delivery ledger should contain the key",
+            );
+
+            let lines = audit_lines(&ctx.audit_dir);
+            assert_eq!(lines.len(), 1, "expected one audit line");
+            assert_eq!(lines[0]["kind"], "transport.delivered");
+            assert_eq!(lines[0]["message_id"], env.message_id.to_string());
+            assert_eq!(lines[0]["recipient_id"], ctx.recipient_id.to_string());
+
+            actix::System::current().stop();
+        });
+
+        // No route was registered: dispatch_envelope must have skipped
+        // sending. The collector must have received 0 messages.
+        assert_eq!(
+            dispatched.lock().unwrap().len(),
+            0,
+            "no dispatch expected when routing table has no entry for recipient",
+        );
     }
 
     // W2: tampered signature → Quarantined with reason signature_invalid, file
@@ -1031,7 +1384,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1109,7 +1462,7 @@ mod tests {
         let path = place_in_new(&ctx.inbox, "redelivery.json", &bytes);
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1142,7 +1495,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1236,11 +1589,26 @@ mod tests {
         );
     }
 
-    // W8: recipient mismatch → Quarantined(RecipientMismatch).
+    // W8: envelope addressed to a KNOWN identity that is not this inbox's agent
+    // → Quarantined(RecipientMismatch).
+    //
+    // To distinguish RecipientMismatch from RecipientNotFound the envelope's
+    // recipient_id must be present in the agent registry. We register it before
+    // calling process_file.
     #[test]
     fn recipient_mismatch_quarantines() {
         let ctx = build_ctx();
         let wrong_recipient = IdentityId::new().unwrap();
+
+        // Register wrong_recipient in the agent registry so the pipeline
+        // produces RecipientMismatch rather than RecipientNotFound.
+        register_in_ctx_registry(
+            &ctx,
+            "other",
+            wrong_recipient,
+            PathBuf::from("/tmp/other/inbox"),
+        );
+
         let (_, bytes) = crate::test_support::make_signed_envelope(
             &ctx.keypair,
             ctx.sender_id,
@@ -1251,19 +1619,441 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| true)
+            .unwrap();
+
+        let ProcessOutcome::Quarantined {
+            reason: QuarantineReason::RecipientMismatch { expected },
+        } = outcome
+        else {
+            panic!("expected Quarantined(RecipientMismatch), got {outcome:?}");
+        };
+        assert_eq!(
+            expected, ctx.recipient_id,
+            "RecipientMismatch.expected must be the inbox owner's agent_id",
+        );
+        assert!(!path.exists(), "file should have left new/");
+    }
+
+    // W_new1: envelope where recipient_id is unknown (not in registry) →
+    // Quarantined(RecipientNotFound).
+    #[test]
+    fn unknown_recipient_id_quarantines_with_recipient_not_found() {
+        let ctx = build_ctx();
+        // Envelope addressed to a fresh identity that is NOT in the agent
+        // registry → RecipientNotFound.
+        let unknown_recipient = IdentityId::new().unwrap();
+        let (_, bytes) = crate::test_support::make_signed_envelope(
+            &ctx.keypair,
+            ctx.sender_id,
+            ctx.key_record.key_id,
+            unknown_recipient,
+        );
+        let path = place_in_new(&ctx.inbox, "unknown_recipient.json", &bytes);
+
+        let outcome = ctx
+            .watcher
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
             matches!(
                 outcome,
                 ProcessOutcome::Quarantined {
-                    reason: QuarantineReason::RecipientMismatch { .. }
+                    reason: QuarantineReason::RecipientNotFound { .. }
                 }
             ),
-            "expected Quarantined(RecipientMismatch), got {outcome:?}",
+            "expected Quarantined(RecipientNotFound), got {outcome:?}",
         );
         assert!(!path.exists(), "file should have left new/");
+        assert!(
+            ctx.inbox
+                .quarantine()
+                .join("unknown_recipient.json.recipient_not_found")
+                .exists(),
+            "quarantine file with recipient_not_found suffix should exist",
+        );
+    }
+
+    // W_new2: registered route → Delivered, ProcessInbound dispatched.
+    //
+    // We register a route for recipient_id before process_file, then verify
+    // the watcher dispatches ProcessInbound to the registered recipient after
+    // successful delivery.
+    #[test]
+    fn registered_route_dispatches_process_inbound() {
+        let ctx = build_ctx();
+
+        // Register ctx.recipient_id in the agent registry so the envelope passes
+        // the recipient check.
+        register_in_ctx_registry(
+            &ctx,
+            "lead",
+            ctx.recipient_id,
+            ctx.inbox.root().to_path_buf(),
+        );
+
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let notify = Arc::new(Mutex::new(Some(tx)));
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(CollectorField::Payload, dispatched_clone, notify);
+
+            ctx.watcher.register_route(ctx.recipient_id, recipient);
+
+            let (env, bytes) = crate::test_support::make_signed_envelope(
+                &ctx.keypair,
+                ctx.sender_id,
+                ctx.key_record.key_id,
+                ctx.recipient_id,
+            );
+            let path = place_in_new(&ctx.inbox, "routed.json", &bytes);
+
+            let outcome = ctx
+                .watcher
+                .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
+                .unwrap();
+
+            assert!(
+                matches!(outcome, ProcessOutcome::Delivered { message_id, .. } if message_id == env.message_id),
+                "expected Delivered, got {outcome:?}",
+            );
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .expect("timed out waiting for ProcessInbound dispatch")
+                .expect("oneshot sender dropped");
+            actix::System::current().stop();
+
+            // Verify count and payload while env is still in scope.
+            let got = dispatched.lock().unwrap();
+            assert_eq!(got.len(), 1, "expected exactly one ProcessInbound dispatched");
+            let expected_payload = String::from_utf8(env.body.clone()).unwrap();
+            assert_eq!(
+                got[0],
+                expected_payload,
+                "dispatched payload must equal envelope body",
+            );
+        });
+    }
+
+    // W_new3: already_delivered → no second dispatch.
+    //
+    // When the delivery ledger already contains (recipient_id, message_id),
+    // the watcher moves the file to cur/ but must NOT call do_send again —
+    // the message was already processed before a prior crash.
+    #[test]
+    fn already_delivered_does_not_dispatch() {
+        let ctx = build_ctx();
+
+        // Register ctx.recipient_id in the agent registry.
+        register_in_ctx_registry(
+            &ctx,
+            "lead",
+            ctx.recipient_id,
+            ctx.inbox.root().to_path_buf(),
+        );
+
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(
+                CollectorField::Payload,
+                dispatched_clone,
+                Arc::new(Mutex::new(None)),
+            );
+
+            ctx.watcher.register_route(ctx.recipient_id, recipient);
+
+            let (env, bytes) = crate::test_support::make_signed_envelope(
+                &ctx.keypair,
+                ctx.sender_id,
+                ctx.key_record.key_id,
+                ctx.recipient_id,
+            );
+
+            // Pre-record delivery so the watcher takes the already_delivered path.
+            ctx.watcher
+                .delivery
+                .record(
+                    DeliveryKey {
+                        recipient_id: ctx.recipient_id,
+                        message_id: env.message_id,
+                    },
+                    time::OffsetDateTime::now_utc(),
+                )
+                .unwrap();
+
+            let path = place_in_new(&ctx.inbox, "already.json", &bytes);
+
+            let outcome = ctx
+                .watcher
+                .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
+                .unwrap();
+
+            assert!(
+                matches!(outcome, ProcessOutcome::AlreadyDelivered { .. }),
+                "expected AlreadyDelivered, got {outcome:?}",
+            );
+
+            actix::System::current().stop();
+        });
+
+        // No dispatch must have occurred.
+        let got = dispatched.lock().unwrap();
+        assert_eq!(
+            got.len(),
+            0,
+            "no ProcessInbound should be dispatched for already-delivered message"
+        );
+    }
+
+    // W_new4: scan_cur_and_dispatch with non-existent cur/ — no panic, no dispatch.
+    //
+    // On first boot an agent's cur/ directory may not yet exist. The function
+    // must degrade gracefully: read_dir failure is silently ignored and no
+    // ProcessInbound messages are dispatched.
+    #[test]
+    fn scan_cur_and_dispatch_silently_handles_missing_cur_dir() {
+        let ctx = build_ctx();
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        // Remove cur/ so read_dir fails.
+        fs::remove_dir_all(ctx.inbox.cur()).unwrap();
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(
+                CollectorField::Payload,
+                dispatched_clone,
+                Arc::new(Mutex::new(None)),
+            );
+
+            // Must not panic.
+            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+
+            actix::System::current().stop();
+        });
+
+        let got = dispatched.lock().unwrap();
+        assert_eq!(got.len(), 0, "no dispatch expected when cur/ is missing");
+    }
+
+    // W_p1: scan_cur_and_dispatch re-dispatches a message already delivered
+    // by process_file — at-least-once crash-recovery semantics.
+    //
+    // The delivery ledger records the message after process_file runs.
+    // scan_cur_and_dispatch must re-dispatch the same file regardless, because
+    // the agent may have crashed before processing it. Adding a ledger guard
+    // here would silently drop messages that were dispatched-but-not-processed.
+    #[test]
+    fn scan_cur_and_dispatch_redispatches_already_delivered_message() {
+        let ctx = build_ctx();
+
+        // Register the recipient so process_file can deliver the envelope.
+        register_in_ctx_registry(
+            &ctx,
+            "lead",
+            ctx.recipient_id,
+            ctx.inbox.root().to_path_buf(),
+        );
+
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        actix::System::new().block_on(async move {
+            let addr = Actor::start(NotifyCollector {
+                dispatched: Arc::clone(&dispatched_clone),
+                notify: Arc::new(Mutex::new(None)),
+                field: CollectorField::MessageId,
+            });
+            let recipient = addr.recipient::<crate::agent::ProcessInbound>();
+
+            ctx.watcher.register_route(ctx.recipient_id, recipient.clone());
+
+            let (env, bytes) = crate::test_support::make_signed_envelope(
+                &ctx.keypair,
+                ctx.sender_id,
+                ctx.key_record.key_id,
+                ctx.recipient_id,
+            );
+            let path = place_in_new(&ctx.inbox, "at_least_once.json", &bytes);
+
+            // Step 1: process_file delivers the envelope and dispatches the first
+            // ProcessInbound. The file now lives in cur/ and the ledger is written.
+            let outcome = ctx
+                .watcher
+                .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
+                .unwrap();
+            assert!(
+                matches!(outcome, ProcessOutcome::Delivered { message_id, .. } if message_id == env.message_id),
+                "expected Delivered on first process_file, got {outcome:?}",
+            );
+
+            // Step 2: scan_cur_and_dispatch re-dispatches the same cur/ file
+            // without consulting the ledger — at-least-once semantics.
+            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+
+            // Wait up to 5 s for both dispatches to arrive at the collector.
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                {
+                    let got = dispatched_clone.lock().unwrap();
+                    if got.len() >= 2 {
+                        break;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for second ProcessInbound dispatch"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            actix::System::current().stop();
+
+            // Verify both dispatches carry the same message_id.
+            let got = dispatched_clone.lock().unwrap();
+            assert_eq!(
+                got.len(),
+                2,
+                "scan_cur_and_dispatch must re-dispatch the already-delivered message (at-least-once)"
+            );
+            assert_eq!(
+                got[0], got[1],
+                "both dispatches must carry the same message_id",
+            );
+            assert_eq!(
+                got[0],
+                env.message_id.to_string(),
+                "dispatched message_id must match the envelope",
+            );
+        });
+    }
+
+    // W_p2: scan_cur_and_dispatch recovers a message when a route is registered
+    // after process_file has already moved the envelope to cur/.
+    //
+    // Crash-recovery scenario: process_file verifies the envelope and writes it
+    // to cur/, but no route was registered yet so dispatch_envelope skips
+    // dispatch. Once a route is registered, scan_cur_and_dispatch must deliver
+    // the waiting envelope.
+    #[test]
+    fn scan_cur_recovers_message_when_route_registered_after_delivery() {
+        let ctx = build_ctx();
+
+        let (env, bytes) = crate::test_support::make_signed_envelope(
+            &ctx.keypair,
+            ctx.sender_id,
+            ctx.key_record.key_id,
+            ctx.recipient_id,
+        );
+        let path = place_in_new(&ctx.inbox, "recover.json", &bytes);
+
+        // Step 1: process_file with no route registered. The envelope passes
+        // verification and lands in cur/, but dispatch_envelope logs a warning
+        // and skips dispatch.
+        let outcome = ctx
+            .watcher
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
+            .unwrap();
+        assert!(
+            matches!(outcome, ProcessOutcome::Delivered { message_id, .. } if message_id == env.message_id),
+            "expected Delivered on first process_file, got {outcome:?}",
+        );
+        assert!(
+            ctx.inbox.cur().join("recover.json").exists(),
+            "envelope should be in cur/ after process_file with no route",
+        );
+
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(
+                CollectorField::MessageId,
+                dispatched_clone,
+                Arc::new(Mutex::new(None)),
+            );
+
+            // Step 2: register the route.
+            ctx.watcher
+                .register_route(ctx.recipient_id, recipient.clone());
+
+            // Step 3: scan_cur_and_dispatch picks up the waiting envelope and
+            // dispatches it now that a route is present.
+            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+
+            // Wait up to 5 s for the dispatch to arrive.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                {
+                    let got = dispatched.lock().unwrap();
+                    if !got.is_empty() {
+                        break;
+                    }
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for ProcessInbound from scan_cur_and_dispatch",
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+
+            actix::System::current().stop();
+
+            let got = dispatched.lock().unwrap();
+            assert_eq!(
+                got.len(),
+                1,
+                "scan_cur_and_dispatch must dispatch the envelope recovered from cur/",
+            );
+            assert_eq!(
+                got[0],
+                env.message_id.to_string(),
+                "dispatched message_id must match the envelope",
+            );
+        });
+    }
+
+    // W_new5: scan_cur_and_dispatch skips symlinks in cur/.
+    //
+    // Symlinks must be skipped via symlink_metadata, consistent with scan_new.
+    // O_NOFOLLOW protects the open, but the explicit skip is defense-in-depth.
+    #[cfg(unix)]
+    #[test]
+    fn scan_cur_and_dispatch_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let ctx = build_ctx();
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        // Place a symlink in cur/ pointing to a file outside the inbox.
+        let target = ctx.inbox.tmp().join("target.json");
+        fs::write(&target, b"not an envelope").unwrap();
+        let link = ctx.inbox.cur().join("symlink.json");
+        symlink(&target, &link).unwrap();
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(
+                CollectorField::Payload,
+                dispatched_clone,
+                Arc::new(Mutex::new(None)),
+            );
+
+            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+
+            actix::System::current().stop();
+        });
+
+        assert!(link.exists(), "symlink should remain untouched");
+        let got = dispatched.lock().unwrap();
+        assert_eq!(got.len(), 0, "symlink must not be dispatched");
     }
 
     // W9: scan_new skips symlinks.
@@ -1301,7 +2091,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1339,7 +2129,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1374,7 +2164,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&ghost_path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&ghost_path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1396,7 +2186,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1444,7 +2234,7 @@ mod tests {
 
         let result = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox);
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false);
 
         assert!(
             matches!(result, Err(WatcherError::Io { .. })),
@@ -1477,7 +2267,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1527,7 +2317,7 @@ mod tests {
 
         let result = ctx
             .watcher
-            .process_file(&path, ctx.recipient_id, &ctx.inbox);
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| false);
 
         assert!(
             matches!(result, Err(WatcherError::Io { .. })),
@@ -1559,7 +2349,7 @@ mod tests {
 
         let outcome = ctx
             .watcher
-            .process_file(&root_path, ctx.recipient_id, &ctx.inbox)
+            .process_file(&root_path, ctx.recipient_id, &ctx.inbox, |_| false)
             .unwrap();
 
         assert!(
@@ -1883,6 +2673,325 @@ mod tests {
         assert!(
             !ctx.inbox.archive().join(".hidden.json").exists(),
             ".hidden.json must not appear in archive/",
+        );
+    }
+
+    // W_m1: crash-recovery dispatches envelope.message_id, not the filename stem.
+    //
+    // Place a real signed envelope in cur/ under a filename that does NOT match
+    // the envelope's message_id. scan_cur_and_dispatch must use envelope.message_id
+    // as the dispatched message_id, not the file stem.
+    #[test]
+    fn scan_cur_uses_envelope_message_id_not_filename_stem() {
+        let ctx = build_ctx();
+
+        // Register the recipient in the agent registry so delivery succeeds.
+        register_in_ctx_registry(
+            &ctx,
+            "lead",
+            ctx.recipient_id,
+            ctx.inbox.root().to_path_buf(),
+        );
+
+        let (env, bytes) = crate::test_support::make_signed_envelope(
+            &ctx.keypair,
+            ctx.sender_id,
+            ctx.key_record.key_id,
+            ctx.recipient_id,
+        );
+        // Write the envelope to cur/ under a filename that does NOT match message_id.
+        let cur_path = ctx.inbox.cur().join("not-the-uuid.json");
+        fs::write(&cur_path, &bytes).unwrap();
+
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let notify = Arc::new(Mutex::new(Some(tx)));
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(CollectorField::MessageId, dispatched_clone, notify);
+
+            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+
+            tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+                .await
+                .expect("timed out waiting for ProcessInbound dispatch")
+                .expect("oneshot sender dropped");
+            actix::System::current().stop();
+        });
+
+        let got = dispatched.lock().unwrap();
+        assert_eq!(got.len(), 1, "exactly one message dispatched");
+        assert_eq!(
+            got[0],
+            env.message_id.to_string(),
+            "dispatched message_id must equal envelope.message_id, not filename stem",
+        );
+    }
+
+    // W_m2: registry open failure → RecipientMismatch, not RecipientNotFound.
+    //
+    // Build a Watcher with a non-existent registry path. When
+    // scan_new calls snapshot_known_recipients and the registry cannot be opened,
+    // it returns None (conservative fallback: treat all recipients as known), so
+    // an envelope addressed to a different recipient produces RecipientMismatch
+    // rather than RecipientNotFound.
+    #[test]
+    fn registry_open_failure_produces_recipient_mismatch_not_not_found() {
+        use crate::identity_registry::{IdentityRegistry, StoredIdentity};
+        use crate::ledger::{DeliveryLedger, ReplayLedger};
+
+        let reg_dir = crate::test_support::secure_dir();
+        let replay_dir = crate::test_support::secure_dir();
+        let delivery_dir = crate::test_support::secure_dir();
+        let audit_data_dir = tempdir().unwrap();
+        let inbox_data_dir = crate::test_support::secure_dir();
+
+        let registry = Arc::new(IdentityRegistry::open(reg_dir.keep()).unwrap());
+        let replay = Arc::new(ReplayLedger::open(replay_dir.keep()).unwrap());
+        let delivery = Arc::new(DeliveryLedger::open(delivery_dir.keep()).unwrap());
+        let audit = Arc::new(AuditLog::open(audit_data_dir.path().to_path_buf()).unwrap());
+
+        let keypair = reeve_types::Keypair::generate();
+        let identity =
+            reeve_types::Identity::new_operator("registry-fail-sender".to_owned()).unwrap();
+        let sender_id = identity.identity_id;
+        let key_record = reeve_types::KeyRecord::new(sender_id, *keypair.public()).unwrap();
+        let stored = StoredIdentity::new(identity, key_record.clone()).unwrap();
+        registry.write(&stored).unwrap();
+
+        let recipient_id = IdentityId::new().unwrap();
+        let layout = InboxLayout::open(inbox_data_dir.path().to_path_buf()).unwrap();
+        let inbox = layout.provision(recipient_id).unwrap();
+
+        // Point agent_registry_path at a non-existent file — open will fail.
+        let watcher = Watcher::new(
+            &registry,
+            &replay,
+            Arc::clone(&delivery),
+            Arc::clone(&audit),
+            PathBuf::from("/nonexistent/no-such-registry.toml"),
+        );
+
+        // Envelope addressed to a different identity than this inbox's agent.
+        let wrong_recipient = IdentityId::new().unwrap();
+        let (_, bytes) = crate::test_support::make_signed_envelope(
+            &keypair,
+            sender_id,
+            key_record.key_id,
+            wrong_recipient,
+        );
+        let path = inbox.new_dir().join("mismatch_fallback.json");
+        fs::write(&path, &bytes).unwrap();
+
+        // scan_new calls snapshot_known_recipients once; with a missing
+        // registry it returns None and treats all recipients as known.
+        let quarantined: Mutex<Vec<String>> = Mutex::new(Vec::new());
+        watcher
+            .scan_new(recipient_id, &inbox, &|reason| {
+                quarantined.lock().unwrap().push(reason);
+            })
+            .unwrap();
+
+        let reasons = quarantined.into_inner().unwrap();
+        assert_eq!(
+            reasons.len(),
+            1,
+            "expected one quarantine on registry failure"
+        );
+        assert!(
+            reasons[0].contains("recipient_mismatch"),
+            "expected RecipientMismatch on registry open failure, got {:?}",
+            reasons[0],
+        );
+    }
+
+    // W_p1: non-UTF-8 envelope body → Quarantined(BodyNotUtf8), file in quarantine/.
+    //
+    // Build a valid signed envelope whose body bytes are not valid UTF-8.
+    // process_file must quarantine it before delivery, not move it to cur/.
+    #[test]
+    fn non_utf8_body_quarantines_before_delivery() {
+        use crate::verify::QuarantineReason;
+        use reeve_transport::sign::sign_envelope;
+        use reeve_types::{
+            Envelope, EnvelopeSignature, MessageId, Nonce, PayloadHash, SchemaVersion,
+        };
+
+        let ctx = build_ctx();
+
+        // Register recipient_id so the envelope passes the recipient check.
+        register_in_ctx_registry(
+            &ctx,
+            "lead",
+            ctx.recipient_id,
+            ctx.inbox.root().to_path_buf(),
+        );
+
+        // Construct an envelope with a non-UTF-8 body.
+        let placeholder = EnvelopeSignature::from_bytes([0u8; reeve_types::SIGNATURE_LEN]);
+        let mut env = Envelope::new(
+            SchemaVersion::V1,
+            MessageId::new().unwrap(),
+            ctx.sender_id,
+            ctx.key_record.key_id,
+            ctx.recipient_id,
+            time::OffsetDateTime::now_utc(),
+            Nonce::from_bytes([0xAAu8; reeve_types::NONCE_LEN]),
+            PayloadHash::from_bytes([0xBBu8; reeve_types::PAYLOAD_HASH_LEN]),
+            // Invalid UTF-8: lone continuation byte.
+            vec![0x80u8, 0x81u8, 0x82u8],
+            placeholder,
+        );
+        let sig = sign_envelope(&env, ctx.keypair.private()).unwrap();
+        env.signature = sig;
+        let bytes = serde_json::to_vec(&env).unwrap();
+
+        let path = place_in_new(&ctx.inbox, "bad_body.json", &bytes);
+
+        let outcome = ctx
+            .watcher
+            .process_file(&path, ctx.recipient_id, &ctx.inbox, |_| true)
+            .unwrap();
+
+        assert!(
+            matches!(
+                outcome,
+                ProcessOutcome::Quarantined {
+                    reason: QuarantineReason::BodyNotUtf8
+                }
+            ),
+            "expected Quarantined(BodyNotUtf8), got {outcome:?}",
+        );
+        assert!(!path.exists(), "file should have left new/");
+        assert!(
+            !ctx.inbox.cur().join("bad_body.json").exists(),
+            "file must not be in cur/",
+        );
+        assert!(
+            ctx.inbox
+                .quarantine()
+                .join("bad_body.json.body_not_utf8")
+                .exists(),
+            "file must be in quarantine/ with body_not_utf8 suffix",
+        );
+        let lines = audit_lines(&ctx.audit_dir);
+        assert_eq!(lines.len(), 1, "expected one audit line");
+        assert_eq!(lines[0]["kind"], "transport.quarantine");
+        assert_eq!(lines[0]["reason"], "body_not_utf8");
+        assert!(
+            !ctx.watcher
+                .delivery
+                .contains(&DeliveryKey {
+                    recipient_id: ctx.recipient_id,
+                    message_id: env.message_id,
+                })
+                .unwrap(),
+            "delivery ledger must remain clean after BodyNotUtf8 quarantine",
+        );
+    }
+
+    // W_p2: scan_cur_and_dispatch skips a cur/ file whose envelope body is not
+    // valid UTF-8. read_cur_payload returns None for such files and logs a
+    // warning; no ProcessInbound is dispatched.
+    //
+    // The envelope is written directly to cur/ (bypassing process_file) to
+    // simulate the residual-risk scenario where a non-UTF-8 body arrives in
+    // cur/ without passing the guard in process_file.
+    #[test]
+    fn scan_cur_and_dispatch_skips_non_utf8_body_in_cur() {
+        use reeve_types::{
+            Envelope, EnvelopeSignature, MessageId, Nonce, PayloadHash, SchemaVersion,
+        };
+
+        let ctx = build_ctx();
+
+        // Build a valid envelope struct whose body bytes are not valid UTF-8.
+        // The envelope does not need a real signature: read_cur_payload only
+        // parses the JSON and checks the body encoding; it does not verify.
+        let placeholder_sig = EnvelopeSignature::from_bytes([0u8; reeve_types::SIGNATURE_LEN]);
+        let env = Envelope::new(
+            SchemaVersion::V1,
+            MessageId::new().unwrap(),
+            ctx.sender_id,
+            ctx.key_record.key_id,
+            ctx.recipient_id,
+            time::OffsetDateTime::now_utc(),
+            Nonce::from_bytes([0xAAu8; reeve_types::NONCE_LEN]),
+            PayloadHash::from_bytes([0xBBu8; reeve_types::PAYLOAD_HASH_LEN]),
+            vec![0x80u8, 0x81u8, 0x82u8],
+            placeholder_sig,
+        );
+        let bytes = serde_json::to_vec(&env).unwrap();
+        // Write the serialized envelope directly to cur/, bypassing process_file.
+        let cur_path = ctx.inbox.cur().join("non_utf8_body.json");
+        fs::write(&cur_path, &bytes).unwrap();
+
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(
+                CollectorField::Payload,
+                dispatched_clone,
+                Arc::new(Mutex::new(None)),
+            );
+
+            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+
+            actix::System::current().stop();
+        });
+
+        let got = dispatched.lock().unwrap();
+        assert_eq!(
+            got.len(),
+            0,
+            "non-UTF-8 body in cur/ must not be dispatched; got {got:?}",
+        );
+    }
+
+    // W_p3: scan_cur_and_dispatch skips a cur/ file whose envelope.recipient_id
+    // does not match the agent_id argument — defense-in-depth against stray
+    // files in cur/.
+    //
+    // The envelope is written directly to cur/ (bypassing process_file) to
+    // simulate a stray file landing there. No ProcessInbound must be dispatched.
+    #[test]
+    fn scan_cur_and_dispatch_skips_stray_recipient_id_mismatch() {
+        let ctx = build_ctx();
+
+        // A fresh identity that is NOT ctx.recipient_id — the stray recipient.
+        let stray_recipient = IdentityId::new().unwrap();
+        let (_, bytes) = crate::test_support::make_signed_envelope(
+            &ctx.keypair,
+            ctx.sender_id,
+            ctx.key_record.key_id,
+            stray_recipient,
+        );
+        // Write the envelope directly to cur/, bypassing process_file.
+        let cur_path = ctx.inbox.cur().join("stray.json");
+        fs::write(&cur_path, &bytes).unwrap();
+
+        let dispatched: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        actix::System::new().block_on(async move {
+            let recipient = make_collector(
+                CollectorField::Payload,
+                dispatched_clone,
+                Arc::new(Mutex::new(None)),
+            );
+
+            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+
+            actix::System::current().stop();
+        });
+
+        let got = dispatched.lock().unwrap();
+        assert_eq!(
+            got.len(),
+            0,
+            "stray envelope with mismatched recipient_id must not be dispatched",
         );
     }
 

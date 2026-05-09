@@ -73,6 +73,16 @@ pub struct WatchInbox {
     /// rejects an envelope to `quarantine/`. Use this to surface transport
     /// failures in the agent's conversation thread. `None` disables the hook.
     pub on_quarantine: Option<Box<dyn Fn(String) + Send + 'static>>,
+    /// The actor to which verified envelopes are dispatched after they are
+    /// moved to `cur/`. Non-optional: a [`WatchInbox`] message without a live
+    /// dispatch target is a programming error. This differs from
+    /// `on_quarantine`, which is an optional notification hook with different
+    /// semantics.
+    ///
+    /// The [`WatcherActor`] handler registers this recipient with
+    /// [`Watcher::register_route`] and performs a one-shot `cur/` scan for
+    /// crash-recovery before starting the `new/` watcher loop.
+    pub recipient: actix::Recipient<crate::agent::ProcessInbound>,
 }
 
 impl Message for WatchInbox {
@@ -263,8 +273,26 @@ impl Handler<WatchInbox> for WatcherActor {
         let watcher = Arc::clone(&self.watcher);
         let agent_id = msg.agent_id;
         let inbox = msg.inbox.clone();
-        self.inboxes.push(msg.inbox);
+        let recipient = msg.recipient.clone();
+        self.inboxes.push(msg.inbox.clone());
         let on_quarantine = msg.on_quarantine;
+
+        // Route must be registered before watcher.run starts. The run
+        // loop calls handle_deliver → dispatch_envelope, which consults
+        // the routing table; a message arriving before register_route is
+        // called is silently dropped.
+        watcher.register_route(agent_id, recipient.clone());
+
+        // scan_cur_and_dispatch reads the filesystem; move it off the actix
+        // thread so it doesn't block the async executor.
+        tokio::task::spawn_blocking({
+            let inbox = inbox.clone();
+            let recipient = recipient.clone();
+            move || {
+                Watcher::scan_cur_and_dispatch(&inbox, agent_id, &recipient);
+            }
+        });
+
         info!(inbox_root = %inbox.root().display(), "watcher started for inbox");
         tokio::task::spawn_blocking(move || {
             let cb = on_quarantine.unwrap_or_else(|| Box::new(|_| {}));
