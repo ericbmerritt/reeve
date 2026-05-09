@@ -20,9 +20,10 @@ use tracing::{debug, info};
 
 use crate::agent::Agent;
 use crate::agent_fs::AgentDirs;
+use crate::agent_registry::{AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName};
 use crate::audit::AuditLog;
 use crate::config::{install_defaults, load_persona_config, load_team_config};
-use crate::identity_registry::IdentityRegistry;
+use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
 use crate::model_resolution::{resolve_model, write_spawn_snapshot};
@@ -311,11 +312,11 @@ pub(crate) fn confirm_started(state_dir: &Path) -> Result<(), DaemonError> {
 
 // ── daemon_stop ───────────────────────────────────────────────────────────────
 
-/// Send SIGTERM to the running daemon and wait up to 5 seconds for it to exit.
+/// Send SIGTERM to the running daemon and wait up to [`STOP_TIMEOUT`] for it to exit.
 ///
 /// Returns [`DaemonError::NoRuntime`] when no daemon is running. Returns
 /// [`DaemonError::Signal`] when the kill command fails. Returns
-/// [`DaemonError::Timeout`] if the daemon does not exit within 5 seconds.
+/// [`DaemonError::Timeout`] if the daemon does not exit within [`STOP_TIMEOUT`].
 pub fn daemon_stop(state_dir: &Path) -> Result<(), DaemonError> {
     #[cfg(unix)]
     {
@@ -419,7 +420,7 @@ pub fn daemon_run(
     let (registry, replay, delivery, audit) = open_resources(data_dir)?;
     let watcher = Arc::new(Watcher::new(&registry, &replay, delivery, audit));
 
-    run_actor_system(state_dir, data_dir, watcher, adapter)?;
+    run_actor_system(state_dir, data_dir, &registry, watcher, adapter)?;
     info!("daemon stopping cleanly");
     Ok(())
 }
@@ -466,13 +467,26 @@ fn open_resources(data_dir: &Path) -> Result<Resources, DaemonError> {
 fn run_actor_system(
     state_dir: PathBuf,
     data_dir: &Path,
+    identity_registry: &Arc<IdentityRegistry>,
     watcher: Arc<Watcher>,
     adapter: &Arc<dyn reeve_adapter::Adapter>,
 ) -> Result<(), DaemonError> {
     // Prepare everything that can fail before entering the actix runtime.
     // Agent startup failures surface here with structured errors rather than
     // being swallowed inside block_on.
-    let startup = prepare_agent_startup(data_dir, watcher, adapter)?;
+    let agent_registry_path =
+        AgentRegistry::default_registry_path().map_err(|e| DaemonError::Resource {
+            component: "agent registry path",
+            source: Box::new(e),
+        })?;
+    let startup = prepare_agent_startup(
+        data_dir,
+        identity_registry,
+        watcher,
+        adapter,
+        agent_registry_path,
+    )?;
+    let agent_registry_path = startup.agent_registry_path.clone();
 
     #[cfg(unix)]
     {
@@ -528,6 +542,15 @@ fn run_actor_system(
         }
     }
 
+    // On clean shutdown, mark the lead agent as Stopped. Failure here is
+    // non-fatal: the registry will show Running at next startup and be
+    // corrected then.
+    if let Ok(mut registry) = AgentRegistry::open(agent_registry_path) {
+        if let Err(err) = registry.update_status("lead", AgentStatus::Stopped) {
+            tracing::warn!(err = %err, "failed to mark lead agent as Stopped on shutdown");
+        }
+    }
+
     Ok(())
 }
 
@@ -544,6 +567,8 @@ struct AgentStartup {
     system_prompt: String,
     inbox: AgentInbox,
     agent_id: reeve_types::IdentityId,
+    keypair: reeve_types::Keypair,
+    agent_registry_path: PathBuf,
     watcher: Arc<Watcher>,
 }
 
@@ -552,17 +577,23 @@ struct AgentStartup {
 ///
 /// None of this requires the actix runtime to be running, so errors can be
 /// propagated normally.
+#[expect(
+    clippy::too_many_lines,
+    reason = "splitting would obscure the linear dependency chain across startup steps"
+)]
 fn prepare_agent_startup(
     data_dir: &Path,
+    identity_registry: &Arc<IdentityRegistry>,
     watcher: Arc<Watcher>,
     adapter: &Arc<dyn reeve_adapter::Adapter>,
+    agent_registry_path: PathBuf,
 ) -> Result<AgentStartup, DaemonError> {
     // 1. Install default configs if they do not already exist.
     install_defaults(data_dir).map_err(|e| DaemonError::Resource {
         component: "config defaults",
         source: Box::new(e),
     })?;
-    debug!("installing default configs");
+    debug!("default configs ready");
 
     // 2. Load the default team config.
     let team_path = data_dir.join("teams").join("default.toml");
@@ -602,16 +633,118 @@ fn prepare_agent_startup(
         source: Box::new(e),
     })?;
 
-    // 6. Generate a transient identity for the lead agent's watcher slot.
-    //     The watcher uses this to key the ledger; for the walking skeleton a
-    //     fresh ID per boot is acceptable. A persistent agent-identity mapping
-    //     is a task for a later ladder.
-    //     Generated before the snapshot so the ID is recorded in agent.toml
-    //     for use by the TUI's envelope signing path.
-    let agent_id = reeve_types::IdentityId::new().map_err(|e| DaemonError::Resource {
-        component: "agent identity",
-        source: Box::new(e),
+    // 6. On first run mint a new identity and register it; on restart reuse the stored identity_id.
+    let keypair = crate::generate_or_load_keypair(&dirs.identity_key_path()).map_err(|e| {
+        DaemonError::Resource {
+            component: "agent keypair",
+            source: Box::new(e),
+        }
     })?;
+
+    let mut agent_registry =
+        AgentRegistry::open(agent_registry_path.clone()).map_err(|e| DaemonError::Resource {
+            component: "agent registry",
+            source: Box::new(e),
+        })?;
+
+    let agent_id = if let Some(record) = agent_registry.lookup("lead") {
+        let id = record.identity_id;
+        agent_registry
+            .update_status("lead", AgentStatus::Running)
+            .map_err(|e| DaemonError::Resource {
+                component: "agent registry update",
+                source: Box::new(e),
+            })?;
+        // Halt if the key file was replaced without updating the registry —
+        // proceeding would produce envelopes that fail signature verification
+        // at every counterparty.
+        match identity_registry.lookup(id) {
+            Ok(Some(stored)) => {
+                let key_records = stored.key_records();
+                let stored_key = &key_records
+                    .first()
+                    .ok_or_else(|| DaemonError::Resource {
+                        component: "identity registry lookup",
+                        source: Box::new(io::Error::other(
+                            "stored identity has no key records; registry may be corrupt",
+                        )),
+                    })?
+                    .public_key;
+                if keypair.public() != stored_key {
+                    return Err(DaemonError::Resource {
+                        component: "keypair mismatch",
+                        source: Box::new(io::Error::other(
+                            "on-disk identity.key does not match stored public key; \
+                             restore the correct key file or re-register the agent",
+                        )),
+                    });
+                }
+            }
+            Ok(None) => {
+                return Err(DaemonError::Resource {
+                    component: "identity registry lookup",
+                    source: Box::new(io::Error::other(
+                        "agent_id found in agent registry but no entry in identity registry",
+                    )),
+                });
+            }
+            Err(err) => {
+                return Err(DaemonError::Resource {
+                    component: "identity registry lookup",
+                    source: Box::new(err),
+                });
+            }
+        }
+        debug!(agent_id = %id, "reusing existing lead identity");
+        id
+    } else {
+        // Bootstrap: no operator identity exists yet. Use new_operator so
+        // created_by is None — there is no prior identity to reference, and
+        // a dangling foreign key would corrupt the registry.
+        let identity = reeve_types::Identity::new_operator(lead_member.persona_name.clone())
+            .map_err(|e| DaemonError::Resource {
+                component: "agent identity",
+                source: Box::new(e),
+            })?;
+        let agent_id = identity.identity_id;
+        let public_key = *keypair.public();
+        let key_record = reeve_types::KeyRecord::new(agent_id, public_key).map_err(|e| {
+            DaemonError::Resource {
+                component: "key record",
+                source: Box::new(e),
+            }
+        })?;
+        let stored =
+            StoredIdentity::new(identity, key_record).map_err(|e| DaemonError::Resource {
+                component: "stored identity",
+                source: Box::new(e),
+            })?;
+        identity_registry
+            .write(&stored)
+            .map_err(|e| DaemonError::Resource {
+                component: "identity registry write",
+                source: Box::new(e),
+            })?;
+        let lead_name = ValidatedAgentName::new("lead").map_err(|e| DaemonError::Resource {
+            component: "lead agent name",
+            source: Box::new(e),
+        })?;
+        agent_registry
+            .register(AgentRecord {
+                name: lead_name,
+                identity_id: agent_id,
+                inbox_dir: dirs.inbox_root(),
+                persona_name: Some(lead_member.persona_name.clone()),
+                spawned_at: time::OffsetDateTime::now_utc(),
+                status: AgentStatus::Running,
+            })
+            .map_err(|e| DaemonError::Resource {
+                component: "agent registry register",
+                source: Box::new(e),
+            })?;
+        debug!(agent_id = %agent_id, "registered new lead identity");
+        agent_id
+    };
 
     // 7. Resolve the model adapter against this persona's preferences.
     let mut snapshot =
@@ -634,8 +767,6 @@ fn prepare_agent_startup(
 
     let system_prompt = persona_config.system_prompt.clone();
 
-    // Agent::new is deferred to launch_actors so it can take Recipient<InvokeTool>
-    // handles to tool actors started inside the actix runtime.
     Ok(AgentStartup {
         adapter: Arc::clone(adapter),
         dirs,
@@ -643,6 +774,8 @@ fn prepare_agent_startup(
         system_prompt,
         inbox,
         agent_id,
+        keypair,
+        agent_registry_path,
         watcher,
     })
 }
@@ -660,15 +793,14 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
         system_prompt,
         inbox,
         agent_id,
+        keypair,
+        agent_registry_path: _agent_registry_path,
         watcher,
     } = startup;
 
     // HeartbeatActor: touches the heartbeat file every second.
     actix::Supervisor::start(move |_| HeartbeatActor::new(state_dir));
 
-    // EchoTool: temporary tool used to validate the agent's tool execution
-    // loop end-to-end. Replaced by spawn_agent / send_message in subsequent
-    // multi-agent ladder phases.
     let echo_addr = crate::tool::EchoTool.start();
     let tools: Vec<(
         reeve_adapter::Tool,
@@ -677,13 +809,19 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
 
     // Agent: processes inbound envelopes via the model adapter and the tool
     // execution loop.
-    let lead_agent =
-        Agent::new(adapter, &dirs, snapshot, system_prompt, agent_id, tools).map_err(|e| {
-            DaemonError::Resource {
-                component: "lead agent",
-                source: Box::new(e),
-            }
-        })?;
+    let lead_agent = Agent::new(
+        adapter,
+        &dirs,
+        snapshot,
+        system_prompt,
+        agent_id,
+        keypair,
+        tools,
+    )
+    .map_err(|e| DaemonError::Resource {
+        component: "lead agent",
+        source: Box::new(e),
+    })?;
     let lead_addr = actix::Supervisor::start(move |_| lead_agent);
 
     // WatcherActor: watches the lead inbox and dispatches verified messages.
@@ -712,6 +850,7 @@ mod tests {
     #[cfg(unix)]
     use super::wait_for_exit;
     use super::{confirm_started, daemon_status, prepare_agent_startup, DaemonError, DaemonStatus};
+    use crate::agent_registry::tests::registry_path_for_data_dir;
     use crate::audit::AuditLog;
     use crate::identity_registry::IdentityRegistry;
     use crate::ledger::{DeliveryLedger, ReplayLedger};
@@ -900,12 +1039,13 @@ mod tests {
         }
     }
 
-    fn build_test_watcher(data_dir: &Path) -> Arc<Watcher> {
+    fn build_test_resources(data_dir: &Path) -> (Arc<IdentityRegistry>, Arc<Watcher>) {
         let registry = Arc::new(IdentityRegistry::open(data_dir.to_path_buf()).unwrap());
         let replay = Arc::new(ReplayLedger::open(data_dir.to_path_buf()).unwrap());
         let delivery = Arc::new(DeliveryLedger::open(data_dir.to_path_buf()).unwrap());
         let audit = Arc::new(AuditLog::open(data_dir.to_path_buf()).unwrap());
-        Arc::new(Watcher::new(&registry, &replay, delivery, audit))
+        let watcher = Arc::new(Watcher::new(&registry, &replay, delivery, audit));
+        (registry, watcher)
     }
 
     // A1: prepare_agent_startup succeeds with default configs and a matching adapter.
@@ -913,10 +1053,17 @@ mod tests {
     fn prepare_agent_startup_succeeds_with_defaults_and_matching_adapter() {
         let tmp = crate::test_support::secure_dir();
         let data_dir = tmp.path().to_path_buf();
-        let watcher = build_test_watcher(&data_dir);
+        let agent_registry_path = registry_path_for_data_dir(&data_dir);
+        let (identity_registry, watcher) = build_test_resources(&data_dir);
         let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(MockOpusAdapter);
 
-        let result = prepare_agent_startup(&data_dir, watcher, &adapter);
+        let result = prepare_agent_startup(
+            &data_dir,
+            &identity_registry,
+            watcher,
+            &adapter,
+            agent_registry_path,
+        );
         assert!(
             result.is_ok(),
             "prepare_agent_startup should succeed with defaults; got: {:?}",
@@ -953,10 +1100,17 @@ mod tests {
 
         let tmp = crate::test_support::secure_dir();
         let data_dir = tmp.path().to_path_buf();
-        let watcher = build_test_watcher(&data_dir);
+        let agent_registry_path = registry_path_for_data_dir(&data_dir);
+        let (identity_registry, watcher) = build_test_resources(&data_dir);
         let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(WrongAdapter);
 
-        let result = prepare_agent_startup(&data_dir, watcher, &adapter);
+        let result = prepare_agent_startup(
+            &data_dir,
+            &identity_registry,
+            watcher,
+            &adapter,
+            agent_registry_path,
+        );
         let is_model_resolution_err = matches!(
             result,
             Err(DaemonError::Resource {
@@ -967,6 +1121,132 @@ mod tests {
         assert!(
             is_model_resolution_err,
             "expected Resource model resolution error"
+        );
+    }
+
+    // A3: prepare_agent_startup produces the same agent_id and keypair across two
+    // calls against the same data directory (durable identity).
+    #[test]
+    fn prepare_agent_startup_uses_stable_identity_across_calls() {
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(MockOpusAdapter);
+
+        let (identity_registry1, watcher1) = build_test_resources(&data_dir);
+        let first = prepare_agent_startup(
+            &data_dir,
+            &identity_registry1,
+            watcher1,
+            &adapter,
+            registry_path_for_data_dir(&data_dir),
+        )
+        .expect("first prepare_agent_startup should succeed");
+        let first_id = first.agent_id;
+        let first_public = *first.keypair.public();
+
+        let (identity_registry2, watcher2) = build_test_resources(&data_dir);
+        let second = prepare_agent_startup(
+            &data_dir,
+            &identity_registry2,
+            watcher2,
+            &adapter,
+            registry_path_for_data_dir(&data_dir),
+        )
+        .expect("second prepare_agent_startup should succeed");
+
+        assert_eq!(
+            first_id, second.agent_id,
+            "agent_id must be stable across restarts"
+        );
+        assert_eq!(
+            first_public,
+            *second.keypair.public(),
+            "keypair public key must be stable across restarts"
+        );
+
+        // The identity registry must contain exactly one entry for agent_id
+        // after the second call — no duplication.
+        let stored = identity_registry2
+            .lookup(second.agent_id)
+            .expect("identity registry lookup must not fail")
+            .expect("identity registry must contain the agent_id after second call");
+        assert_eq!(
+            stored.identity().identity_id,
+            second.agent_id,
+            "stored identity id must match agent_id"
+        );
+        let all = identity_registry2
+            .list()
+            .expect("identity registry list must not fail");
+        assert_eq!(
+            all.len(),
+            1,
+            "identity registry must have exactly one entry, not duplicated; got: {all:?}"
+        );
+
+        // The agent registry must show the lead record with status Running
+        // after the second call.
+        let agent_registry =
+            crate::agent_registry::AgentRegistry::open(registry_path_for_data_dir(&data_dir))
+                .unwrap();
+        let record = agent_registry
+            .lookup("lead")
+            .expect("lead record must be present in agent registry after second call");
+        assert_eq!(
+            record.status,
+            crate::agent_registry::AgentStatus::Running,
+            "lead agent status must be Running after second prepare_agent_startup"
+        );
+    }
+
+    // A4: When the on-disk keypair does not match the identity-registry public key,
+    // prepare_agent_startup must return a Resource("keypair mismatch") error.
+    // This exercises the mismatch branch at the keypair-verification step.
+    #[test]
+    fn prepare_agent_startup_rejects_mismatched_keypair() {
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(MockOpusAdapter);
+
+        // First call: establishes identity and writes the keypair file.
+        let (identity_registry1, watcher1) = build_test_resources(&data_dir);
+        let first = prepare_agent_startup(
+            &data_dir,
+            &identity_registry1,
+            watcher1,
+            &adapter,
+            registry_path_for_data_dir(&data_dir),
+        )
+        .expect("first call should succeed");
+
+        // Overwrite the keypair file with a freshly generated keypair so that
+        // the on-disk key no longer matches the identity-registry entry.
+        let new_keypair = reeve_types::Keypair::generate();
+        let key_path = first.dirs.identity_key_path();
+        let seed = new_keypair.private().to_seed_bytes();
+        // Direct write simulates out-of-band key replacement (e.g. manual restore
+        // from backup) without going through generate_or_load_keypair.
+        fs::write(&key_path, seed.as_ref()).expect("overwrite keypair file");
+
+        // Second call: must detect the mismatch and return an error.
+        let (identity_registry2, watcher2) = build_test_resources(&data_dir);
+        let result = prepare_agent_startup(
+            &data_dir,
+            &identity_registry2,
+            watcher2,
+            &adapter,
+            registry_path_for_data_dir(&data_dir),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(DaemonError::Resource {
+                    component: "keypair mismatch",
+                    ..
+                })
+            ),
+            "mismatched keypair must produce Resource(keypair mismatch); got: {:?}",
+            result.err().map(|e| e.to_string())
         );
     }
 }
