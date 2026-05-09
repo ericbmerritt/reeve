@@ -34,42 +34,18 @@ use crate::ValidatedAgentName;
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
-/// Errors returned by [`SpawnRequest::new`] when the caller-supplied fields
-/// fail invariant checks before the message is enqueued.
+/// Errors returned by [`SpawnRequest::validate`] when the caller-supplied
+/// fields fail invariant checks before the message is enqueued.
 #[derive(Debug)]
 pub enum SpawnRequestError {
     /// `persona_name` did not pass [`ValidatedAgentName`] validation.
     InvalidPersonaName(AgentRegistryError),
-    /// `display_name` was empty or whitespace-only.
-    EmptyDisplayName,
-    /// `display_name` exceeded the maximum allowed byte length.
-    DisplayNameTooLong {
-        /// Maximum allowed byte length.
-        max: usize,
-        /// Actual byte length of the rejected value.
-        actual: usize,
-    },
-    /// `display_name` contained a control character.
-    InvalidDisplayName {
-        /// Human-readable description of the violation.
-        reason: &'static str,
-    },
 }
 
 impl fmt::Display for SpawnRequestError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidPersonaName(err) => write!(f, "invalid persona name: {err}"),
-            Self::EmptyDisplayName => f.write_str("display_name must not be empty"),
-            Self::DisplayNameTooLong { max, actual } => {
-                write!(
-                    f,
-                    "display_name exceeds maximum length of {max} bytes (actual: {actual})"
-                )
-            }
-            Self::InvalidDisplayName { reason } => {
-                write!(f, "display_name is invalid: {reason}")
-            }
         }
     }
 }
@@ -78,78 +54,92 @@ impl std::error::Error for SpawnRequestError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::InvalidPersonaName(err) => Some(err),
-            Self::EmptyDisplayName
-            | Self::DisplayNameTooLong { .. }
-            | Self::InvalidDisplayName { .. } => None,
         }
     }
 }
 
-/// Maximum byte length accepted for `display_name`.
-const MAX_DISPLAY_NAME_LEN: usize = 256;
-
 /// Directory name under `data_dir` where persona configs are stored.
 const PERSONAS_DIR: &str = "personas";
 
+/// Pre-validated parameters for a spawn request, not yet bound to a reply
+/// recipient.
+///
+/// Produced by [`SpawnRequest::validate`]; consumed by [`SpawnRequest::new`].
+/// Separating validation from construction allows the relay actor — which
+/// carries the reply recipient — to be created only after all field invariants
+/// have passed.
+pub(crate) struct ValidatedSpawnParams {
+    persona_name: ValidatedAgentName,
+    system_prompt: String,
+    sender_id: IdentityId,
+}
+
+impl ValidatedSpawnParams {
+    /// The normalized system prompt (leading/trailing whitespace trimmed).
+    #[cfg(test)]
+    pub(crate) fn system_prompt(&self) -> &str {
+        &self.system_prompt
+    }
+}
+
 /// Request to provision and start a new subordinate agent.
 ///
-/// All fields are private; [`SpawnRequest::new`] is the only construction path.
-/// Invariants — non-empty `persona_name`, non-empty/not-too-long `display_name`
-/// — are checked once at the message boundary so the handler never re-validates.
+/// Construction is a two-step process:
+///
+/// 1. [`SpawnRequest::validate`] — checks all fields except `reply_to`; returns
+///    a [`ValidatedSpawnParams`] on success.
+/// 2. [`SpawnRequest::new`] — infallible; attaches a relay recipient to the
+///    validated params.
+///
+/// This split ensures the relay actor (which starts a timeout timer) is created
+/// only after all invariants pass, preventing timer leaks on validation failure.
 /// The outcome arrives on `reply_to` as a [`SpawnResponse`].
 pub struct SpawnRequest {
     persona_name: ValidatedAgentName,
-    display_name: String,
     system_prompt: String,
     sender_id: IdentityId,
     reply_to: actix::Recipient<SpawnResponse>,
 }
 
 impl SpawnRequest {
-    /// Construct a [`SpawnRequest`], validating `persona_name` and
-    /// `display_name` at the message boundary.
+    /// Validate `persona_name`, `system_prompt`, and `sender_id` at the message
+    /// boundary, returning a [`ValidatedSpawnParams`] on success.
     ///
-    /// Returns [`SpawnRequestError`] when either field fails its invariant.
-    pub fn new(
+    /// Does not start any relay actor or timer. Call [`SpawnRequest::new`] to
+    /// attach the reply recipient after creating the relay.
+    pub(crate) fn validate(
         persona_name: &str,
-        display_name: &str,
         system_prompt: &str,
         sender_id: IdentityId,
-        reply_to: actix::Recipient<SpawnResponse>,
-    ) -> Result<Self, SpawnRequestError> {
+    ) -> Result<ValidatedSpawnParams, SpawnRequestError> {
         let persona_name =
             ValidatedAgentName::new(persona_name).map_err(SpawnRequestError::InvalidPersonaName)?;
-        let display_name = display_name.trim().to_owned();
-        if display_name.is_empty() {
-            return Err(SpawnRequestError::EmptyDisplayName);
-        }
-        if display_name.len() > MAX_DISPLAY_NAME_LEN {
-            return Err(SpawnRequestError::DisplayNameTooLong {
-                max: MAX_DISPLAY_NAME_LEN,
-                actual: display_name.len(),
-            });
-        }
-        if display_name.chars().any(char::is_control) {
-            return Err(SpawnRequestError::InvalidDisplayName {
-                reason: "display_name must not contain control characters",
-            });
-        }
         let system_prompt = system_prompt.trim().to_owned();
-        Ok(Self {
+        Ok(ValidatedSpawnParams {
             persona_name,
-            display_name,
             system_prompt,
             sender_id,
-            reply_to,
         })
+    }
+
+    /// Attach a reply recipient to a [`ValidatedSpawnParams`], producing a
+    /// [`SpawnRequest`] ready to send to the coordinator.
+    ///
+    /// Infallible — all field invariants were enforced in [`SpawnRequest::validate`].
+    pub(crate) fn new(
+        params: ValidatedSpawnParams,
+        reply_to: actix::Recipient<SpawnResponse>,
+    ) -> Self {
+        Self {
+            persona_name: params.persona_name,
+            system_prompt: params.system_prompt,
+            sender_id: params.sender_id,
+            reply_to,
+        }
     }
 
     pub fn persona_name(&self) -> &ValidatedAgentName {
         &self.persona_name
-    }
-
-    pub fn display_name(&self) -> &str {
-        &self.display_name
     }
 
     pub fn system_prompt(&self) -> &str {
@@ -267,7 +257,6 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
     fn handle(&mut self, msg: SpawnRequest, _ctx: &mut actix::Context<Self>) {
         let SpawnRequest {
             persona_name,
-            display_name,
             system_prompt,
             sender_id,
             reply_to,
@@ -284,6 +273,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
                 acc
             });
         let agent_name_str = format!("{persona_name_str}-{suffix}");
+        let derived_display_name = agent_name_str.clone();
         let validated_name = match ValidatedAgentName::new(&agent_name_str) {
             Ok(n) => n,
             Err(err) => {
@@ -341,7 +331,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             }
         };
 
-        let identity = match Identity::new_agent(display_name, sender_id) {
+        let identity = match Identity::new_agent(derived_display_name, sender_id) {
             Ok(id) => id,
             Err(err) => {
                 error_reply(&reply_to, format!("failed to create agent identity: {err}"));
@@ -474,34 +464,16 @@ mod tests {
     use crate::agent_registry::{AgentRegistry, AgentStatus};
     use crate::identity_registry::IdentityRegistry;
     use crate::supervisor::WatchInbox;
-    use crate::test_support::{build_registries, secure_dir, MockAdapter};
+    use crate::test_support::{
+        build_registries, secure_dir, MockAdapter, NullInboxStarter, ResponseCapture,
+    };
     use crate::watcher::Watcher;
     use reeve_types::IdentityId;
-
-    // ── Stub actors ───────────────────────────────────────────────────────────
-
-    /// No-op inbox-starter stub that prevents the tokio runtime from blocking on shutdown.
-    struct NullInboxStarter;
-
-    impl Actor for NullInboxStarter {
-        type Context = actix::Context<Self>;
-    }
-
-    impl actix::Handler<WatchInbox> for NullInboxStarter {
-        type Result = ();
-
-        fn handle(&mut self, _msg: WatchInbox, _ctx: &mut actix::Context<Self>) {}
-    }
 
     // ── Fixture helpers ───────────────────────────────────────────────────────
 
     fn write_minimal_persona(data_dir: &std::path::Path, persona_name: &str) {
-        let persona_dir = data_dir.join("personas").join(persona_name);
-        std::fs::create_dir_all(&persona_dir).unwrap();
-        let config = format!(
-            "name = \"{persona_name}\"\nsystem_prompt = \"Be helpful.\"\nmodel_preferences = [\"claude-opus-4-7\"]\n"
-        );
-        std::fs::write(persona_dir.join("config.toml"), config).unwrap();
+        crate::test_support::write_persona_config(data_dir, persona_name, "claude-opus-4-7");
     }
 
     fn build_coordinator(
@@ -534,24 +506,6 @@ mod tests {
             .expect("SpawnResponse sender dropped without sending")
     }
 
-    struct ResponseCapture {
-        tx: Option<oneshot::Sender<SpawnResponse>>,
-    }
-
-    impl Actor for ResponseCapture {
-        type Context = actix::Context<Self>;
-    }
-
-    impl actix::Handler<SpawnResponse> for ResponseCapture {
-        type Result = ();
-
-        fn handle(&mut self, msg: SpawnResponse, _ctx: &mut actix::Context<Self>) {
-            if let Some(tx) = self.tx.take() {
-                let _ = tx.send(msg);
-            }
-        }
-    }
-
     // ── SC1: persona not found ────────────────────────────────────────────────
 
     /// No agent directories should be created under `data_dir/agents/`.
@@ -580,16 +534,10 @@ mod tests {
             );
             let coord_addr = coordinator.start();
 
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "nonexistent",
-                    "Test Agent",
-                    "You are a test agent.",
-                    sender_id,
-                    capture_addr.recipient(),
-                )
-                .unwrap(),
-            );
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("nonexistent", "You are a test agent.", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
 
             let resp = collect_response(rx).await;
             *response_outer.lock().unwrap() = Some(resp);
@@ -646,16 +594,10 @@ mod tests {
             );
             let coord_addr = coordinator.start();
 
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "test",
-                    "Test Agent",
-                    "You are a test agent.",
-                    sender_id,
-                    capture_addr.recipient(),
-                )
-                .unwrap(),
-            );
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", "You are a test agent.", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
 
             let resp = collect_response(rx).await;
             *response_outer.lock().unwrap() = Some(resp);
@@ -731,26 +673,14 @@ mod tests {
             );
             let coord_addr = coordinator.start();
 
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "test",
-                    "Agent One",
-                    "First agent.",
-                    sender_id,
-                    capture1.recipient(),
-                )
-                .unwrap(),
-            );
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "test",
-                    "Agent Two",
-                    "Second agent.",
-                    sender_id,
-                    capture2.recipient(),
-                )
-                .unwrap(),
-            );
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", "First agent.", sender_id).unwrap(),
+                capture1.recipient(),
+            ));
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", "Second agent.", sender_id).unwrap(),
+                capture2.recipient(),
+            ));
 
             let r1 = collect_response(rx1).await;
             let r2 = collect_response(rx2).await;
@@ -797,17 +727,7 @@ mod tests {
         let invalid_names: &[&str] = &["../escape", "", "name/with/slash", ".."];
         for &bad_name in invalid_names {
             let dummy_id = IdentityId::new().unwrap();
-            let result = actix::System::new().block_on(async {
-                let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-                let capture = ResponseCapture { tx: Some(tx) }.start();
-                SpawnRequest::new(
-                    bad_name,
-                    "Test Agent",
-                    "irrelevant",
-                    dummy_id,
-                    capture.recipient(),
-                )
-            });
+            let result = SpawnRequest::validate(bad_name, "irrelevant", dummy_id);
             assert!(
                 matches!(result, Err(SpawnRequestError::InvalidPersonaName(_))),
                 "expected Err(InvalidPersonaName) for invalid persona_name '{bad_name}'",
@@ -856,16 +776,10 @@ mod tests {
             );
             let coord_addr = coordinator.start();
 
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "test",
-                    "Orphan Test",
-                    "irrelevant",
-                    sender_id,
-                    capture_addr.recipient(),
-                )
-                .unwrap(),
-            );
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", "irrelevant", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
 
             let resp = collect_response(rx).await;
             *response_outer.lock().unwrap() = Some(resp);
@@ -925,16 +839,10 @@ mod tests {
             );
             let coord_addr = coordinator.start();
 
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "test",
-                    "Test Agent",
-                    "irrelevant",
-                    sender_id,
-                    capture_addr.recipient(),
-                )
-                .unwrap(),
-            );
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", "irrelevant", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
 
             let resp = collect_response(rx).await;
             *response_outer.lock().unwrap() = Some(resp);
@@ -948,153 +856,17 @@ mod tests {
         );
     }
 
-    // ── SC7: whitespace-only display_name returns failure ─────────────────────
-
-    #[test]
-    fn empty_display_name_returns_failure() {
-        let dummy_id = IdentityId::new().unwrap();
-        let result = actix::System::new().block_on(async {
-            let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-            let capture = ResponseCapture { tx: Some(tx) }.start();
-            SpawnRequest::new(
-                "valid-persona",
-                "   ",
-                "irrelevant",
-                dummy_id,
-                capture.recipient(),
-            )
-        });
-        assert!(
-            matches!(result, Err(SpawnRequestError::EmptyDisplayName)),
-            "expected Err(EmptyDisplayName) for whitespace-only display_name",
-        );
-    }
-
     // ── SC7b: whitespace-only system_prompt is normalized to empty string ────────
 
     #[test]
     fn whitespace_only_system_prompt_is_normalized() {
         let dummy_id = IdentityId::new().unwrap();
-        let result = actix::System::new().block_on(async {
-            let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-            let capture = ResponseCapture { tx: Some(tx) }.start();
-            SpawnRequest::new(
-                "valid-persona",
-                "Test Agent",
-                "   ",
-                dummy_id,
-                capture.recipient(),
-            )
-        });
-        let req = result.expect("whitespace-only system_prompt must not fail validation");
+        let params = SpawnRequest::validate("valid-persona", "   ", dummy_id)
+            .expect("whitespace-only system_prompt must not fail validation");
         assert_eq!(
-            req.system_prompt(),
+            params.system_prompt(),
             "",
             "whitespace-only system_prompt must be normalized to empty string",
-        );
-    }
-
-    // ── SC8: display_name byte-length boundary ────────────────────────────────
-
-    #[test]
-    fn display_name_at_max_len_is_accepted() {
-        let dummy_id = IdentityId::new().unwrap();
-        let name_256 = "a".repeat(256);
-        assert_eq!(name_256.len(), 256);
-        let result = actix::System::new().block_on(async {
-            let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-            let capture = ResponseCapture { tx: Some(tx) }.start();
-            SpawnRequest::new(
-                "valid-persona",
-                &name_256,
-                "irrelevant",
-                dummy_id,
-                capture.recipient(),
-            )
-        });
-        assert!(
-            result.is_ok(),
-            "display_name of exactly 256 bytes must be accepted",
-        );
-    }
-
-    #[test]
-    fn display_name_one_over_max_len_is_rejected() {
-        let dummy_id = IdentityId::new().unwrap();
-        let name_257 = "a".repeat(257);
-        assert_eq!(name_257.len(), 257);
-        let result = actix::System::new().block_on(async {
-            let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-            let capture = ResponseCapture { tx: Some(tx) }.start();
-            SpawnRequest::new(
-                "valid-persona",
-                &name_257,
-                "irrelevant",
-                dummy_id,
-                capture.recipient(),
-            )
-        });
-        assert!(
-            matches!(
-                result,
-                Err(SpawnRequestError::DisplayNameTooLong {
-                    max: 256,
-                    actual: 257
-                })
-            ),
-            "display_name of 257 bytes must be rejected with DisplayNameTooLong {{ max: 256, actual: 257 }}",
-        );
-    }
-
-    #[test]
-    fn display_name_multibyte_boundary() {
-        // "é" is 2 bytes in UTF-8.
-        // 254 ASCII bytes + "é" (2 bytes) = 256 bytes total — should pass.
-        let name_256_multibyte = "a".repeat(254) + "é";
-        assert_eq!(name_256_multibyte.len(), 256, "fixture must be 256 bytes");
-
-        // 255 ASCII bytes + "é" (2 bytes) = 257 bytes total — should fail.
-        let name_257_multibyte = "a".repeat(255) + "é";
-        assert_eq!(name_257_multibyte.len(), 257, "fixture must be 257 bytes");
-
-        let dummy_id = IdentityId::new().unwrap();
-        let ok = actix::System::new().block_on(async {
-            let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-            let capture = ResponseCapture { tx: Some(tx) }.start();
-            SpawnRequest::new(
-                "valid-persona",
-                &name_256_multibyte,
-                "irrelevant",
-                dummy_id,
-                capture.recipient(),
-            )
-        });
-        assert!(
-            ok.is_ok(),
-            "256-byte multibyte display_name must be accepted"
-        );
-
-        let dummy_id2 = IdentityId::new().unwrap();
-        let err = actix::System::new().block_on(async {
-            let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-            let capture = ResponseCapture { tx: Some(tx) }.start();
-            SpawnRequest::new(
-                "valid-persona",
-                &name_257_multibyte,
-                "irrelevant",
-                dummy_id2,
-                capture.recipient(),
-            )
-        });
-        assert!(
-            matches!(
-                err,
-                Err(SpawnRequestError::DisplayNameTooLong {
-                    max: 256,
-                    actual: 257
-                })
-            ),
-            "257-byte multibyte display_name must be rejected",
         );
     }
 
@@ -1151,16 +923,10 @@ mod tests {
             );
             let coord_addr = coordinator.start();
 
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "unmatchable",
-                    "Unmatchable Agent",
-                    "irrelevant",
-                    sender_id,
-                    capture_addr.recipient(),
-                )
-                .unwrap(),
-            );
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("unmatchable", "irrelevant", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
 
             let resp = collect_response(rx).await;
             *response_outer.lock().unwrap() = Some(resp);
@@ -1194,35 +960,6 @@ mod tests {
             agents_before + 1,
             "one orphan agent registry record expected: written before resolve_model fails",
         );
-    }
-
-    // ── SC11: display_name control char is rejected at the message boundary ────
-
-    #[test]
-    fn spawn_display_name_rejects_control_char() {
-        let dummy_id = IdentityId::new().unwrap();
-        let control_char_cases: &[(&str, &str)] = &[
-            ("newline", "Agent\nName"),
-            ("carriage return", "Agent\rName"),
-            ("escape", "Agent\x1bName"),
-        ];
-        for &(label, bad_name) in control_char_cases {
-            let result = actix::System::new().block_on(async {
-                let (tx, _rx) = oneshot::channel::<SpawnResponse>();
-                let capture = ResponseCapture { tx: Some(tx) }.start();
-                SpawnRequest::new(
-                    "valid-persona",
-                    bad_name,
-                    "irrelevant",
-                    dummy_id,
-                    capture.recipient(),
-                )
-            });
-            assert!(
-                matches!(result, Err(SpawnRequestError::InvalidDisplayName { .. })),
-                "expected Err(InvalidDisplayName) for display_name with {label}",
-            );
-        }
     }
 
     // ── SC12: identity_registry write failure returns SpawnResponse::Failure ───
@@ -1270,16 +1007,10 @@ mod tests {
             );
             let coord_addr = coordinator.start();
 
-            coord_addr.do_send(
-                SpawnRequest::new(
-                    "test",
-                    "Test Agent",
-                    "irrelevant",
-                    sender_id,
-                    capture_addr.recipient(),
-                )
-                .unwrap(),
-            );
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", "irrelevant", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
 
             let resp = collect_response(rx).await;
             *response_outer.lock().unwrap() = Some(resp);

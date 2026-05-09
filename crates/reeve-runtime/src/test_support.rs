@@ -155,6 +155,149 @@ impl reeve_adapter::Adapter for MockAdapter {
     }
 }
 
+// ── ToolResultCapture ─────────────────────────────────────────────────────────
+
+/// One-shot capture actor: receives exactly one [`crate::tool::ToolResult`] and
+/// forwards it through a tokio oneshot sender.
+pub(crate) struct ToolResultCapture {
+    pub(crate) tx: Option<tokio::sync::oneshot::Sender<crate::tool::ToolResult>>,
+}
+
+impl actix::Actor for ToolResultCapture {
+    type Context = actix::Context<Self>;
+}
+
+impl actix::Handler<crate::tool::ToolResult> for ToolResultCapture {
+    type Result = ();
+
+    fn handle(&mut self, msg: crate::tool::ToolResult, _ctx: &mut actix::Context<Self>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
+// ── Mock spawn coordinator ────────────────────────────────────────────────────
+
+/// Test stub for [`crate::spawn_coordinator::SpawnCoordinator`].
+///
+/// Accepts [`crate::spawn_coordinator::SpawnRequest`] and always replies with
+/// [`crate::spawn_coordinator::SpawnResponse::Success`] using the fixed agent
+/// name `"mock-agent"`. Used in tool and agent tests that need a coordinator
+/// in the actor tree without exercising the full provisioning sequence.
+pub(crate) struct MockSpawnCoordinator;
+
+impl actix::Actor for MockSpawnCoordinator {
+    type Context = actix::Context<Self>;
+}
+
+impl actix::Handler<crate::spawn_coordinator::SpawnRequest> for MockSpawnCoordinator {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        msg: crate::spawn_coordinator::SpawnRequest,
+        _ctx: &mut actix::Context<Self>,
+    ) {
+        let id = IdentityId::new().unwrap();
+        msg.reply_to()
+            .do_send(crate::spawn_coordinator::SpawnResponse::Success {
+                agent_name: "mock-agent".to_owned(),
+                agent_id: id,
+            });
+    }
+}
+
+/// One-shot capture actor: receives exactly one
+/// [`crate::spawn_coordinator::SpawnResponse`] and forwards it through a tokio
+/// oneshot sender.
+pub(crate) struct ResponseCapture {
+    pub(crate) tx: Option<tokio::sync::oneshot::Sender<crate::spawn_coordinator::SpawnResponse>>,
+}
+
+impl actix::Actor for ResponseCapture {
+    type Context = actix::Context<Self>;
+}
+
+impl actix::Handler<crate::spawn_coordinator::SpawnResponse> for ResponseCapture {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        msg: crate::spawn_coordinator::SpawnResponse,
+        _ctx: &mut actix::Context<Self>,
+    ) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(msg);
+        }
+    }
+}
+
+/// Capturing coordinator: accepts [`crate::spawn_coordinator::SpawnRequest`],
+/// stores the `system_prompt` into a shared slot, and replies `Success`.
+///
+/// Used in `T_SA7` to verify the `task`+`context` composition without requiring
+/// the full provisioning sequence.
+pub(crate) struct CapturingSpawnCoordinator {
+    pub(crate) last_system_prompt: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+impl actix::Actor for CapturingSpawnCoordinator {
+    type Context = actix::Context<Self>;
+}
+
+impl actix::Handler<crate::spawn_coordinator::SpawnRequest> for CapturingSpawnCoordinator {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        msg: crate::spawn_coordinator::SpawnRequest,
+        _ctx: &mut actix::Context<Self>,
+    ) {
+        *self.last_system_prompt.lock().unwrap() = Some(msg.system_prompt().to_owned());
+        let id = IdentityId::new().unwrap();
+        msg.reply_to()
+            .do_send(crate::spawn_coordinator::SpawnResponse::Success {
+                agent_name: "mock-agent".to_owned(),
+                agent_id: id,
+            });
+    }
+}
+
+// ── Null inbox starter ────────────────────────────────────────────────────────
+
+/// Test stub for a [`crate::supervisor::WatchInbox`] recipient.
+///
+/// Accepts [`crate::supervisor::WatchInbox`] messages and silently discards
+/// them. Used in tests that need a valid `inbox_starter` recipient wired into
+/// a [`crate::spawn_coordinator::SpawnCoordinator`] without actually starting
+/// file watchers.
+pub(crate) struct NullInboxStarter;
+
+impl actix::Actor for NullInboxStarter {
+    type Context = actix::Context<Self>;
+}
+
+impl actix::Handler<crate::supervisor::WatchInbox> for NullInboxStarter {
+    type Result = ();
+
+    fn handle(&mut self, _msg: crate::supervisor::WatchInbox, _ctx: &mut actix::Context<Self>) {}
+}
+
+// ── Persona config writer ─────────────────────────────────────────────────────
+
+/// `model_pref` must match the prefix of the adapter id used by the test (the part before `'@'`).
+pub(crate) fn write_persona_config(data_dir: &Path, name: &str, model_pref: &str) {
+    let persona_dir = data_dir.join("personas").join(name);
+    std::fs::create_dir_all(&persona_dir).unwrap();
+    let config = format!(
+        "name = \"{name}\"\nsystem_prompt = \"Be helpful.\"\nmodel_preferences = [\"{model_pref}\"]\n"
+    );
+    std::fs::write(persona_dir.join("config.toml"), config).unwrap();
+}
+
+// ── Shared registry builder ───────────────────────────────────────────────────
+
 /// Build the identity registry, watcher, and agent registry path for a test
 /// data directory.
 pub(crate) fn build_registries(

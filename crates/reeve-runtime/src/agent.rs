@@ -982,18 +982,23 @@ mod tests {
 
     // ── Mock adapters ─────────────────────────────────────────────────────────
 
-    struct MockAdapter {
+    /// Adapter stub that always succeeds with a fixed text response.
+    ///
+    /// Distinct from [`crate::test_support::MockAdapter`], which always returns
+    /// `Err(BadRequest)`. Use this type for tests that require the agent to
+    /// complete a turn (process inbound, write journal, reach idle).
+    struct TextResponseAdapter {
         id: &'static str,
     }
 
-    impl MockAdapter {
+    impl TextResponseAdapter {
         fn new(id: &'static str) -> Self {
             Self { id }
         }
     }
 
     #[async_trait::async_trait]
-    impl reeve_adapter::Adapter for MockAdapter {
+    impl reeve_adapter::Adapter for TextResponseAdapter {
         fn id(&self) -> &str {
             self.id
         }
@@ -1082,7 +1087,7 @@ mod tests {
     fn lead_agent_new_creates_valid_actor() {
         let tmp = tempdir().unwrap();
         let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
         let result = mock_agent(adapter, &dirs, Vec::new());
         assert!(result.is_ok(), "Agent::new should succeed");
     }
@@ -1094,7 +1099,7 @@ mod tests {
         let data_dir = tmp.path().to_path_buf();
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
         let status_path = dirs.status_path();
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
         let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
@@ -1129,7 +1134,7 @@ mod tests {
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
         let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
@@ -1212,7 +1217,7 @@ mod tests {
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
         let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
@@ -1753,7 +1758,7 @@ mod tests {
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
         let conversation_path = dirs.conversation_path();
         let conv_path_outer = conversation_path.clone();
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
         let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         actix::System::new().block_on(async move {
@@ -1814,15 +1819,24 @@ mod tests {
     }
 
     // ── Tool loop adapter: ToolUse on call 1, EndTurn on call 2 ───────────────
+    //
+    // Parameterized so IT-1 and IT-2 can reuse the same skeleton without
+    // repeating boilerplate. `preamble_text` is emitted before the tool call
+    // on turn 1; `None` produces a tool-only turn (no text blocks).
 
-    struct TwoTurnEchoAdapter {
+    struct TwoTurnSpawnAdapter {
         calls: Arc<std::sync::Mutex<u32>>,
+        persona: &'static str,
+        task: &'static str,
+        tool_call_id: &'static str,
+        preamble_text: Option<&'static str>,
+        end_turn_text: &'static str,
     }
 
     #[async_trait::async_trait]
-    impl reeve_adapter::Adapter for TwoTurnEchoAdapter {
+    impl reeve_adapter::Adapter for TwoTurnSpawnAdapter {
         fn id(&self) -> &'static str {
-            "two-turn-echo@test"
+            "two-turn-spawn@test"
         }
 
         fn capabilities(&self) -> reeve_adapter::Capabilities {
@@ -1840,14 +1854,19 @@ mod tests {
             let n = *count;
             drop(count);
             if n == 1 {
+                let text_blocks = match self.preamble_text {
+                    Some(t) => vec![reeve_adapter::MessageContent::Text(t.to_owned())],
+                    None => vec![],
+                };
                 Ok(reeve_adapter::Response::new_tool_use(
-                    vec![reeve_adapter::MessageContent::Text(
-                        "calling echo".to_owned(),
-                    )],
+                    text_blocks,
                     vec![reeve_adapter::ToolCall {
-                        id: "tu_1".to_owned(),
-                        name: "echo".to_owned(),
-                        arguments: serde_json::json!({ "text": "hello world" }),
+                        id: self.tool_call_id.to_owned(),
+                        name: "spawn_agent".to_owned(),
+                        arguments: serde_json::json!({
+                            "persona": self.persona,
+                            "task": self.task
+                        }),
                     }],
                     reeve_adapter::TokenCounts {
                         input: 10,
@@ -1858,7 +1877,9 @@ mod tests {
                 ))
             } else {
                 Ok(reeve_adapter::Response::new_text(
-                    vec![reeve_adapter::MessageContent::Text("done!".to_owned())],
+                    vec![reeve_adapter::MessageContent::Text(
+                        self.end_turn_text.to_owned(),
+                    )],
                     reeve_adapter::TokenCounts {
                         input: 12,
                         output: 3,
@@ -1871,17 +1892,19 @@ mod tests {
     }
 
     // L-T1: tool execution loop end-to-end. Adapter returns ToolUse on call 1,
-    // EchoTool fires, ToolResult flows back, adapter returns EndTurn on call 2,
-    // the agent goes idle. Journal must contain tool_use and tool_result entries
-    // with matching tool_use_id, and the final response text.
+    // SpawnAgentTool fires (via MockSpawnCoordinator), ToolResult flows back,
+    // adapter returns EndTurn on call 2, the agent goes idle. Journal must
+    // contain tool_use and tool_result entries with matching tool_use_id, and
+    // the final response text.
     #[test]
     #[expect(
         clippy::too_many_lines,
         reason = "end-to-end loop test with multi-stage poll loops and journal \
                   assertions; splitting fragments the narrative"
     )]
-    fn agent_tool_loop_round_trips_through_echo_tool() {
-        use crate::tool::EchoTool;
+    fn agent_tool_loop_round_trips_through_spawn_agent_tool() {
+        use crate::test_support::MockSpawnCoordinator;
+        use crate::tool::SpawnAgentTool;
         use actix::Actor as _;
 
         let tmp = tempdir().unwrap();
@@ -1891,15 +1914,23 @@ mod tests {
         let conv_path_outer = conversation_path.clone();
         let calls_log = Arc::new(std::sync::Mutex::new(0u32));
         let calls_log_assert = Arc::clone(&calls_log);
-        let adapter = Arc::new(TwoTurnEchoAdapter { calls: calls_log });
+        let adapter = Arc::new(TwoTurnSpawnAdapter {
+            calls: calls_log,
+            persona: "test-persona",
+            task: "hello world",
+            tool_call_id: "tu_1",
+            preamble_text: Some("spawning agent"),
+            end_turn_text: "done!",
+        });
 
         actix::System::new().block_on(async move {
-            // Start the EchoTool actor and assemble the route.
-            let echo_addr = EchoTool.start();
+            // Start the SpawnAgentTool actor backed by a mock coordinator.
+            let mock_coord = MockSpawnCoordinator.start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
-            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+            )> = vec![(SpawnAgentTool::descriptor(), tool_addr.recipient())];
 
             let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
@@ -1971,19 +2002,19 @@ mod tests {
             .find(|e| e["type"] == "tool_use")
             .expect("tool_use entry missing");
         assert_eq!(tool_use["tool_use_id"], "tu_1");
-        assert_eq!(tool_use["name"], "echo");
+        assert_eq!(tool_use["name"], "spawn_agent");
         assert_eq!(
             tool_use["input"],
-            serde_json::json!({ "text": "hello world" })
+            serde_json::json!({ "persona": "test-persona", "task": "hello world" })
         );
 
-        // Tool-result entry with matching id and the echoed content.
+        // Tool-result entry with matching id and the mock agent name content.
         let tool_result = entries
             .iter()
             .find(|e| e["type"] == "tool_result")
             .expect("tool_result entry missing");
         assert_eq!(tool_result["tool_use_id"], "tu_1");
-        assert_eq!(tool_result["content"], "hello world");
+        assert_eq!(tool_result["content"], "mock-agent");
         assert_eq!(tool_result["is_error"], false);
 
         // Final outbound entry carries the EndTurn text.
@@ -2024,8 +2055,8 @@ mod tests {
                 vec![],
                 vec![reeve_adapter::ToolCall {
                     id: format!("tu_{n}"),
-                    name: "echo".to_owned(),
-                    arguments: serde_json::json!({ "text": "spin" }),
+                    name: "spawn_agent".to_owned(),
+                    arguments: serde_json::json!({ "persona": "test-persona", "task": "spin" }),
                 }],
                 reeve_adapter::TokenCounts {
                     input: 1,
@@ -2047,7 +2078,8 @@ mod tests {
                   assertions; splitting fragments the narrative"
     )]
     fn agent_tool_loop_aborts_at_max_iterations() {
-        use crate::tool::EchoTool;
+        use crate::test_support::MockSpawnCoordinator;
+        use crate::tool::SpawnAgentTool;
         use actix::Actor as _;
 
         let tmp = tempdir().unwrap();
@@ -2060,11 +2092,12 @@ mod tests {
         });
 
         actix::System::new().block_on(async move {
-            let echo_addr = EchoTool.start();
+            let mock_coord = MockSpawnCoordinator.start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
-            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+            )> = vec![(SpawnAgentTool::descriptor(), tool_addr.recipient())];
 
             let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
@@ -2178,8 +2211,8 @@ mod tests {
                     vec![],
                     vec![reeve_adapter::ToolCall {
                         id: "tu_1".to_owned(),
-                        name: "echo".to_owned(),
-                        arguments: serde_json::json!({ "text": "x" }),
+                        name: "spawn_agent".to_owned(),
+                        arguments: serde_json::json!({ "persona": "test-persona", "task": "x" }),
                     }],
                     reeve_adapter::TokenCounts {
                         input: 1,
@@ -2208,7 +2241,8 @@ mod tests {
     // of whether the turn had text.
     #[test]
     fn agent_skips_empty_outbound_for_tool_only_turn() {
-        use crate::tool::EchoTool;
+        use crate::test_support::MockSpawnCoordinator;
+        use crate::tool::SpawnAgentTool;
         use actix::Actor as _;
 
         let tmp = tempdir().unwrap();
@@ -2222,11 +2256,12 @@ mod tests {
         });
 
         actix::System::new().block_on(async move {
-            let echo_addr = EchoTool.start();
+            let mock_coord = MockSpawnCoordinator.start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
-            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+            )> = vec![(SpawnAgentTool::descriptor(), tool_addr.recipient())];
 
             let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
@@ -2345,7 +2380,8 @@ mod tests {
     // unknown tool — the agent handles it locally.
     #[test]
     fn agent_recovers_from_unknown_tool_name() {
-        use crate::tool::EchoTool;
+        use crate::test_support::MockSpawnCoordinator;
+        use crate::tool::SpawnAgentTool;
         use actix::Actor as _;
 
         let tmp = tempdir().unwrap();
@@ -2359,12 +2395,13 @@ mod tests {
         });
 
         actix::System::new().block_on(async move {
-            // Register only EchoTool; the model will call "nonexistent_tool".
-            let echo_addr = EchoTool.start();
+            // Register SpawnAgentTool; the model will call "nonexistent_tool".
+            let mock_coord = MockSpawnCoordinator.start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
-            )> = vec![(EchoTool::descriptor(), echo_addr.recipient())];
+            )> = vec![(SpawnAgentTool::descriptor(), tool_addr.recipient())];
 
             let agent = mock_agent(adapter, &dirs, tools).unwrap();
             let addr = Supervisor::start(move |_| agent);
@@ -2429,32 +2466,337 @@ mod tests {
     // share a name.
     #[test]
     fn agent_new_rejects_duplicate_tool_names() {
-        use crate::tool::EchoTool;
+        use crate::test_support::MockSpawnCoordinator;
+        use crate::tool::SpawnAgentTool;
         use actix::Actor as _;
 
         let tmp = tempdir().unwrap();
         let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
 
         actix::System::new().block_on(async move {
-            let a = EchoTool.start();
-            let b = EchoTool.start();
-            // Both bindings declare the same name (EchoTool::descriptor()
-            // returns "echo").
+            let mock_coord = MockSpawnCoordinator.start();
+            let a = SpawnAgentTool::new(mock_coord.clone().recipient()).start();
+            let b = SpawnAgentTool::new(mock_coord.recipient()).start();
+            // Both bindings declare the same name (SpawnAgentTool::descriptor()
+            // returns "spawn_agent").
             let tools = vec![
-                (EchoTool::descriptor(), a.recipient()),
-                (EchoTool::descriptor(), b.recipient()),
+                (SpawnAgentTool::descriptor(), a.recipient()),
+                (SpawnAgentTool::descriptor(), b.recipient()),
             ];
             let result = mock_agent(adapter, &dirs, tools);
             match result {
                 Err(super::AgentError::DuplicateToolName(name)) => {
-                    assert_eq!(name, "echo");
+                    assert_eq!(name, "spawn_agent");
                 }
                 Err(other) => panic!("expected DuplicateToolName, got {other:?}"),
                 Ok(_) => panic!("expected error, got Ok"),
             }
             actix::System::current().stop();
         });
+    }
+
+    // ── SpawnAgentTool integration tests ─────────────────────────────────────
+
+    fn find_spawned_agent_status(data_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        let agents_dir = data_dir.join("agents");
+        std::fs::read_dir(&agents_dir)
+            .ok()?
+            .flatten()
+            .find_map(|entry| {
+                if entry.file_name() == "lead" {
+                    return None;
+                }
+                let status = entry.path().join("status");
+                if status.exists() {
+                    Some(status)
+                } else {
+                    None
+                }
+            })
+    }
+
+    // IT-1: When the lead agent calls spawn_agent, the SpawnCoordinator
+    // provisions a new agent that writes "idle" to its status file. The lead
+    // agent's conversation journal must contain a tool_result entry with
+    // is_error=false and content equal to the spawned agent's name.
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "end-to-end integration test: status poll + journal assertion; \
+                  splitting would obscure the success-path verification"
+    )]
+    fn spawn_agent_tool_spawns_agent_with_idle_status() {
+        use crate::spawn_coordinator::SpawnCoordinator;
+        use crate::test_support::{build_registries, NullInboxStarter};
+        use crate::tool::SpawnAgentTool;
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+
+        crate::test_support::write_persona_config(&data_dir, "test-persona", "mock");
+
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+
+        // The lead adapter drives the scenario; the coord adapter is what
+        // spawned agents use (must match "test-persona"'s model_preferences).
+        let lead_adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(TwoTurnSpawnAdapter {
+            calls: Arc::new(std::sync::Mutex::new(0u32)),
+            persona: "test-persona",
+            task: "run integration test",
+            tool_call_id: "tu_spawn",
+            preamble_text: None,
+            end_turn_text: "spawned!",
+        });
+        let coord_adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(crate::test_support::MockAdapter::new("mock@test"));
+
+        let data_dir_for_block = data_dir.clone();
+        let agent_registry_path_for_block = agent_registry_path.clone();
+
+        actix::System::new().block_on(async move {
+            let null_inbox = NullInboxStarter.start();
+
+            let spawn_coordinator = SpawnCoordinator::new(
+                data_dir_for_block.clone(),
+                agent_registry_path_for_block,
+                identity_registry,
+                Arc::clone(&coord_adapter),
+                Arc::clone(&watcher),
+                null_inbox.recipient(),
+            );
+            let coord_addr = Supervisor::start(move |_| spawn_coordinator);
+
+            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient());
+            let tools: Vec<(
+                reeve_adapter::Tool,
+                actix::Recipient<crate::tool::InvokeTool>,
+            )> = vec![(SpawnAgentTool::descriptor(), spawn_tool.start().recipient())];
+
+            let agent = mock_agent(lead_adapter, &dirs, tools).unwrap();
+            let addr = Supervisor::start(move |_| agent);
+
+            // Wait for lead agent to reach idle.
+            let status_path = data_dir_for_block
+                .join("agents")
+                .join("lead")
+                .join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "lead agent did not start within 5 seconds",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(ProcessInbound {
+                payload: "go".to_owned(),
+                message_id: "m-1".to_owned(),
+            });
+
+            // Poll until a spawned agent's status file appears and reads "idle".
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                if let Some(status_path) = find_spawned_agent_status(&data_dir_for_block) {
+                    let content = std::fs::read_to_string(&status_path).unwrap_or_default();
+                    if content == "idle" {
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "spawned agent did not reach idle within 10 seconds",
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            // Wait until the lead agent's journal records the tool_result before
+            // reading it outside block_on.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                let has_success_result = content.lines().any(|line| {
+                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+                        entry["type"] == "tool_result" && entry["is_error"] == false
+                    } else {
+                        false
+                    }
+                });
+                if has_success_result {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "success tool_result did not appear in journal within 5 seconds; \
+                     journal:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        // Verify outside block_on: at least one non-lead agent status file exists
+        // and reads "idle".
+        let spawned_status = find_spawned_agent_status(&data_dir)
+            .expect("expected at least one spawned agent status file");
+        let status_content = std::fs::read_to_string(&spawned_status).unwrap();
+        assert_eq!(status_content, "idle", "spawned agent status must be idle");
+
+        // Verify the lead agent's journal recorded the tool_result with
+        // is_error=false and content equal to the spawned agent's name.
+        let journal_content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = journal_content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let tool_result = entries
+            .iter()
+            .find(|e| e["type"] == "tool_result")
+            .expect("journal must contain a tool_result entry");
+        assert_eq!(
+            tool_result["is_error"], false,
+            "tool_result must have is_error=false on success"
+        );
+        // The spawned agent's name is its content; it was provisioned by the
+        // real coordinator so the name has the form "test-persona-<hex>".
+        let content_str = tool_result["content"].as_str().unwrap_or("");
+        assert!(
+            content_str.starts_with("test-persona-"),
+            "tool_result content must be the spawned agent name: {content_str}"
+        );
+    }
+
+    // IT-2: When spawn_agent is called with a persona that does not exist,
+    // the tool result has is_error=true and the content mentions "persona not found".
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "full path from tool invocation through coordinator error reply to journal \
+                  assertion; splitting would obscure the end-to-end error propagation"
+    )]
+    fn spawn_agent_tool_returns_error_for_unknown_persona() {
+        use crate::spawn_coordinator::SpawnCoordinator;
+        use crate::test_support::{build_registries, NullInboxStarter};
+        use crate::tool::SpawnAgentTool;
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        // No persona config written — "nonexistent-persona" will not be found.
+
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+        let conv_path_outer = conversation_path.clone();
+
+        let lead_adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(TwoTurnSpawnAdapter {
+            calls: Arc::new(std::sync::Mutex::new(0u32)),
+            persona: "nonexistent-persona",
+            task: "this will fail",
+            tool_call_id: "tu_bad",
+            preamble_text: None,
+            end_turn_text: "noted",
+        });
+        let coord_adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(crate::test_support::MockAdapter::new("mock@test"));
+
+        let data_dir_for_block = data_dir.clone();
+
+        actix::System::new().block_on(async move {
+            let null_inbox = NullInboxStarter.start();
+
+            let spawn_coordinator = SpawnCoordinator::new(
+                data_dir_for_block.clone(),
+                agent_registry_path,
+                identity_registry,
+                Arc::clone(&coord_adapter),
+                Arc::clone(&watcher),
+                null_inbox.recipient(),
+            );
+            let coord_addr = Supervisor::start(move |_| spawn_coordinator);
+
+            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient());
+            let tools: Vec<(
+                reeve_adapter::Tool,
+                actix::Recipient<crate::tool::InvokeTool>,
+            )> = vec![(SpawnAgentTool::descriptor(), spawn_tool.start().recipient())];
+
+            let agent = mock_agent(lead_adapter, &dirs, tools).unwrap();
+            let addr = Supervisor::start(move |_| agent);
+
+            // Wait for lead to start.
+            let status_path = data_dir_for_block
+                .join("agents")
+                .join("lead")
+                .join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "lead agent did not start within 5 seconds",
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            addr.do_send(ProcessInbound {
+                payload: "go".to_owned(),
+                message_id: "m-1".to_owned(),
+            });
+
+            // Wait for the tool_result with is_error=true to appear in the journal.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let content = std::fs::read_to_string(&conversation_path).unwrap_or_default();
+                let has_error_result = content.lines().any(|line| {
+                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) {
+                        entry["type"] == "tool_result" && entry["is_error"] == true
+                    } else {
+                        false
+                    }
+                });
+                if has_error_result {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "error tool_result did not appear within 10 seconds; journal:\n{content}",
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+
+            actix::System::current().stop();
+        });
+
+        let content = std::fs::read_to_string(&conv_path_outer).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+
+        let error_result = entries
+            .iter()
+            .find(|e| e["type"] == "tool_result" && e["is_error"] == true)
+            .expect("journal must contain a tool_result with is_error=true");
+
+        assert_eq!(error_result["tool_use_id"], "tu_bad");
+        let content_str = error_result["content"].as_str().unwrap_or("");
+        assert!(
+            content_str.contains("coordinator failed to provision agent"),
+            "error content must be the generic coordinator failure message: {content_str}"
+        );
     }
 
     // ── load_history_from_journal unit tests ─────────────────────────────────
@@ -2679,7 +3021,7 @@ mod tests {
     fn restarting_clears_seen_message_ids() {
         let tmp = tempdir().unwrap();
         let dirs = AgentDirs::provision(tmp.path(), "lead").unwrap();
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
         let mut agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         // Simulate a message that was seen before the restart.
@@ -2759,7 +3101,7 @@ mod tests {
         assert_eq!(prior_history[1].role, reeve_adapter::Role::Assistant);
 
         // Agent::new reads the same path and loads the history.
-        let adapter = Arc::new(MockAdapter::new("mock@test"));
+        let adapter = Arc::new(TextResponseAdapter::new("mock@test"));
         let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
 
         // The agent carries the prior history in memory; verify via a turn.
