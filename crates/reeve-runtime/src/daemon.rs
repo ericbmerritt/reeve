@@ -418,9 +418,27 @@ pub fn daemon_run(
     info!(pid = std::process::id(), "daemon starting");
     let _lock = acquire_lock(state_dir.clone())?;
     let (registry, replay, delivery, audit) = open_resources(data_dir)?;
-    let watcher = Arc::new(Watcher::new(&registry, &replay, delivery, audit));
+    let agent_registry_path =
+        AgentRegistry::default_registry_path().map_err(|e| DaemonError::Resource {
+            component: "agent registry path",
+            source: Box::new(e),
+        })?;
+    let watcher = Arc::new(Watcher::new(
+        &registry,
+        &replay,
+        delivery,
+        audit,
+        agent_registry_path.clone(),
+    ));
 
-    run_actor_system(state_dir, data_dir, &registry, watcher, adapter)?;
+    run_actor_system(
+        state_dir,
+        data_dir,
+        &registry,
+        watcher,
+        adapter,
+        agent_registry_path,
+    )?;
     info!("daemon stopping cleanly");
     Ok(())
 }
@@ -464,21 +482,21 @@ fn open_resources(data_dir: &Path) -> Result<Resources, DaemonError> {
 }
 
 /// Start the actix system, launch supervised actors, and block until shutdown.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct resource with no natural grouping peer"
+)]
 fn run_actor_system(
     state_dir: PathBuf,
     data_dir: &Path,
     identity_registry: &Arc<IdentityRegistry>,
     watcher: Arc<Watcher>,
     adapter: &Arc<dyn reeve_adapter::Adapter>,
+    agent_registry_path: PathBuf,
 ) -> Result<(), DaemonError> {
     // Prepare everything that can fail before entering the actix runtime.
     // Agent startup failures surface here with structured errors rather than
     // being swallowed inside block_on.
-    let agent_registry_path =
-        AgentRegistry::default_registry_path().map_err(|e| DaemonError::Resource {
-            component: "agent registry path",
-            source: Box::new(e),
-        })?;
     let startup = prepare_agent_startup(
         data_dir,
         identity_registry,
@@ -825,6 +843,7 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
     let lead_addr = actix::Supervisor::start(move |_| lead_agent);
 
     // WatcherActor: watches the lead inbox and dispatches verified messages.
+    let lead_addr_clone = lead_addr.clone();
     let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
     watcher_addr.do_send(WatchInbox {
         agent_id,
@@ -832,6 +851,7 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
         on_quarantine: Some(Box::new(move |reason| {
             lead_addr.do_send(crate::agent::QuarantineEvent { reason });
         })),
+        recipient: lead_addr_clone.recipient(),
     });
 
     Ok(())
@@ -1044,7 +1064,16 @@ mod tests {
         let replay = Arc::new(ReplayLedger::open(data_dir.to_path_buf()).unwrap());
         let delivery = Arc::new(DeliveryLedger::open(data_dir.to_path_buf()).unwrap());
         let audit = Arc::new(AuditLog::open(data_dir.to_path_buf()).unwrap());
-        let watcher = Arc::new(Watcher::new(&registry, &replay, delivery, audit));
+        // Use a non-existent registry path; prepare_agent_startup will create it
+        // via AgentRegistry::open during the test.
+        let agent_registry_path = data_dir.join("agents").join("registry.toml");
+        let watcher = Arc::new(Watcher::new(
+            &registry,
+            &replay,
+            delivery,
+            audit,
+            agent_registry_path,
+        ));
         (registry, watcher)
     }
 
