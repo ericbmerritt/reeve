@@ -30,6 +30,7 @@ toml = { workspace = true }
 uuid = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
+ed25519-dalek = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
@@ -42,6 +43,5 @@ secret-service = { workspace = true }
 
 [dev-dependencies]
 async-trait = { workspace = true }
-ed25519-dalek = { workspace = true }
 rand_core = { workspace = true }
 time = { workspace = true }

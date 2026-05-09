@@ -27,7 +27,10 @@ use reeve_types::{Identity, IdentityId, IdentityIdError, KeyRecord};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::fs_util::{ensure_directory, set_nofollow, sync_directory, FsCheckError};
+use crate::fs_util::{
+    ensure_directory, resolve_xdg_base_dir, set_nofollow, sync_directory, FsCheckError,
+    XdgBaseError,
+};
 
 /// Maximum size in bytes of any single registry TOML file. Identities and
 /// their key records serialize to well under a kilobyte; the cap guards
@@ -589,29 +592,12 @@ fn resolve_default_data_dir(
     xdg_data_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Result<PathBuf, RegistryError> {
-    let base = match xdg_data_home {
-        Some(value) if !value.is_empty() => {
-            let path = PathBuf::from(value);
-            if !path.is_absolute() {
-                return Err(RegistryError::RelativeDataDir {
-                    var_name: "XDG_DATA_HOME",
-                    path,
-                });
-            }
-            path
+    let base = resolve_xdg_base_dir(xdg_data_home, home).map_err(|e| match e {
+        XdgBaseError::MissingHome => RegistryError::MissingHome,
+        XdgBaseError::RelativeDir { var_name, path } => {
+            RegistryError::RelativeDataDir { var_name, path }
         }
-        _ => {
-            let home = home.ok_or(RegistryError::MissingHome)?;
-            let path = PathBuf::from(home);
-            if !path.is_absolute() {
-                return Err(RegistryError::RelativeDataDir {
-                    var_name: "HOME",
-                    path,
-                });
-            }
-            path.join(".local").join("share")
-        }
-    };
+    })?;
     Ok(base.join("reeve").join("identities"))
 }
 
