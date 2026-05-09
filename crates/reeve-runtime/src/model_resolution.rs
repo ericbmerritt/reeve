@@ -132,6 +132,7 @@ fn parse_adapter_model(adapter_id: &str) -> Option<&str> {
 pub fn resolve_model(
     persona: &PersonaConfig,
     adapters: &[&dyn reeve_adapter::Adapter],
+    agent_id: reeve_types::IdentityId,
 ) -> Result<SpawnSnapshot, ModelResolveError> {
     for model_id in &persona.model_preferences {
         if let Some(adapter) = adapters
@@ -143,9 +144,7 @@ pub fn resolve_model(
                 persona_version: 1,
                 capability_profile: persona.capability_profile.clone(),
                 adapter_id: adapter.id().to_owned(),
-                // agent_id is populated by the caller (prepare_agent_startup)
-                // before the snapshot is written to disk.
-                agent_id: String::new(),
+                agent_id: agent_id.to_string(),
             });
         }
     }
@@ -190,39 +189,7 @@ mod tests {
 
     use tempfile::tempdir;
 
-    // ── Mock adapter ────────────────────────────────────────────────────────
-
-    struct MockAdapter {
-        id: &'static str,
-    }
-
-    impl MockAdapter {
-        fn new(id: &'static str) -> Self {
-            Self { id }
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl reeve_adapter::Adapter for MockAdapter {
-        fn id(&self) -> &str {
-            self.id
-        }
-
-        fn capabilities(&self) -> reeve_adapter::Capabilities {
-            reeve_adapter::Capabilities::new()
-        }
-
-        async fn call(
-            &self,
-            _messages: &[reeve_adapter::Message],
-            _tools: &[reeve_adapter::Tool],
-            _params: &reeve_adapter::Params,
-        ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
-            Err(reeve_adapter::AdapterError::BadRequest {
-                message: String::from("mock adapter does not support calls"),
-            })
-        }
-    }
+    use crate::test_support::MockAdapter;
 
     fn minimal_persona(name: &str, prefs: Vec<String>) -> PersonaConfig {
         PersonaConfig {
@@ -241,13 +208,15 @@ mod tests {
         let adapter = MockAdapter::new("claude-opus-4-7@anthropic-direct");
         let persona = minimal_persona("lead", vec![String::from("claude-opus-4-7")]);
         let adapters: &[&dyn reeve_adapter::Adapter] = &[&adapter];
+        let agent_id = reeve_types::IdentityId::new().unwrap();
 
-        let snapshot = resolve_model(&persona, adapters).expect("should resolve");
+        let snapshot = resolve_model(&persona, adapters, agent_id).expect("should resolve");
         assert_eq!(snapshot.adapter_id, "claude-opus-4-7@anthropic-direct");
         assert_eq!(snapshot.model(), "claude-opus-4-7");
         assert_eq!(snapshot.persona_name, "lead");
         assert_eq!(snapshot.persona_version, 1);
         assert!(snapshot.capability_profile.is_none());
+        assert_eq!(snapshot.agent_id, agent_id.to_string());
     }
 
     // M2: resolve_model returns NoMatchingAdapter when no adapter matches any
@@ -256,8 +225,9 @@ mod tests {
     fn resolve_model_returns_error_when_no_adapter_matches() {
         let persona = minimal_persona("solo", vec![String::from("nonexistent-model")]);
         let adapters: &[&dyn reeve_adapter::Adapter] = &[];
+        let agent_id = reeve_types::IdentityId::new().unwrap();
 
-        let err = resolve_model(&persona, adapters).expect_err("should fail");
+        let err = resolve_model(&persona, adapters, agent_id).expect_err("should fail");
         assert!(
             matches!(err, ModelResolveError::NoMatchingAdapter { ref persona, .. } if persona == "solo"),
             "unexpected error variant: {err}",
@@ -276,8 +246,9 @@ mod tests {
             vec![String::from("model-a"), String::from("model-b")],
         );
         let adapters: &[&dyn reeve_adapter::Adapter] = &[&adapter_a, &adapter_b];
+        let agent_id = reeve_types::IdentityId::new().unwrap();
 
-        let snapshot = resolve_model(&persona, adapters).expect("should resolve");
+        let snapshot = resolve_model(&persona, adapters, agent_id).expect("should resolve");
         assert_eq!(snapshot.adapter_id, "model-a@route");
         assert_eq!(snapshot.model(), "model-a");
     }
@@ -345,8 +316,9 @@ mod tests {
             display_name: None,
         };
         let adapters: &[&dyn reeve_adapter::Adapter] = &[&adapter];
+        let agent_id = reeve_types::IdentityId::new().unwrap();
 
-        let snapshot = resolve_model(&persona, adapters).expect("should resolve");
+        let snapshot = resolve_model(&persona, adapters, agent_id).expect("should resolve");
         assert_eq!(snapshot.capability_profile.as_deref(), Some("default"));
     }
 
@@ -398,7 +370,8 @@ mod tests {
         let malformed = MockAdapter::new("claude-opus-4-7-no-at"); // no @ character
         let persona = minimal_persona("solo", vec![String::from("claude-opus-4-7")]);
         let adapters: &[&dyn reeve_adapter::Adapter] = &[&malformed];
-        let err = resolve_model(&persona, adapters).unwrap_err();
+        let agent_id = reeve_types::IdentityId::new().unwrap();
+        let err = resolve_model(&persona, adapters, agent_id).unwrap_err();
         assert!(matches!(err, ModelResolveError::NoMatchingAdapter { .. }));
     }
 
@@ -412,7 +385,8 @@ mod tests {
             vec![String::from("model-a"), String::from("model-b")],
         );
         let adapters: &[&dyn reeve_adapter::Adapter] = &[&adapter_b];
-        let snapshot = resolve_model(&persona, adapters).unwrap();
+        let agent_id = reeve_types::IdentityId::new().unwrap();
+        let snapshot = resolve_model(&persona, adapters, agent_id).unwrap();
         assert_eq!(snapshot.adapter_id, "model-b@test-route");
         assert_eq!(snapshot.model(), "model-b");
     }

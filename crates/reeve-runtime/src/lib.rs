@@ -17,6 +17,7 @@ pub mod keychain;
 pub mod ledger;
 pub mod model_resolution;
 pub mod runtime_lock;
+pub mod spawn_coordinator;
 pub mod supervisor;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -51,6 +52,7 @@ pub use ledger::{
 };
 pub use model_resolution::{resolve_model, write_spawn_snapshot, ModelResolveError, SpawnSnapshot};
 pub use runtime_lock::{default_state_dir, RuntimeLock, RuntimeLockError};
+pub use spawn_coordinator::{SpawnCoordinator, SpawnRequest, SpawnRequestError, SpawnResponse};
 pub use supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 pub use tool::{check_authority, AuthorityDecision, EchoTool, InvokeTool, ToolResult};
 pub use verify::{

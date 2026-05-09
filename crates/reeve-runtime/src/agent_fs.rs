@@ -407,7 +407,13 @@ impl AtomicFileWriter {
 
 /// Rejects names that would enable path traversal outside the `agents/` subtree.
 pub(crate) fn validate_agent_name(name: &str) -> Result<(), AgentFsError> {
-    if name.is_empty() || name.contains('/') || name.contains('\0') || name == "." || name == ".." {
+    if name.is_empty()
+        || name.contains('/')
+        || name.contains('\0')
+        || name == "."
+        || name == ".."
+        || name.chars().any(char::is_control)
+    {
         return Err(AgentFsError::Io {
             path: PathBuf::from(name),
             source: io::Error::new(
