@@ -1,6 +1,7 @@
 //! Shared test fixtures for reeve-runtime integration tests.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use reeve_transport::sign::sign_envelope;
 use reeve_types::{
@@ -89,9 +90,6 @@ pub(crate) fn make_signed_envelope(
 /// `created_at` timestamp, and return both the parsed envelope and its
 /// serialized JSON bytes. Use this variant when a test must control the
 /// timestamp (e.g., clock-skew checks, key-expiry checks).
-///
-/// Fixture limitation: placeholder hash sufficient for current pipeline
-/// tests; if payload-hash validation is added, this fixture must be updated.
 pub(crate) fn signed_envelope_at(
     keypair: &Keypair,
     sender_id: IdentityId,
@@ -116,4 +114,72 @@ pub(crate) fn signed_envelope_at(
     env.signature = sig;
     let bytes = serde_json::to_vec(&env).unwrap();
     (env, bytes)
+}
+
+// ── Shared mock adapter ───────────────────────────────────────────────────────
+
+/// Parametric model adapter stub for tests.
+///
+/// Accepts any `&'static str` as the adapter id; `call()` always returns
+/// `BadRequest` — sufficient for tests that exercise spawn/resolution logic
+/// without requiring a live model.
+pub(crate) struct MockAdapter {
+    id: &'static str,
+}
+
+impl MockAdapter {
+    pub(crate) fn new(id: &'static str) -> Self {
+        Self { id }
+    }
+}
+
+#[async_trait::async_trait]
+impl reeve_adapter::Adapter for MockAdapter {
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn capabilities(&self) -> reeve_adapter::Capabilities {
+        reeve_adapter::Capabilities::new()
+    }
+
+    async fn call(
+        &self,
+        _messages: &[reeve_adapter::Message],
+        _tools: &[reeve_adapter::Tool],
+        _params: &reeve_adapter::Params,
+    ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+        Err(reeve_adapter::AdapterError::BadRequest {
+            message: String::from("mock adapter does not support calls"),
+        })
+    }
+}
+
+/// Build the identity registry, watcher, and agent registry path for a test
+/// data directory.
+pub(crate) fn build_registries(
+    data_dir: &Path,
+) -> (
+    Arc<crate::identity_registry::IdentityRegistry>,
+    Arc<crate::watcher::Watcher>,
+    std::path::PathBuf,
+) {
+    use crate::audit::AuditLog;
+    use crate::identity_registry::IdentityRegistry;
+    use crate::ledger::{DeliveryLedger, ReplayLedger};
+    use crate::watcher::Watcher;
+
+    let identity_registry = Arc::new(IdentityRegistry::open(data_dir.to_path_buf()).unwrap());
+    let replay = Arc::new(ReplayLedger::open(data_dir.to_path_buf()).unwrap());
+    let delivery = Arc::new(DeliveryLedger::open(data_dir.to_path_buf()).unwrap());
+    let audit = Arc::new(AuditLog::open(data_dir.to_path_buf()).unwrap());
+    let agent_registry_path = data_dir.join("agents").join("registry.toml");
+    let watcher = Arc::new(Watcher::new(
+        &identity_registry,
+        &replay,
+        delivery,
+        audit,
+        agent_registry_path.clone(),
+    ));
+    (identity_registry, watcher, agent_registry_path)
 }

@@ -1097,6 +1097,27 @@ pub(crate) mod tests {
         );
     }
 
+    // T33b: ValidatedAgentName rejects names containing control characters.
+    #[test]
+    fn validated_agent_name_rejects_newline() {
+        assert!(ValidatedAgentName::new("name\nwith\nnewline").is_err());
+    }
+
+    #[test]
+    fn validated_agent_name_rejects_carriage_return() {
+        assert!(ValidatedAgentName::new("name\rwith\rcr").is_err());
+    }
+
+    #[test]
+    fn validated_agent_name_rejects_escape() {
+        assert!(ValidatedAgentName::new("name\x1bwith\x1bescape").is_err());
+    }
+
+    #[test]
+    fn validated_agent_name_rejects_tab() {
+        assert!(ValidatedAgentName::new("name\twith\ttab").is_err());
+    }
+
     // T34: TOML with a semantically invalid name surfaces as Parse.
     //
     // Writes the TOML manually so the invalid name reaches the deserializer

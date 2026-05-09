@@ -367,6 +367,15 @@ impl Watcher {
             .insert(agent_id, recipient);
     }
 
+    /// Returns `true` when a route is registered for `id`.
+    #[cfg(test)]
+    pub(crate) fn has_route(&self, id: IdentityId) -> bool {
+        self.routing_table
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains_key(&id)
+    }
+
     /// Send `envelope` to its registered actix recipient, if one is present in
     /// the routing table. Logs a warning when no entry is found; the file
     /// remains in `cur/` and will be dispatched on the next

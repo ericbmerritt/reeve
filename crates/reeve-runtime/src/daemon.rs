@@ -765,12 +765,12 @@ fn prepare_agent_startup(
     };
 
     // 7. Resolve the model adapter against this persona's preferences.
-    let mut snapshot =
-        resolve_model(&persona_config, &[adapter.as_ref()]).map_err(|e| DaemonError::Resource {
+    let snapshot = resolve_model(&persona_config, &[adapter.as_ref()], agent_id).map_err(|e| {
+        DaemonError::Resource {
             component: "model resolution",
             source: Box::new(e),
-        })?;
-    snapshot.agent_id = agent_id.to_string();
+        }
+    })?;
     debug!(adapter_id = %snapshot.adapter_id, "resolved adapter");
 
     // 8. Write the spawn snapshot to disk (includes agent_id for TUI signing).
@@ -871,10 +871,7 @@ mod tests {
     use super::wait_for_exit;
     use super::{confirm_started, daemon_status, prepare_agent_startup, DaemonError, DaemonStatus};
     use crate::agent_registry::tests::registry_path_for_data_dir;
-    use crate::audit::AuditLog;
-    use crate::identity_registry::IdentityRegistry;
-    use crate::ledger::{DeliveryLedger, ReplayLedger};
-    use crate::watcher::Watcher;
+    use crate::test_support::{build_registries, MockAdapter};
 
     fn write_pid(state_dir: &Path, pid: u32) {
         fs::create_dir_all(state_dir).unwrap();
@@ -1034,57 +1031,15 @@ mod tests {
 
     // ── prepare_agent_startup tests ───────────────────────────────────────────
 
-    /// Mock adapter that advertises the default persona model `claude-opus-4-7`.
-    struct MockOpusAdapter;
-
-    #[async_trait::async_trait]
-    impl reeve_adapter::Adapter for MockOpusAdapter {
-        fn id(&self) -> &'static str {
-            "claude-opus-4-7@anthropic-direct"
-        }
-
-        fn capabilities(&self) -> reeve_adapter::Capabilities {
-            reeve_adapter::Capabilities::new()
-        }
-
-        async fn call(
-            &self,
-            _messages: &[reeve_adapter::Message],
-            _tools: &[reeve_adapter::Tool],
-            _params: &reeve_adapter::Params,
-        ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
-            Err(reeve_adapter::AdapterError::BadRequest {
-                message: String::from("mock: no calls"),
-            })
-        }
-    }
-
-    fn build_test_resources(data_dir: &Path) -> (Arc<IdentityRegistry>, Arc<Watcher>) {
-        let registry = Arc::new(IdentityRegistry::open(data_dir.to_path_buf()).unwrap());
-        let replay = Arc::new(ReplayLedger::open(data_dir.to_path_buf()).unwrap());
-        let delivery = Arc::new(DeliveryLedger::open(data_dir.to_path_buf()).unwrap());
-        let audit = Arc::new(AuditLog::open(data_dir.to_path_buf()).unwrap());
-        // Use a non-existent registry path; prepare_agent_startup will create it
-        // via AgentRegistry::open during the test.
-        let agent_registry_path = data_dir.join("agents").join("registry.toml");
-        let watcher = Arc::new(Watcher::new(
-            &registry,
-            &replay,
-            delivery,
-            audit,
-            agent_registry_path,
-        ));
-        (registry, watcher)
-    }
-
     // A1: prepare_agent_startup succeeds with default configs and a matching adapter.
     #[test]
     fn prepare_agent_startup_succeeds_with_defaults_and_matching_adapter() {
         let tmp = crate::test_support::secure_dir();
         let data_dir = tmp.path().to_path_buf();
         let agent_registry_path = registry_path_for_data_dir(&data_dir);
-        let (identity_registry, watcher) = build_test_resources(&data_dir);
-        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(MockOpusAdapter);
+        let (identity_registry, watcher, _) = build_registries(&data_dir);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
 
         let result = prepare_agent_startup(
             &data_dir,
@@ -1130,7 +1085,7 @@ mod tests {
         let tmp = crate::test_support::secure_dir();
         let data_dir = tmp.path().to_path_buf();
         let agent_registry_path = registry_path_for_data_dir(&data_dir);
-        let (identity_registry, watcher) = build_test_resources(&data_dir);
+        let (identity_registry, watcher, _) = build_registries(&data_dir);
         let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(WrongAdapter);
 
         let result = prepare_agent_startup(
@@ -1159,9 +1114,10 @@ mod tests {
     fn prepare_agent_startup_uses_stable_identity_across_calls() {
         let tmp = crate::test_support::secure_dir();
         let data_dir = tmp.path().to_path_buf();
-        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(MockOpusAdapter);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
 
-        let (identity_registry1, watcher1) = build_test_resources(&data_dir);
+        let (identity_registry1, watcher1, _) = build_registries(&data_dir);
         let first = prepare_agent_startup(
             &data_dir,
             &identity_registry1,
@@ -1173,7 +1129,7 @@ mod tests {
         let first_id = first.agent_id;
         let first_public = *first.keypair.public();
 
-        let (identity_registry2, watcher2) = build_test_resources(&data_dir);
+        let (identity_registry2, watcher2, _) = build_registries(&data_dir);
         let second = prepare_agent_startup(
             &data_dir,
             &identity_registry2,
@@ -1235,10 +1191,11 @@ mod tests {
     fn prepare_agent_startup_rejects_mismatched_keypair() {
         let tmp = crate::test_support::secure_dir();
         let data_dir = tmp.path().to_path_buf();
-        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(MockOpusAdapter);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
 
         // First call: establishes identity and writes the keypair file.
-        let (identity_registry1, watcher1) = build_test_resources(&data_dir);
+        let (identity_registry1, watcher1, _) = build_registries(&data_dir);
         let first = prepare_agent_startup(
             &data_dir,
             &identity_registry1,
@@ -1258,7 +1215,7 @@ mod tests {
         fs::write(&key_path, seed.as_ref()).expect("overwrite keypair file");
 
         // Second call: must detect the mismatch and return an error.
-        let (identity_registry2, watcher2) = build_test_resources(&data_dir);
+        let (identity_registry2, watcher2, _) = build_registries(&data_dir);
         let result = prepare_agent_startup(
             &data_dir,
             &identity_registry2,
