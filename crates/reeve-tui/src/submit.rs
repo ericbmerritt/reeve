@@ -25,16 +25,14 @@ use std::path::PathBuf;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt as _;
 
-use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 
 use reeve_runtime::{AgentDirs, IdentityRegistry, OperatorKeyStore, SpawnSnapshot, StoredIdentity};
-use reeve_transport::sign_envelope;
+use reeve_transport::{fresh_nonce, sha256_payload_hash, sign_envelope};
 use reeve_types::{
-    Envelope, EnvelopeSignature, IdentityType, KeyId, KeyState, MessageId, Nonce, PayloadHash,
-    PrivateKey, SchemaVersion, NONCE_LEN, PAYLOAD_HASH_LEN, SIGNATURE_LEN,
+    Envelope, EnvelopeSignature, IdentityType, KeyId, KeyState, MessageId, PrivateKey,
+    SchemaVersion, SIGNATURE_LEN,
 };
 
 // ── Error type ─────────────────────────────────────────────────────────────────
@@ -53,7 +51,7 @@ pub enum SubmitError {
     /// JSON serialisation of the signed envelope failed.
     Serialize(serde_json::Error),
     /// The spawn snapshot (`agent.toml`) could not be parsed.
-    ReadSnapshot(serde_json::Error),
+    ReadSnapshot(toml::de::Error),
     /// The spawn snapshot exists but `agent_id` is absent or not a valid UUID.
     AgentIdMissing,
     /// No operator identity is enrolled on this machine.
@@ -101,7 +99,8 @@ impl std::error::Error for SubmitError {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::MintMessageId(err) => Some(err),
-            Self::Serialize(err) | Self::ReadSnapshot(err) => Some(err),
+            Self::Serialize(err) => Some(err),
+            Self::ReadSnapshot(err) => Some(err),
             Self::Registry(err) => Some(err),
             Self::Keychain(err) => Some(err),
             Self::Sign(err) => Some(err),
@@ -131,13 +130,11 @@ pub fn submit_message(
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<(), SubmitError> {
-    // 1. Read and parse the spawn snapshot to get the agent's identity id.
     let snapshot = read_snapshot(dirs)?;
     let recipient_id = snapshot
         .agent_identity_id()
         .ok_or(SubmitError::AgentIdMissing)?;
 
-    // 2. Find the operator identity and its active key.
     let stored = registry.list().map_err(SubmitError::Registry)?;
     let operator = find_operator(&stored).ok_or(SubmitError::NoOperatorEnrolled)?;
     let operator_key = operator
@@ -151,17 +148,15 @@ pub fn submit_message(
         return Err(SubmitError::OperatorHasNoActiveKey);
     }
 
-    // 3. Retrieve the operator's private key seed from the keystore.
     let seed = keystore
         .retrieve(operator.identity().identity_id)
         .map_err(SubmitError::Keychain)?;
     let private_key = PrivateKey::from_seed_bytes(&seed);
 
-    // 4. Build the envelope.
     let message_id = MessageId::new().map_err(SubmitError::MintMessageId)?;
     let nonce = fresh_nonce();
     let body = payload.as_bytes();
-    let payload_hash = sha256_hash(body);
+    let payload_hash = sha256_payload_hash(body);
     let sender_id = operator.identity().identity_id;
     let sender_key_id: KeyId = operator_key.key_id;
 
@@ -178,14 +173,11 @@ pub fn submit_message(
         EnvelopeSignature::from_bytes([0xDE; SIGNATURE_LEN]),
     );
 
-    // 5. Sign and embed the real signature.
     let sig = sign_envelope(&envelope, &private_key).map_err(SubmitError::Sign)?;
     envelope.signature = sig;
 
-    // 6. Serialise the signed envelope.
     let json = serde_json::to_string(&envelope).map_err(SubmitError::Serialize)?;
 
-    // 7. Atomic tmp → rename into inbox/new/.
     let filename = format!("{message_id}.json");
     let new_path = dirs.inbox_root().join("new").join(&filename);
     let tmp_dir = dirs.inbox_root().join("tmp");
@@ -230,16 +222,7 @@ pub fn submit_message(
 fn read_snapshot(dirs: &AgentDirs) -> Result<SpawnSnapshot, SubmitError> {
     let path = dirs.agent_toml_path();
     let raw = fs::read_to_string(&path).map_err(|source| SubmitError::Io { path, source })?;
-    toml::from_str(&raw).map_err(|e| {
-        // toml::de::Error does not implement std::error::Error directly in all
-        // versions; convert via its Display string into a serde_json::Error
-        // proxy to keep the variant type consistent. We use a custom workaround:
-        // wrap as an IO error so the caller gets a useful message.
-        SubmitError::Io {
-            path: dirs.agent_toml_path(),
-            source: std::io::Error::other(e.to_string()),
-        }
-    })
+    toml::from_str(&raw).map_err(SubmitError::ReadSnapshot)
 }
 
 /// Find the first stored identity with `IdentityType::Operator`.
@@ -247,19 +230,4 @@ fn find_operator(stored: &[StoredIdentity]) -> Option<&StoredIdentity> {
     stored
         .iter()
         .find(|s| s.identity().identity_type == IdentityType::Operator)
-}
-
-/// Generate a fresh 16-byte cryptographic nonce using the OS RNG.
-fn fresh_nonce() -> Nonce {
-    let mut bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut bytes);
-    Nonce::from_bytes(bytes)
-}
-
-/// Compute the SHA-256 hash of `data` and return it as a [`PayloadHash`].
-fn sha256_hash(data: &[u8]) -> PayloadHash {
-    let digest = Sha256::digest(data);
-    let mut bytes = [0u8; PAYLOAD_HASH_LEN];
-    bytes.copy_from_slice(&digest);
-    PayloadHash::from_bytes(bytes)
 }

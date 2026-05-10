@@ -1715,7 +1715,6 @@ name = "reeve-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
- "rand_core 0.6.4",
  "reeve-adapter",
  "reeve-runtime",
  "reeve-transport",
@@ -1723,7 +1722,6 @@ dependencies = [
  "reeve-types",
  "secrecy",
  "serde_json",
- "sha2",
  "tempfile",
  "time",
  "tokio",
@@ -1765,8 +1763,10 @@ name = "reeve-transport"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "rand_core 0.6.4",
  "reeve-types",
  "serde_json",
+ "sha2",
  "time",
  "uuid",
 ]
@@ -1777,13 +1777,11 @@ version = "0.1.0"
 dependencies = [
  "crossterm",
  "notify",
- "rand_core 0.6.4",
  "ratatui",
  "reeve-runtime",
  "reeve-transport",
  "reeve-types",
  "serde_json",
- "sha2",
  "tempfile",
  "time",
  "tokio",
