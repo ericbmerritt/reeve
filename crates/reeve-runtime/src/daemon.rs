@@ -23,6 +23,7 @@ use crate::agent_fs::AgentDirs;
 use crate::agent_registry::{AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName};
 use crate::audit::AuditLog;
 use crate::config::{install_defaults, load_persona_config, load_team_config};
+use crate::dispatcher::MessageDispatcher;
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
@@ -512,11 +513,16 @@ fn run_actor_system(
         debug!("actix system starting");
         let mut launch_err: Option<DaemonError> = None;
         actix::System::new().block_on(async {
-            if let Err(e) = launch_actors(state_dir, startup) {
-                launch_err = Some(e);
-                actix::System::current().stop();
-                return;
-            }
+            // _dispatcher_addr keeps the actor alive for the duration of the
+            // system.
+            let _dispatcher_addr = match launch_actors(state_dir, startup) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    launch_err = Some(e);
+                    actix::System::current().stop();
+                    return;
+                }
+            };
             // Set up SIGTERM handler inside block_on — tokio::signal requires
             // an active runtime, which actix provides only once block_on starts.
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
@@ -546,11 +552,16 @@ fn run_actor_system(
         debug!("actix system starting");
         let mut launch_err: Option<DaemonError> = None;
         actix::System::new().block_on(async {
-            if let Err(e) = launch_actors(state_dir, startup) {
-                launch_err = Some(e);
-                actix::System::current().stop();
-                return;
-            }
+            // _dispatcher_addr keeps the actor alive for the duration of the
+            // system.
+            let _dispatcher_addr = match launch_actors(state_dir, startup) {
+                Ok(addr) => addr,
+                Err(e) => {
+                    launch_err = Some(e);
+                    actix::System::current().stop();
+                    return;
+                }
+            };
             // No signal API on this platform. This future never resolves; the
             // process must be killed externally. Non-Unix is not a supported
             // deployment target.
@@ -806,7 +817,10 @@ fn prepare_agent_startup(
 /// Start all supervised actors inside the running actix system.
 ///
 /// Must be called from within an actix `block_on` context.
-fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), DaemonError> {
+fn launch_actors(
+    state_dir: PathBuf,
+    startup: AgentStartup,
+) -> Result<actix::Addr<MessageDispatcher>, DaemonError> {
     use actix::Actor as _;
 
     let AgentStartup {
@@ -828,6 +842,21 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
 
     let watcher_for_coord = Arc::clone(&watcher);
     let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
+
+    // Opened as a fresh registry snapshot — keys and inbox_dir paths for the
+    // registered agents are stable after this point in the current ladder.
+    let dispatcher_registry =
+        AgentRegistry::open(agent_registry_path.clone()).map_err(|e| DaemonError::Resource {
+            component: "message dispatcher registry",
+            source: Box::new(e),
+        })?;
+    let identity_registry_for_dispatcher = Arc::clone(&identity_registry);
+    let dispatcher_addr = actix::Supervisor::start(move |_| {
+        MessageDispatcher::new(
+            Arc::new(dispatcher_registry),
+            identity_registry_for_dispatcher,
+        )
+    });
 
     let spawn_coordinator = SpawnCoordinator::new(
         data_dir,
@@ -875,7 +904,7 @@ fn launch_actors(state_dir: PathBuf, startup: AgentStartup) -> Result<(), Daemon
         recipient: lead_addr_clone.recipient(),
     });
 
-    Ok(())
+    Ok(dispatcher_addr)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

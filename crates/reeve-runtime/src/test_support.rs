@@ -155,27 +155,64 @@ impl reeve_adapter::Adapter for MockAdapter {
     }
 }
 
-// ── ToolResultCapture ─────────────────────────────────────────────────────────
+// ── Inbox provisioning ───────────────────────────────────────────────────────
 
-/// One-shot capture actor: receives exactly one [`crate::tool::ToolResult`] and
-/// forwards it through a tokio oneshot sender.
-pub(crate) struct ToolResultCapture {
-    pub(crate) tx: Option<tokio::sync::oneshot::Sender<crate::tool::ToolResult>>,
-}
-
-impl actix::Actor for ToolResultCapture {
-    type Context = actix::Context<Self>;
-}
-
-impl actix::Handler<crate::tool::ToolResult> for ToolResultCapture {
-    type Result = ();
-
-    fn handle(&mut self, msg: crate::tool::ToolResult, _ctx: &mut actix::Context<Self>) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(msg);
-        }
+/// Create a minimal inbox layout at `root/inbox/{tmp,new}` with mode 0o700 on
+/// Unix. Used by dispatcher tests whose `AgentRecord.inbox_dir` points to
+/// `root/inbox/` and need the staging and delivery subdirectories to exist.
+///
+/// Note: this creates only the subdirectories required by the dispatcher.
+/// Watcher tests that need `cur/`, `quarantine/`, and `archive/` should use
+/// [`crate::inbox::InboxLayout::provision`] instead.
+#[cfg(unix)]
+pub(crate) fn provision_inbox(root: &Path) {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    for sub in &["inbox", "inbox/tmp", "inbox/new"] {
+        let dir = root.join(sub);
+        fs::create_dir_all(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     }
 }
+
+#[cfg(not(unix))]
+pub(crate) fn provision_inbox(root: &Path) {
+    use std::fs;
+    for sub in &["inbox", "inbox/tmp", "inbox/new"] {
+        fs::create_dir_all(root.join(sub)).unwrap();
+    }
+}
+
+// ── Capture actors ────────────────────────────────────────────────────────────
+
+/// Generates a one-shot capture actor that receives one message of type
+/// `$msg` and forwards it through a tokio oneshot sender.
+macro_rules! oneshot_capture {
+    ($name:ident, $msg:path) => {
+        pub(crate) struct $name {
+            pub(crate) tx: Option<tokio::sync::oneshot::Sender<$msg>>,
+        }
+
+        impl actix::Actor for $name {
+            type Context = actix::Context<Self>;
+        }
+
+        impl actix::Handler<$msg> for $name {
+            type Result = ();
+
+            fn handle(&mut self, msg: $msg, _ctx: &mut actix::Context<Self>) {
+                if let Some(tx) = self.tx.take() {
+                    let _ = tx.send(msg);
+                }
+            }
+        }
+    };
+}
+
+oneshot_capture!(ToolResultCapture, crate::tool::ToolResult);
+oneshot_capture!(ResponseCapture, crate::spawn_coordinator::SpawnResponse);
+oneshot_capture!(SendResultCapture, crate::dispatcher::SendResult);
+oneshot_capture!(SendFailedCapture, crate::dispatcher::SendFailed);
 
 // ── Mock spawn coordinator ────────────────────────────────────────────────────
 
@@ -205,31 +242,6 @@ impl actix::Handler<crate::spawn_coordinator::SpawnRequest> for MockSpawnCoordin
                 agent_name: "mock-agent".to_owned(),
                 agent_id: id,
             });
-    }
-}
-
-/// One-shot capture actor: receives exactly one
-/// [`crate::spawn_coordinator::SpawnResponse`] and forwards it through a tokio
-/// oneshot sender.
-pub(crate) struct ResponseCapture {
-    pub(crate) tx: Option<tokio::sync::oneshot::Sender<crate::spawn_coordinator::SpawnResponse>>,
-}
-
-impl actix::Actor for ResponseCapture {
-    type Context = actix::Context<Self>;
-}
-
-impl actix::Handler<crate::spawn_coordinator::SpawnResponse> for ResponseCapture {
-    type Result = ();
-
-    fn handle(
-        &mut self,
-        msg: crate::spawn_coordinator::SpawnResponse,
-        _ctx: &mut actix::Context<Self>,
-    ) {
-        if let Some(tx) = self.tx.take() {
-            let _ = tx.send(msg);
-        }
     }
 }
 
