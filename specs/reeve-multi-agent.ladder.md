@@ -298,6 +298,25 @@ to the lead via `send_message` in its own tool loop.
 - A `message_id` returned by the tool appears in B's delivery ledger after
   delivery
 
+#### Carried Follow-ons
+
+Items deferred from prior phases that belong here:
+
+- [t4/c9 pier.p2 → 2026-05-09] AgentRegistry per-spawn re-open: consider
+  holding `AgentRegistry` open as mutable shared state when
+  `MessageDispatcher` needs sender lookup (for the in-memory keypair) and
+  recipient lookup. The per-spawn re-open pattern from Phase 3 was NT'd
+  there as actix-sequential safe; with a second consumer in Phase 4 the
+  tradeoff may shift.
+- [t4 priya.p1 → 2026-05-09] System-prompt branch testing: add a
+  `MockAgent` observation hook so tests can assert on `system_prompt`
+  content reaching spawned agents without instrumenting production code
+  paths. Needed to close coverage gaps on prompt composition routes.
+- [t4/c6 priya.p2,p3 → 2026-05-09] Keypair / write_snapshot failure-path
+  tests: provide a deterministic-name constructor or test hook so failure
+  branches in identity provisioning and registry persistence are reachable
+  from unit tests.
+
 #### Depends On
 
 - spawn-agent-tool
@@ -530,6 +549,69 @@ deleted — it remains as the audit record. The new message's envelope has a fre
 
 - per-agent-inspect
 
+## Phase 9: Documentation
+
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ⬜ not started  |            |            |
+
+Tags: docs
+
+The implementation is complete. This phase wires up the project's durable
+documentation layer so the knowledge that currently lives in specs survives
+their retirement.
+
+**mdBook.** Add `mdbook` to the Nix dev shell and create `docs/book.toml`.
+The book has two sections: Architecture (narrative overview, key design
+decisions) and Operations (install, configure, run, send a message). A
+`just docs` target builds and opens it. The GitHub Actions CI job adds a
+`mdbook build` step to verify the book compiles on every push.
+
+**Architecture Decision Records.** `docs/decisions/` holds numbered ADR
+files (`001-*.md`, `002-*.md`, …). Each ADR is a short document with three
+sections: Context (why the decision arose), Decision (what was chosen and
+what was rejected), Consequences (what follows from the choice). ADRs are
+never edited after the fact; superseded ADRs are marked with a `Superseded
+by:` line at the top. The first two ADRs capture decisions already made:
+the tool-actor trust boundary (tools as local executors, Agent as the audit
+point, envelope protocol reserved for agent-to-agent crossings) and the
+actor-system internals model (actix supervision tree, Maildir spool,
+filesystem-only runtime/TUI channel).
+
+**Crate-level rustdoc.** Each crate root (`lib.rs` or `main.rs`) gains a
+`//!` module doc: one paragraph on what the crate does, one on its public
+surface, and a link to the book for narrative context. `cargo doc --no-deps`
+must produce zero warnings.
+
+**`architecture.md` cleanup.** The root `architecture.md` currently
+references spec files in its key-files table; those pointers are replaced
+with pointers to `cargo doc` output and `docs/decisions/`. The line "Signed
+envelopes are the only communication channel. There is no socket or RPC" is
+corrected to reflect the tool-actor model (tools communicate via actix
+messages internally; the envelope protocol governs cross-agent boundaries).
+
+#### Delivers
+
+- `docs/book.toml` and at least two book chapters (Architecture, Operations)
+- `docs/decisions/002-tool-actor-trust-boundary.md`
+- `docs/decisions/003-actor-system-internals.md`
+- `just docs` target building and opening the book
+- CI step verifying `mdbook build`
+- `//!` crate-level docs on all reeve-* crate roots (zero `cargo doc`
+  warnings)
+- `architecture.md` updated and accurate
+
+#### Done When
+
+- `just docs` builds without error and opens the book
+- `cargo doc --no-deps` produces zero warnings across all crates
+- Both ADRs exist and are prose-complete (context, decision, consequences)
+- `architecture.md` contains no dead links to retired spec files
+
+#### Depends On
+
+- quarantine-review-screen
+
 ## Notes
 
 ### Non-goals for this ladder
@@ -539,6 +621,11 @@ Deferred to later ladders:
 - Capability profile and blacklist enforcement — `InvokeTool.sender_id` is
   present; the authority check always returns Allow. Enforcement arrives in
   `reeve-authority` (ladder 3).
+- System-prompt source annotation and length cap — `spawn_agent`'s
+  `system_prompt` is caller-supplied (the spawning agent) but currently
+  treated as trusted by the spawned agent. Source annotation (mark as
+  untrusted at the boundary) and a transport-level length cap arrive in
+  `reeve-transport-security.md` (ladder 3+). [t5 yelena.SP-1 → 2026-05-09]
 - Classifier integration — no content classification on tool inputs or outputs.
   Arrives in `reeve-gatekeeper` (ladder 4).
 - Long-term agent lifecycle management — agents accumulate on disk indefinitely
