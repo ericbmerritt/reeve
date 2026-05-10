@@ -53,19 +53,61 @@ use crate::tool::{InvokeTool, ToolResult};
 /// `Message` by appending their content blocks rather than pushing a new
 /// message, reconstructing the same shape the adapter originally received.
 ///
-/// Returns `Ok(Vec::new())` when the journal file is absent (normal: first
-/// run). Returns `Err(io::Error)` for all other I/O failures (permission
-/// denied, disk fault, etc.).
+/// Also collects `message_id`s from completed `Inbound` turns into a [`SeenIds`] set in
+/// journal insertion order.
+///
+/// A turn is *completed* when its final `ModelCall` is not followed by a
+/// `ToolUse` entry before the next `Inbound` or end of journal. An `Inbound`
+/// with an incomplete round-trip (crash before the final `ModelCall`, or
+/// a `ModelCall` followed by a dangling `ToolUse`) is an interrupted turn.
+/// The watcher re-delivers that envelope, so its `message_id` must NOT be
+/// added to `seen_ids` — doing so would silently drop the re-delivery and
+/// leave the turn permanently unprocessed.
+///
+/// Returns `Ok((Vec::new(), SeenIds::new()))` when the journal file is absent
+/// (normal: first run). Returns `Err(io::Error)` for all other I/O failures
+/// (permission denied, disk fault, etc.).
+#[expect(
+    clippy::too_many_lines,
+    reason = "the match arms each handle a distinct journal entry variant; \
+              splitting into sub-functions would fragment tightly coupled logic \
+              without reducing actual complexity"
+)]
 pub(crate) fn load_history_from_journal(
     path: &Path,
-) -> Result<Vec<reeve_adapter::Message>, std::io::Error> {
+) -> Result<(Vec<reeve_adapter::Message>, SeenIds), std::io::Error> {
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((Vec::new(), SeenIds::new()));
+        }
         Err(err) => return Err(err),
     };
 
     let mut history: Vec<reeve_adapter::Message> = Vec::new();
+    let mut seen_ids = SeenIds::new();
+    // We commit to `seen_ids` only when we can confirm the full round-trip
+    // is durable — preventing crash-recovery re-delivery from being silently dropped.
+    let mut pending_inbound_id: Option<String> = None;
+
+    // State-machine flags for commit deferral: commit pending_inbound_id only
+    // when the entire tool-call chain is durably closed — not at an
+    // intermediate ModelCall that may be followed by another ToolUse.
+    //
+    // Runtime journal write order for a two-iteration tool turn:
+    //   Inbound → MC(1) → TU(a) → TR(a) → MC(2) → TU(b) → TR(b) → MC(3)
+    // Committing at MC(2) is wrong: if the process crashes after TU(b) the
+    // journal ends at TU(b), but the id is already in seen_ids, so re-delivery
+    // is silently dropped and the turn is permanently unprocessable.
+    //
+    // Deferral strategy: commit only when a ModelCall is NOT immediately
+    // followed by a ToolUse. `tool_use_after_last_mc` is reset to false on
+    // each ModelCall and set to true on each ToolUse. The commit is deferred
+    // to (a) the next Inbound boundary or (b) end-of-journal, whichever comes
+    // first, and only when `model_call_seen && !tool_use_after_last_mc`.
+    let mut model_call_seen: bool = false;
+    let mut tool_use_after_last_mc: bool = false;
+
     for line in content.lines() {
         if line.is_empty() {
             continue;
@@ -74,10 +116,26 @@ pub(crate) fn load_history_from_journal(
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
         let (role, block) = match entry {
-            ConversationEntry::Inbound { payload, .. } => (
-                reeve_adapter::Role::User,
-                reeve_adapter::MessageContent::Text(payload),
-            ),
+            ConversationEntry::Inbound {
+                message_id,
+                payload,
+                ..
+            } => {
+                // Deferred commit from the previous turn: if the last MC was
+                // not followed by a TU, the previous turn completed cleanly.
+                if model_call_seen && !tool_use_after_last_mc {
+                    if let Some(id) = pending_inbound_id.take() {
+                        seen_ids.insert(id);
+                    }
+                }
+                pending_inbound_id = Some(message_id);
+                model_call_seen = false;
+                tool_use_after_last_mc = false;
+                (
+                    reeve_adapter::Role::User,
+                    reeve_adapter::MessageContent::Text(payload),
+                )
+            }
             ConversationEntry::Outbound { payload, .. } => (
                 reeve_adapter::Role::Assistant,
                 reeve_adapter::MessageContent::Text(payload),
@@ -87,14 +145,17 @@ pub(crate) fn load_history_from_journal(
                 name,
                 input,
                 ..
-            } => (
-                reeve_adapter::Role::Assistant,
-                reeve_adapter::MessageContent::ToolUse {
-                    id: tool_use_id,
-                    name,
-                    input,
-                },
-            ),
+            } => {
+                tool_use_after_last_mc = true;
+                (
+                    reeve_adapter::Role::Assistant,
+                    reeve_adapter::MessageContent::ToolUse {
+                        id: tool_use_id,
+                        name,
+                        input,
+                    },
+                )
+            }
             ConversationEntry::ToolResult {
                 tool_use_id,
                 content,
@@ -108,7 +169,12 @@ pub(crate) fn load_history_from_journal(
                     is_error,
                 },
             ),
-            ConversationEntry::System { .. } | ConversationEntry::ModelCall { .. } => continue,
+            ConversationEntry::System { .. } => continue,
+            ConversationEntry::ModelCall { .. } => {
+                model_call_seen = true;
+                tool_use_after_last_mc = false;
+                continue;
+            }
         };
 
         match history.last_mut() {
@@ -135,7 +201,17 @@ pub(crate) fn load_history_from_journal(
     {
         history.pop();
     }
-    Ok(history)
+    // Deferred commit for the last turn in the journal: commit when the last
+    // ModelCall was not followed by a ToolUse (turn complete). A bare Inbound
+    // with no ModelCall, or a ModelCall followed by a ToolUse (turn still
+    // open — crash in the tool round-trip), are both not committed so the
+    // watcher can re-deliver for retry.
+    if model_call_seen && !tool_use_after_last_mc {
+        if let Some(id) = pending_inbound_id.take() {
+            seen_ids.insert(id);
+        }
+    }
+    Ok((history, seen_ids))
 }
 
 // ── Error type ────────────────────────────────────────────────────────────────
@@ -332,7 +408,7 @@ const SEEN_MESSAGE_IDS_CAP: usize = 4096;
 /// [`SEEN_MESSAGE_IDS_CAP`] the oldest entry is evicted to make room. Used
 /// for inbound dedup; see the field-level comment on [`Agent::seen_message_ids`].
 #[derive(Debug, Default)]
-struct SeenIds {
+pub(crate) struct SeenIds {
     set: HashSet<String>,
     order: VecDeque<String>,
 }
@@ -340,6 +416,35 @@ struct SeenIds {
 impl SeenIds {
     fn new() -> Self {
         Self::default()
+    }
+
+    /// Loads `ids` in order, keeping only the last [`SEEN_MESSAGE_IDS_CAP`]
+    /// entries when `ids` exceeds the cap (oldest are dropped). Duplicates
+    /// are skipped (first occurrence wins).
+    #[cfg(test)]
+    fn from_vec(ids: &[String]) -> Self {
+        let mut this = Self::default();
+        let start = ids.len().saturating_sub(SEEN_MESSAGE_IDS_CAP);
+        for id in &ids[start..] {
+            this.insert(id.clone());
+        }
+        this
+    }
+
+    #[cfg(test)]
+    fn contains(&self, id: &str) -> bool {
+        self.set.contains(id)
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.order.len()
+    }
+
+    /// Returns ids in insertion order (`VecDeque`, not `HashSet`).
+    #[cfg(test)]
+    fn iter(&self) -> impl Iterator<Item = &String> {
+        self.order.iter()
     }
 
     /// Insert `id`. Returns `true` if the id is new (insert took effect),
@@ -410,7 +515,7 @@ impl Agent {
         let status_writer = AtomicFileWriter::new(dirs.status_path()).map_err(AgentError::Fs)?;
         let cost_writer = AtomicFileWriter::new(dirs.cost_path()).map_err(AgentError::Fs)?;
 
-        let history =
+        let (history, seen_message_ids) =
             load_history_from_journal(&conversation_path).map_err(|source| AgentError::Io {
                 path: conversation_path.clone(),
                 source,
@@ -444,7 +549,7 @@ impl Agent {
             agent_id,
             keypair,
             pending_inbound: VecDeque::new(),
-            seen_message_ids: SeenIds::new(),
+            seen_message_ids,
         })
     }
 
@@ -790,9 +895,8 @@ impl Supervised for Agent {
         self.pending_tool_use_ids.clear();
         self.pending_results.clear();
         self.pending_inbound.clear();
-        // scan_cur_and_dispatch runs once at startup via the WatchInbox handler;
-        // it does not re-run on supervisor restart. Clearing here ensures messages
-        // delivered after restart are not silently dropped as false duplicates.
+        // scan_cur_and_dispatch does not run on supervisor restart (only at initial
+        // WatchInbox setup), so clearing here is safe: no cur/ files are re-dispatched.
         self.seen_message_ids = SeenIds::new();
         self.set_idle(ctx);
     }
@@ -2806,7 +2910,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("conv.jsonl");
         std::fs::write(&path, "").unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert!(history.is_empty());
     }
 
@@ -2814,7 +2918,7 @@ mod tests {
     fn load_history_from_journal_missing_file_returns_empty_vec() {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("nonexistent.jsonl");
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert!(history.is_empty());
     }
 
@@ -2829,7 +2933,7 @@ mod tests {
             r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].role, reeve_adapter::Role::User);
         assert_eq!(
@@ -2845,7 +2949,7 @@ mod tests {
         let line =
             r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#;
         std::fs::write(&path, format!("{line}\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].role, reeve_adapter::Role::Assistant);
         assert_eq!(
@@ -2863,7 +2967,7 @@ mod tests {
             r#"{"type":"model_call","input_tokens":10,"output_tokens":5,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert!(
             history.is_empty(),
             "expected empty history for system/model_call only, got {history:?}"
@@ -2882,7 +2986,7 @@ mod tests {
             r#"{"type":"outbound","payload":"done","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(history.len(), 3, "expected 3 messages, got {history:?}");
 
         // tool_use → assistant turn
@@ -2923,7 +3027,7 @@ mod tests {
             r#"{"type":"outbound","payload":"replied","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(history.len(), 4);
         assert_eq!(history[0].role, reeve_adapter::Role::User);
         assert_eq!(
@@ -2963,7 +3067,7 @@ mod tests {
             r#"{"type":"inbound","message_id":"m3","payload":"crashed","timestamp_utc":"2024-01-01T00:00:02Z"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(
             history.len(),
             4,
@@ -2984,7 +3088,7 @@ mod tests {
         let path = tmp.path().join("conv.jsonl");
         let line = r#"{"type":"inbound","message_id":"m1","payload":"only","timestamp_utc":"2024-01-01T00:00:00Z"}"#;
         std::fs::write(&path, line).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert!(
             history.is_empty(),
             "single interrupted inbound must produce empty history; got {history:?}"
@@ -3005,7 +3109,7 @@ mod tests {
         ]
         .join("\n");
         std::fs::write(&path, content).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(
             history.len(),
             2,
@@ -3091,7 +3195,8 @@ mod tests {
         }
 
         // Verify that load_history_from_journal sees the 2 prior entries.
-        let prior_history = super::load_history_from_journal(&conversation_path).unwrap();
+        let (prior_history, _seen_ids) =
+            super::load_history_from_journal(&conversation_path).unwrap();
         assert_eq!(
             prior_history.len(),
             2,
@@ -3197,7 +3302,7 @@ mod tests {
             r#"{"type":"tool_use","tool_use_id":"tu1","name":"echo","input":{"text":"hi"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(
             history.len(),
             1,
@@ -3230,7 +3335,7 @@ mod tests {
             r#"{"type":"outbound","payload":"response","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
         ];
         std::fs::write(&path, lines.join("\n")).unwrap();
-        let history = super::load_history_from_journal(&path).unwrap();
+        let (history, _seen_ids) = super::load_history_from_journal(&path).unwrap();
         assert_eq!(
             history.len(),
             2,
@@ -3254,6 +3359,510 @@ mod tests {
             "merged user message must contain both ToolResult blocks"
         );
         assert_eq!(history[1].role, reeve_adapter::Role::Assistant);
+    }
+
+    // Fix B — new tests ────────────────────────────────────────────────────────
+
+    // FB1: load_history_from_journal collects message_ids from completed Inbound
+    // turns (each followed by an Outbound) into the returned Vec, in journal
+    // order. Outbound entries must not contribute ids.
+    #[test]
+    fn load_history_from_journal_collects_inbound_message_ids() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Both turns are complete: Inbound → Outbound → ModelCall. ModelCall
+        // (model_call_seen=T, tool_use_after_last_mc=F) triggers the deferred
+        // commit at the next Inbound boundary and at end-of-journal.
+        let lines = [
+            r#"{"type":"inbound","message_id":"inbound-1","payload":"hello","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":3,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"inbound","message_id":"inbound-2","payload":"again","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            r#"{"type":"outbound","payload":"replied","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            r#"{"type":"model_call","input_tokens":3,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert_eq!(
+            seen_ids.len(),
+            2,
+            "expected exactly 2 inbound message_ids; got {seen_ids:?}"
+        );
+        assert!(
+            seen_ids.iter().any(|id| id == "inbound-1"),
+            "seen_ids must contain inbound-1; got {seen_ids:?}"
+        );
+        assert!(
+            seen_ids.iter().any(|id| id == "inbound-2"),
+            "seen_ids must contain inbound-2; got {seen_ids:?}"
+        );
+    }
+
+    // w2: An interrupted inbound turn (Inbound with no subsequent Outbound)
+    // must NOT contribute its message_id to seen_ids, so crash-recovery
+    // re-delivery is not silently dropped.
+    #[test]
+    fn seen_ids_excludes_interrupted_inbound() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // First turn is complete (Inbound → Outbound → ModelCall). Second is
+        // interrupted — no ModelCall written before the next Inbound arrives.
+        let lines = [
+            r#"{"type":"inbound","message_id":"completed-turn","payload":"hello","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":3,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"inbound","message_id":"interrupted-turn","payload":"crash","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            // No outbound or ModelCall — process crashed before writing the reply.
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            seen_ids.iter().any(|id| id == "completed-turn"),
+            "seen_ids must contain the completed turn's id; got {seen_ids:?}"
+        );
+        assert!(
+            !seen_ids.iter().any(|id| id == "interrupted-turn"),
+            "seen_ids must NOT contain the interrupted turn's id; got {seen_ids:?}"
+        );
+    }
+
+    // GAP1: A complete tool-only turn must commit the message_id to seen_ids.
+    //
+    // Actual runtime journal write order for a tool turn with no preamble text
+    // and an empty-text EndTurn on the second adapter call:
+    //   Inbound → ModelCall(1) → ToolUse → ToolResult → ModelCall(2)
+    //
+    // The first ModelCall is written BEFORE ToolUse (before the crash window is
+    // closed), so committing there is unsafe. The deferral fix commits at
+    // end-of-journal when the last MC was not followed by a TU — here MC(2).
+    // The fixture includes both ModelCalls to match reality.
+    #[test]
+    fn load_history_from_journal_commits_message_id_on_model_call() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Complete tool-only turn: Inbound → ModelCall(1) → ToolUse → ToolResult
+        // → ModelCall(2). MC(2) has tool_use_after_last_mc=F → deferred commit.
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-tool-only","payload":"do the thing","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":5,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu1","name":"spawn_agent","input":{"persona":"p","task":"t"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu1","content":"ok","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":8,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            seen_ids.contains("msg-tool-only"),
+            "tool-only turn's message_id must be committed to seen_ids at second ModelCall; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // Crash scenario: a crash between ModelCall(1) and ToolResult leaves the
+    // journal as Inbound → ModelCall(1) → ToolUse. The pending_inbound_id must
+    // NOT be committed — the watcher must re-deliver so the turn can be retried.
+    #[test]
+    fn seen_ids_excludes_crash_between_model_call_and_tool_result() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Incomplete tool turn: crash between ToolUse write and ToolResult write.
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-crash","payload":"hi","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":5,"output_tokens":0,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu1","name":"spawn_agent","input":{},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            !seen_ids.contains("msg-crash"),
+            "interrupted tool turn must NOT be committed to seen_ids; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // GAP2: A complete two-iteration tool turn must commit the message_id exactly
+    // once.
+    //
+    // Journal: Inbound → MC(1) → TU(a) → TR(a) → MC(2) → TU(b) → TR(b) → MC(3)
+    //
+    // With the single-iteration fix (commit at ToolResult→ModelCall boundary),
+    // this would commit at MC(2) — correct for the complete turn but too early if
+    // the turn crashes after TU(b). The deferral fix commits only at
+    // end-of-journal when the last MC was not followed by a TU: here MC(3).
+    #[test]
+    fn load_history_from_journal_commits_message_id_on_two_iteration_tool_turn() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-two-iter","payload":"do two things","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":5,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu-a","name":"spawn_agent","input":{"persona":"p","task":"t"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu-a","content":"ok-a","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":8,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu-b","name":"spawn_agent","input":{"persona":"q","task":"u"},"timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu-b","content":"ok-b","is_error":false,"timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            r#"{"type":"model_call","input_tokens":12,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:02Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            seen_ids.contains("msg-two-iter"),
+            "two-iteration tool turn's message_id must be committed to seen_ids; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // Crash scenario: crash between TU(b) and TR(b) in a two-iteration turn.
+    // Journal ends: Inbound → MC(1) → TU(a) → TR(a) → MC(2) → TU(b).
+    // The message_id must NOT be committed — the watcher re-delivers for retry.
+    // This is the core regression caught by priya.p1: the old state machine
+    // committed at MC(2) (when tool_result_seen=T from TR(a)), so a subsequent
+    // crash at TU(b) left the id permanently in seen_ids, silently dropping
+    // re-delivery.
+    #[test]
+    fn seen_ids_excludes_crash_in_second_tool_iteration() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-two-iter-crash","payload":"do two things","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":5,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu-a","name":"spawn_agent","input":{"persona":"p","task":"t"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu-a","content":"ok-a","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":8,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu-b","name":"spawn_agent","input":{"persona":"q","task":"u"},"timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+            // crash here — TR(b) was never written
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            !seen_ids.contains("msg-two-iter-crash"),
+            "crash in second tool iteration must NOT commit message_id to seen_ids; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // Preamble-text tool turn crash: journal has Outbound before ToolUse.
+    // Sequence: Inbound → Outbound("preamble") → MC(1) → ToolUse(a) → [crash]
+    // The Outbound arm must NOT commit pending_inbound_id — the turn is incomplete
+    // because ToolUse(a) has not been followed by its ToolResult + final MC.
+    // This is the core m1 regression: the old code committed at Outbound, which
+    // would silently drop re-delivery after a crash in the tool round-trip.
+    #[test]
+    fn seen_ids_excludes_crash_in_preamble_text_tool_turn() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-preamble-crash","payload":"do it","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"Sure, I'll do that.","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":5,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu1","name":"spawn_agent","input":{"persona":"p","task":"t"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            // crash here — TR and final MC never written
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            !seen_ids.contains("msg-preamble-crash"),
+            "crash in preamble-text tool turn must NOT commit message_id to seen_ids; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // Positive case: complete preamble-text tool turn commits the message_id.
+    // Sequence: Inbound → Outbound("preamble") → MC(1) → ToolUse → ToolResult → MC(2)
+    // MC(2) has tool_use_after_last_mc=F → deferred commit fires at end-of-journal.
+    #[test]
+    fn load_history_from_journal_commits_message_id_for_preamble_text_tool_turn() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-preamble-complete","payload":"do it","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"Sure, I'll do that.","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":5,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu1","name":"spawn_agent","input":{"persona":"p","task":"t"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu1","content":"ok","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":8,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:01Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            seen_ids.contains("msg-preamble-complete"),
+            "complete preamble-text tool turn must commit message_id after final MC; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // Crash after ToolResult but before the following ModelCall.
+    // Sequence: Inbound → MC(1) → TU(a) → TR(a) → [crash before MC(2)]
+    // tool_use_after_last_mc is still true (set by TU(a), not yet reset by MC(2)),
+    // so the deferred-commit condition is false → id NOT committed → watcher re-delivers.
+    #[test]
+    fn seen_ids_excludes_crash_after_tool_result_before_mc() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-tr-crash","payload":"do it","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":5,"output_tokens":3,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_use","tool_use_id":"tu1","name":"spawn_agent","input":{"persona":"p","task":"t"},"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"tool_result","tool_use_id":"tu1","content":"ok","is_error":false,"timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            // crash here — MC(2) never written
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            !seen_ids.contains("msg-tr-crash"),
+            "crash after TR but before next MC must NOT commit message_id to seen_ids; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // priya.p3: Real production sequence for text-response turns. The runtime
+    // writes Outbound followed by ModelCall. Verify the id is committed and the
+    // post-loop condition does not erroneously skip it.
+    #[test]
+    fn load_history_from_journal_commits_message_id_for_real_text_turn_sequence() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Inbound → Outbound → ModelCall: the trailing ModelCall
+        // (model_call_seen=T, tool_use_after_last_mc=F) triggers the deferred
+        // commit. Outbound no longer commits (preamble-text tool turns use the
+        // same arm and must not commit before the tool round-trip closes).
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-text-real","payload":"hello","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"outbound","payload":"world","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":3,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            seen_ids.contains("msg-text-real"),
+            "text-turn id must be committed by deferred-MC arm; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+        assert_eq!(
+            seen_ids.len(),
+            1,
+            "exactly one id must be committed (no double-commit from trailing MC); \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // GAP1b: A tool-only turn where the model returns EndTurn with empty text
+    // immediately (no tool calls at all) produces a journal with only
+    // Inbound + ModelCall. The message_id must still be committed.
+    #[test]
+    fn load_history_from_journal_commits_message_id_on_model_call_no_tools() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conv.jsonl");
+        // Minimal turn: Inbound followed immediately by ModelCall (no tool calls,
+        // no Outbound — model returned EndTurn with empty text).
+        let lines = [
+            r#"{"type":"inbound","message_id":"msg-empty-endturn","payload":"hello","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            r#"{"type":"model_call","input_tokens":3,"output_tokens":1,"model":"test","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+        ];
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let (_history, seen_ids) = super::load_history_from_journal(&path).unwrap();
+        assert!(
+            seen_ids.contains("msg-empty-endturn"),
+            "empty-EndTurn turn's message_id must be committed to seen_ids via ModelCall arm; \
+             got seen_ids with {} entries",
+            seen_ids.len()
+        );
+    }
+
+    // g3: SeenIds::from_vec truncates to the cap when given more than
+    // SEEN_MESSAGE_IDS_CAP entries, retaining the last (most-recent) entries.
+    #[test]
+    fn seen_ids_from_vec_truncates_to_cap() {
+        let cap = super::SEEN_MESSAGE_IDS_CAP;
+        // Build a Vec with cap+1 distinct entries. The extra entry is at index 0
+        // (oldest), so after truncation it must not be present.
+        let ids: Vec<String> = (0..=cap).map(|i| format!("msg-{i}")).collect();
+        let oldest = ids[0].clone();
+        let newest = ids[cap].clone();
+
+        let seen = super::SeenIds::from_vec(&ids);
+
+        assert_eq!(
+            seen.order.len(),
+            cap,
+            "SeenIds must hold exactly SEEN_MESSAGE_IDS_CAP entries after truncation; \
+             got {}",
+            seen.order.len()
+        );
+        assert!(
+            !seen.set.contains(&oldest),
+            "oldest entry must have been evicted by cap truncation; oldest = {oldest}"
+        );
+        assert!(
+            seen.set.contains(&newest),
+            "newest entry must be retained; newest = {newest}"
+        );
+    }
+
+    // FB2: An agent constructed with a journal that already contains an Inbound
+    // entry for a message_id drops a subsequent ProcessInbound with that same id
+    // without calling the adapter. Uses MockAdapter (always BadRequest); if the
+    // adapter were called, an error journal entry would be written — assert none
+    // appears.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the probe-based drain requires setup, actor lifecycle, journal polling, \
+                  and multiple post-assertions; each step is necessary and splitting \
+                  into helpers would obscure the test's intent"
+    )]
+    #[test]
+    fn seen_ids_rebuilt_from_journal_prevents_reprocessing() {
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let conversation_path = dirs.conversation_path();
+
+        // Pre-seed the journal with a completed turn so the message_id is
+        // present and the history ends on an assistant turn (no truncation).
+        {
+            let thread = crate::agent_fs::ConversationThread::open(&conversation_path).unwrap();
+            thread
+                .append(&ConversationEntry::Inbound {
+                    message_id: "msg-already-processed".to_owned(),
+                    payload: "prior turn".to_owned(),
+                    timestamp_utc: time::OffsetDateTime::now_utc(),
+                })
+                .unwrap();
+            thread
+                .append(&ConversationEntry::Outbound {
+                    payload: "prior reply".to_owned(),
+                    timestamp_utc: time::OffsetDateTime::now_utc(),
+                })
+                .unwrap();
+            thread
+                .append(&ConversationEntry::ModelCall {
+                    input_tokens: 3,
+                    output_tokens: 1,
+                    model: "test".to_owned(),
+                    timestamp_utc: time::OffsetDateTime::now_utc(),
+                })
+                .unwrap();
+        }
+
+        // MockAdapter always returns BadRequest. If a call is made the agent
+        // appends a system error entry to the journal.
+        let adapter = Arc::new(crate::test_support::MockAdapter::new("mock@test"));
+        let agent = mock_agent(adapter, &dirs, Vec::new()).unwrap();
+
+        let conv_path_outer = conversation_path.clone();
+        let conv_path_assert = conv_path_outer.clone();
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |_| agent);
+
+            // Wait for the actor to start (status file appears).
+            let status_path = data_dir.join("agents").join("lead").join("status");
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if status_path.exists() {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() <= deadline,
+                    "actor did not start within 5 seconds"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+
+            // Send a ProcessInbound with the already-seen message_id.
+            addr.do_send(ProcessInbound {
+                payload: "re-delivered payload".to_owned(),
+                message_id: "msg-already-processed".to_owned(),
+            });
+
+            // Send a distinct probe message after the duplicate. The actor
+            // processes messages sequentially; once the probe's Inbound entry
+            // appears in the journal, the duplicate has already been handled
+            // (or dropped), draining the mailbox past it.
+            addr.do_send(ProcessInbound {
+                payload: "probe".to_owned(),
+                message_id: "msg-probe".to_owned(),
+            });
+
+            // Poll until the probe's Inbound entry is visible in the journal.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let content = std::fs::read_to_string(&conv_path_outer).unwrap_or_default();
+                    let probe_present = content.lines().filter(|l| !l.is_empty()).any(|l| {
+                        serde_json::from_str::<serde_json::Value>(l)
+                            .map(|e| e["type"] == "inbound" && e["message_id"] == "msg-probe")
+                            .unwrap_or(false)
+                    });
+                    if probe_present {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("probe Inbound entry never appeared in journal within 5 s");
+
+            actix::System::current().stop();
+        });
+
+        // The duplicate must have been silently dropped. If the adapter was
+        // called it would fail (BadRequest) and the agent would append a
+        // system error entry. Verify no such entry is present — the journal
+        // should contain only the pre-seeded Inbound + Outbound + ModelCall +
+        // system(started) plus the probe's entries.
+        let content = std::fs::read_to_string(&conv_path_assert).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        // The pre-seeded entry must be present exactly once; the re-delivered
+        // duplicate must not have produced a second journal entry.
+        let already_processed_inbound_count = entries
+            .iter()
+            .filter(|e| e["type"] == "inbound" && e["message_id"] == "msg-already-processed")
+            .count();
+        assert_eq!(
+            already_processed_inbound_count, 1,
+            "duplicate inbound must not produce a second journal entry; entries: {entries:?}"
+        );
+
+        // The probe must be present (confirms the actor ran past the duplicate).
+        let probe_inbound_count = entries
+            .iter()
+            .filter(|e| e["type"] == "inbound" && e["message_id"] == "msg-probe")
+            .count();
+        assert_eq!(
+            probe_inbound_count, 1,
+            "probe Inbound entry must appear exactly once; entries: {entries:?}"
+        );
+
+        // The probe triggers a MockAdapter error ("adapter call failed"). The duplicate
+        // must NOT have triggered a second adapter call. Count adapter-error system
+        // entries and assert exactly 1 (from the probe).
+        let adapter_call_count = entries
+            .iter()
+            .filter(|e| {
+                e["type"] == "system"
+                    && e["message"]
+                        .as_str()
+                        .map(|m| m.contains("adapter call failed"))
+                        .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(
+            adapter_call_count, 1,
+            "exactly 1 adapter call expected (probe only); duplicate must not trigger adapter; entries: {entries:?}"
+        );
     }
 
     // P2: A journal file that exists but cannot be read returns Err, not Ok.

@@ -868,11 +868,11 @@ impl Watcher {
     ///
     /// The correct cleanup mechanism is `rotate_cur`, which archives verified
     /// messages from `cur/` after the configured retention period.
-    pub(crate) fn scan_cur_and_dispatch(
-        inbox: &AgentInbox,
-        agent_id: IdentityId,
-        recipient: &actix::Recipient<crate::agent::ProcessInbound>,
-    ) {
+    ///
+    /// Routes through [`Watcher::dispatch_envelope`] — the single
+    /// `ProcessInbound` dispatch gateway per CLAUDE.md and
+    /// `docs/decisions/001-single-processInbound-dispatch.md`.
+    pub(crate) fn scan_cur_and_dispatch(&self, inbox: &AgentInbox, agent_id: IdentityId) {
         let cur = inbox.cur();
         let Ok(entries) = fs::read_dir(cur) else {
             return;
@@ -889,45 +889,37 @@ impl Watcher {
             if !metadata.is_file() {
                 continue;
             }
-            if let Some((payload, message_id, recipient_id)) = Self::read_cur_payload(&path) {
-                if recipient_id != agent_id {
+            if let Some((envelope, payload)) = Self::read_cur_payload(&path) {
+                if envelope.recipient_id != agent_id {
                     warn!(
                         path = %path.display(),
-                        envelope_recipient_id = %recipient_id,
+                        envelope_recipient_id = %envelope.recipient_id,
                         inbox_agent_id = %agent_id,
                         "cur/ envelope recipient mismatch; skipping dispatch",
                     );
                     continue;
                 }
-                recipient.do_send(crate::agent::ProcessInbound {
-                    payload,
-                    message_id,
-                });
+                self.dispatch_envelope(&envelope, payload);
             }
         }
     }
 
-    /// Read an envelope file from `cur/` and return `(payload, message_id,
-    /// recipient_id)`.
+    /// Read an envelope file from `cur/` and return the full [`Envelope`] plus
+    /// the UTF-8–decoded body payload.
     ///
-    /// Opens with `O_NOFOLLOW`. Returns `None` when the file cannot be read
-    /// or parsed. Logs a warning and returns `None` when the body is not valid
+    /// Opens with `O_NOFOLLOW`. Returns `None` when the file cannot be read or
+    /// parsed. Logs a warning and returns `None` when the body is not valid
     /// UTF-8 so operators can detect files stuck in `cur/`.
-    ///
-    /// `message_id` is taken from `envelope.message_id`, not from the filename,
-    /// so crash-recovery dispatch is consistent with live delivery via
-    /// [`Watcher::dispatch_envelope`].
-    fn read_cur_payload(path: &Path) -> Option<(String, String, IdentityId)> {
+    fn read_cur_payload(path: &Path) -> Option<(Envelope, String)> {
         let buf = read_nofollow(path).ok()?;
-        let envelope: Envelope = serde_json::from_slice(&buf).ok()?;
-        let message_id = envelope.message_id.to_string();
-        let recipient_id = envelope.recipient_id;
-        if let Ok(payload) = String::from_utf8(envelope.body) {
-            Some((payload, message_id, recipient_id))
+        let mut envelope: Envelope = serde_json::from_slice(&buf).ok()?;
+        let body = std::mem::take(&mut envelope.body);
+        if let Ok(payload) = String::from_utf8(body) {
+            Some((envelope, payload))
         } else {
             warn!(
                 path = %path.display(),
-                message_id = %message_id,
+                message_id = %envelope.message_id,
                 "cur/ envelope body is not valid UTF-8; skipping crash-recovery dispatch"
             );
             None
@@ -1840,9 +1832,12 @@ mod tests {
                 dispatched_clone,
                 Arc::new(Mutex::new(None)),
             );
+            // Register the route so dispatch_envelope has somewhere to send.
+            ctx.watcher.register_route(ctx.recipient_id, recipient);
 
             // Must not panic.
-            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+            ctx.watcher
+                .scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id);
 
             actix::System::current().stop();
         });
@@ -1904,7 +1899,7 @@ mod tests {
 
             // Step 2: scan_cur_and_dispatch re-dispatches the same cur/ file
             // without consulting the ledger — at-least-once semantics.
-            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+            ctx.watcher.scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id);
 
             // Wait up to 5 s for both dispatches to arrive at the collector.
             let deadline =
@@ -1995,7 +1990,8 @@ mod tests {
 
             // Step 3: scan_cur_and_dispatch picks up the waiting envelope and
             // dispatches it now that a route is present.
-            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+            ctx.watcher
+                .scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id);
 
             // Wait up to 5 s for the dispatch to arrive.
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -2054,8 +2050,12 @@ mod tests {
                 dispatched_clone,
                 Arc::new(Mutex::new(None)),
             );
+            // Register the route so dispatch_envelope has somewhere to send
+            // (it is not expected to be called, but it must not panic).
+            ctx.watcher.register_route(ctx.recipient_id, recipient);
 
-            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+            ctx.watcher
+                .scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id);
 
             actix::System::current().stop();
         });
@@ -2719,8 +2719,10 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let recipient = make_collector(CollectorField::MessageId, dispatched_clone, notify);
+            ctx.watcher.register_route(ctx.recipient_id, recipient);
 
-            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+            ctx.watcher
+                .scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id);
 
             tokio::time::timeout(std::time::Duration::from_secs(5), rx)
                 .await
@@ -2945,8 +2947,10 @@ mod tests {
                 dispatched_clone,
                 Arc::new(Mutex::new(None)),
             );
+            ctx.watcher.register_route(ctx.recipient_id, recipient);
 
-            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+            ctx.watcher
+                .scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id);
 
             actix::System::current().stop();
         });
@@ -2990,8 +2994,12 @@ mod tests {
                 dispatched_clone,
                 Arc::new(Mutex::new(None)),
             );
+            // Register the route for the correct agent_id; the stray envelope
+            // targets a different id and must be skipped.
+            ctx.watcher.register_route(ctx.recipient_id, recipient);
 
-            Watcher::scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id, &recipient);
+            ctx.watcher
+                .scan_cur_and_dispatch(&ctx.inbox, ctx.recipient_id);
 
             actix::System::current().stop();
         });

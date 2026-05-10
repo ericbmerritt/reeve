@@ -33,8 +33,8 @@ whether the rule still holds (and retire it if not).
   paraphrase the next line, restate the function name, or narrate code
   structure are deleted before commit. Comments that explain non-obvious
   cross-module behavior, external-system interaction, or intentional design
-  tradeoffs stay. When in doubt: ask whether a careful reader who has *only
-  the code in front of them* (not the surrounding crate, not the external
+  tradeoffs stay. When in doubt: ask whether a careful reader who has _only
+  the code in front of them_ (not the surrounding crate, not the external
   system's docs) can recover the comment's information. If yes, delete. If
   the comment names a coupling the code at this location can't show, keep
   it.
@@ -51,7 +51,7 @@ whether the rule still holds (and retire it if not).
   **Source:** [t3/c10 priya.p1, p2]; reinforced across Phase 3 t5 cycles.
 - **Tests of quarantine paths assert audit events.** Any test exercising a
   quarantine code path includes an `audit_lines!(kind=transport.quarantine,
-  reason=<expected>)` assertion. A test that hits the path without observing
+reason=<expected>)` assertion. A test that hits the path without observing
   the audit proves only that the function returned, not that the system
   recorded the security event.
   **Why:** Quarantine is a security boundary; the audit trail is what

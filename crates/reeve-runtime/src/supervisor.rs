@@ -287,9 +287,9 @@ impl Handler<WatchInbox> for WatcherActor {
         // thread so it doesn't block the async executor.
         tokio::task::spawn_blocking({
             let inbox = inbox.clone();
-            let recipient = recipient.clone();
+            let watcher = Arc::clone(&watcher);
             move || {
-                Watcher::scan_cur_and_dispatch(&inbox, agent_id, &recipient);
+                watcher.scan_cur_and_dispatch(&inbox, agent_id);
             }
         });
 
