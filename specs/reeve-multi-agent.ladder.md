@@ -298,25 +298,6 @@ to the lead via `send_message` in its own tool loop.
 - A `message_id` returned by the tool appears in B's delivery ledger after
   delivery
 
-#### Carried Follow-ons
-
-Items deferred from prior phases that belong here:
-
-- [t4/c9 pier.p2 → 2026-05-09] AgentRegistry per-spawn re-open: consider
-  holding `AgentRegistry` open as mutable shared state when
-  `MessageDispatcher` needs sender lookup (for the in-memory keypair) and
-  recipient lookup. The per-spawn re-open pattern from Phase 3 was NT'd
-  there as actix-sequential safe; with a second consumer in Phase 4 the
-  tradeoff may shift.
-- [t4 priya.p1 → 2026-05-09] System-prompt branch testing: add a
-  `MockAgent` observation hook so tests can assert on `system_prompt`
-  content reaching spawned agents without instrumenting production code
-  paths. Needed to close coverage gaps on prompt composition routes.
-- [t4/c6 priya.p2,p3 → 2026-05-09] Keypair / write_snapshot failure-path
-  tests: provide a deterministic-name constructor or test hook so failure
-  branches in identity provisioning and registry persistence are reachable
-  from unit tests.
-
 #### Depends On
 
 - spawn-agent-tool
@@ -553,7 +534,7 @@ deleted — it remains as the audit record. The new message's envelope has a fre
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not started  |            |            |
+| ⬜ not-started  |            |            |
 
 Tags: docs
 
