@@ -8,15 +8,13 @@
 use std::io::{Read, Write};
 use std::path::Path;
 
-use rand_core::{OsRng, RngCore};
-use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use reeve_runtime::{IdentityRegistry, OperatorKeyStore, StoredIdentity};
-use reeve_transport::{sign_envelope, verify_envelope};
+use reeve_transport::{fresh_nonce, sha256_payload_hash, sign_envelope, verify_envelope};
 use reeve_types::{
-    Envelope, EnvelopeSignature, IdentityId, KeyId, KeyState, MessageId, Nonce, PayloadHash,
-    PrivateKey, SchemaVersion, NONCE_LEN, PAYLOAD_HASH_LEN, SIGNATURE_LEN,
+    Envelope, EnvelopeSignature, IdentityId, KeyId, KeyState, MessageId, PrivateKey, SchemaVersion,
+    SIGNATURE_LEN,
 };
 
 use crate::identity::find_existing_operator;
@@ -240,7 +238,7 @@ pub(crate) fn sign(
 
     let message_id = MessageId::new().map_err(EnvelopeCliError::MintMessageId)?;
     let nonce = fresh_nonce();
-    let payload_hash = sha256_hash(body);
+    let payload_hash = sha256_payload_hash(body);
 
     let mut envelope = Envelope::new(
         SchemaVersion::V1,
@@ -366,21 +364,6 @@ pub(crate) fn verify_from_path(
     verify(registry, &mut file, out)
 }
 
-/// Generate a fresh 16-byte cryptographic nonce using the OS RNG.
-fn fresh_nonce() -> Nonce {
-    let mut bytes = [0u8; NONCE_LEN];
-    OsRng.fill_bytes(&mut bytes);
-    Nonce::from_bytes(bytes)
-}
-
-/// Compute the SHA-256 hash of `data` and return it as a [`PayloadHash`].
-fn sha256_hash(data: &[u8]) -> PayloadHash {
-    let digest = Sha256::digest(data);
-    let mut bytes = [0u8; PAYLOAD_HASH_LEN];
-    bytes.copy_from_slice(&digest);
-    PayloadHash::from_bytes(bytes)
-}
-
 /// Find the first stored identity whose `identity_id` matches `id`.
 fn find_by_identity_id(stored: &[StoredIdentity], id: IdentityId) -> Option<&StoredIdentity> {
     stored.iter().find(|s| s.identity().identity_id == id)
@@ -391,7 +374,8 @@ mod tests {
     use super::*;
 
     use reeve_runtime::keychain::memory::MemoryKeyStore;
-    use reeve_types::{Identity, KeyRecord, Keypair};
+    use reeve_transport::sha256_payload_hash;
+    use reeve_types::{Identity, KeyRecord, Keypair, PAYLOAD_HASH_LEN};
     use tempfile::tempdir;
     use time::Duration;
 
@@ -731,8 +715,8 @@ mod tests {
     }
 
     #[test]
-    fn sha256_hash_known_vector() {
-        let hash = sha256_hash(b"");
+    fn sha256_payload_hash_known_vector() {
+        let hash = sha256_payload_hash(b"");
         let expected: [u8; PAYLOAD_HASH_LEN] = [
             0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
             0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
@@ -869,7 +853,7 @@ mod tests {
 
             let message_id = MessageId::new().unwrap();
             let nonce = fresh_nonce();
-            let payload_hash = sha256_hash(b"revoked body");
+            let payload_hash = sha256_payload_hash(b"revoked body");
 
             let mut envelope = Envelope::new(
                 SchemaVersion::V1,
@@ -927,7 +911,7 @@ mod tests {
 
             let message_id = MessageId::new().unwrap();
             let nonce = fresh_nonce();
-            let payload_hash = sha256_hash(b"deprecated body");
+            let payload_hash = sha256_payload_hash(b"deprecated body");
 
             // created_at is now — which is after valid_until.
             let mut envelope = Envelope::new(
@@ -987,7 +971,7 @@ mod tests {
             let message_id = MessageId::new().unwrap();
             let nonce = fresh_nonce();
             let created_at = OffsetDateTime::now_utc();
-            let payload_hash = sha256_hash(b"within window");
+            let payload_hash = sha256_payload_hash(b"within window");
 
             let mut envelope = Envelope::new(
                 SchemaVersion::V1,

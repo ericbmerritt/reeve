@@ -14,8 +14,10 @@ workspace = true
 
 [dependencies]
 ed25519-dalek = { workspace = true }
+rand_core = { workspace = true }
 reeve-types = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 [dev-dependencies]
 time = { workspace = true }
