@@ -865,17 +865,26 @@ fn launch_actors(
         Arc::clone(&adapter),
         watcher_for_coord,
         watcher_addr.clone().recipient(),
+        dispatcher_addr.clone().recipient(),
     );
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
 
     let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord_addr.recipient());
+    let send_message_tool =
+        crate::tool::SendMessageTool::new(dispatcher_addr.clone().recipient());
     let tools: Vec<(
         reeve_adapter::Tool,
         actix::Recipient<crate::tool::InvokeTool>,
-    )> = vec![(
-        crate::tool::SpawnAgentTool::descriptor(),
-        spawn_agent_tool.start().recipient(),
-    )];
+    )> = vec![
+        (
+            crate::tool::SpawnAgentTool::descriptor(),
+            spawn_agent_tool.start().recipient(),
+        ),
+        (
+            crate::tool::SendMessageTool::descriptor(),
+            send_message_tool.start().recipient(),
+        ),
+    ];
 
     // Agent: processes inbound envelopes via the model adapter and the tool
     // execution loop.

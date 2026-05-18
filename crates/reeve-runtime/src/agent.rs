@@ -2632,7 +2632,7 @@ mod tests {
     )]
     fn spawn_agent_tool_spawns_agent_with_idle_status() {
         use crate::spawn_coordinator::SpawnCoordinator;
-        use crate::test_support::{build_registries, NullInboxStarter};
+        use crate::test_support::{build_registries, NullDispatcher, NullInboxStarter};
         use crate::tool::SpawnAgentTool;
         use actix::Actor as _;
 
@@ -2664,6 +2664,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let null_inbox = NullInboxStarter.start();
+            let null_dispatcher = NullDispatcher.start();
 
             let spawn_coordinator = SpawnCoordinator::new(
                 data_dir_for_block.clone(),
@@ -2672,6 +2673,7 @@ mod tests {
                 Arc::clone(&coord_adapter),
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
+                null_dispatcher.recipient(),
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
@@ -2790,7 +2792,7 @@ mod tests {
     )]
     fn spawn_agent_tool_returns_error_for_unknown_persona() {
         use crate::spawn_coordinator::SpawnCoordinator;
-        use crate::test_support::{build_registries, NullInboxStarter};
+        use crate::test_support::{build_registries, NullDispatcher, NullInboxStarter};
         use crate::tool::SpawnAgentTool;
         use actix::Actor as _;
 
@@ -2818,6 +2820,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let null_inbox = NullInboxStarter.start();
+            let null_dispatcher = NullDispatcher.start();
 
             let spawn_coordinator = SpawnCoordinator::new(
                 data_dir_for_block.clone(),
@@ -2826,6 +2829,7 @@ mod tests {
                 Arc::clone(&coord_adapter),
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
+                null_dispatcher.recipient(),
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
