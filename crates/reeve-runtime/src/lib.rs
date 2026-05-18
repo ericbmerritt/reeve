@@ -56,7 +56,9 @@ pub use model_resolution::{resolve_model, write_spawn_snapshot, ModelResolveErro
 pub use runtime_lock::{default_state_dir, RuntimeLock, RuntimeLockError};
 pub use spawn_coordinator::{SpawnCoordinator, SpawnRequestError, SpawnResponse};
 pub use supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
-pub use tool::{check_authority, AuthorityDecision, InvokeTool, SpawnAgentTool, ToolResult};
+pub use tool::{
+    check_authority, AuthorityDecision, InvokeTool, SendMessageTool, SpawnAgentTool, ToolResult,
+};
 pub use verify::{
     emit_quarantine_audit, EnvelopeIds, QuarantineReason, Verdict, VerificationError,
     VerificationPipeline, DEFAULT_CLOCK_SKEW, MAX_ENVELOPE_BYTES,

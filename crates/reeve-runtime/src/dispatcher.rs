@@ -128,9 +128,13 @@ impl fmt::Display for SendError {
 }
 
 impl SendError {
-    /// Used in `warn!` to identify the problem class without leaking filesystem
-    /// paths that appear in the `Io` and `KeypairLoad` Display strings.
-    fn category(&self) -> &'static str {
+    /// Classifier for the error variant. Used in `warn!` and surfaced to model
+    /// output by tool handlers as a stable, path-free identifier. The `Io` and
+    /// `KeypairLoad` variants embed filesystem paths in their `Display` output;
+    /// callers that report errors to untrusted readers must use this instead of
+    /// `to_string()`.
+    #[must_use]
+    pub fn category(&self) -> &'static str {
         match self {
             Self::RecipientNotFound { .. } => "RecipientNotFound",
             Self::SenderNotFound { .. } => "SenderNotFound",

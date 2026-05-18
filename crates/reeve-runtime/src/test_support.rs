@@ -296,6 +296,49 @@ impl actix::Handler<crate::supervisor::WatchInbox> for NullInboxStarter {
     fn handle(&mut self, _msg: crate::supervisor::WatchInbox, _ctx: &mut actix::Context<Self>) {}
 }
 
+// ── Null dispatcher ───────────────────────────────────────────────────────────
+
+/// Test stub for a [`crate::dispatcher::SendMessage`] recipient. Accepts
+/// `SendMessage` and silently drops it. Used in tests that need a valid
+/// dispatcher recipient wired into [`crate::spawn_coordinator::SpawnCoordinator`]
+/// without exercising the dispatch path.
+pub(crate) struct NullDispatcher;
+
+impl actix::Actor for NullDispatcher {
+    type Context = actix::Context<Self>;
+}
+
+impl actix::Handler<crate::dispatcher::SendMessage> for NullDispatcher {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        _msg: crate::dispatcher::SendMessage,
+        _ctx: &mut actix::Context<Self>,
+    ) {
+    }
+}
+
+// ── Tool result capture helpers ───────────────────────────────────────────────
+
+/// Default timeout for tool-loop assertions: long enough that a healthy actor
+/// pipeline never trips it, short enough that a regression which never delivers
+/// a `ToolResult` fails the test by assertion instead of by CI timeout.
+pub(crate) const TOOL_RESULT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Construct a [`Recipient<crate::tool::ToolResult>`] backed by a tokio oneshot
+/// receiver. Shared by tool-actor tests that need to assert on the single
+/// `ToolResult` a tool emits per `InvokeTool`.
+pub(crate) fn tool_result_capture_pair() -> (
+    actix::Recipient<crate::tool::ToolResult>,
+    tokio::sync::oneshot::Receiver<crate::tool::ToolResult>,
+) {
+    use actix::Actor as _;
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let addr = ToolResultCapture { tx: Some(tx) }.start();
+    (addr.recipient(), rx)
+}
+
 // ── Persona config writer ─────────────────────────────────────────────────────
 
 /// `model_pref` must match the prefix of the adapter id used by the test (the part before `'@'`).

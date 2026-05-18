@@ -25,10 +25,12 @@ use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentRegistryError, AgentStatus,
 };
 use crate::config::load_persona_config;
+use crate::dispatcher::SendMessage;
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
 use crate::model_resolution::{resolve_model, write_spawn_snapshot};
 use crate::supervisor::WatchInbox;
+use crate::tool::{InvokeTool, SendMessageTool};
 use crate::watcher::Watcher;
 use crate::ValidatedAgentName;
 
@@ -204,13 +206,17 @@ pub struct SpawnCoordinator {
     /// for each new agent. Typically a [`crate::supervisor::WatcherActor`]
     /// recipient; replaceable in tests with a no-op stub.
     inbox_starter: actix::Recipient<WatchInbox>,
+    /// Dispatcher recipient handed to each spawned subagent's
+    /// [`SendMessageTool`] so subordinates can reply via `send_message` in
+    /// their own tool loop.
+    dispatcher: actix::Recipient<SendMessage>,
 }
 
 impl SpawnCoordinator {
     /// Construct a coordinator.
     #[expect(
         clippy::too_many_arguments,
-        reason = "coordinator wires six independent runtime collaborators; \
+        reason = "coordinator wires seven independent runtime collaborators; \
                   bundling into a config struct trades clarity for indirection"
     )]
     pub fn new(
@@ -220,6 +226,7 @@ impl SpawnCoordinator {
         adapter: Arc<dyn reeve_adapter::Adapter>,
         watcher: Arc<Watcher>,
         inbox_starter: actix::Recipient<WatchInbox>,
+        dispatcher: actix::Recipient<SendMessage>,
     ) -> Self {
         Self {
             data_dir,
@@ -228,6 +235,7 @@ impl SpawnCoordinator {
             adapter,
             watcher,
             inbox_starter,
+            dispatcher,
         }
     }
 }
@@ -237,6 +245,24 @@ impl Actor for SpawnCoordinator {
 }
 
 impl Supervised for SpawnCoordinator {}
+
+// ── Subagent tool wiring ──────────────────────────────────────────────────────
+
+/// Build the tool set every spawned subagent gets. Currently just
+/// `send_message`, wired to the shared dispatcher so subordinates can reply to
+/// the lead (and to peers) via their own tool loop. Extracted into a free
+/// function so tests can assert the descriptor list without spinning up the
+/// full spawn pipeline.
+fn build_subagent_tools(
+    dispatcher: actix::Recipient<SendMessage>,
+) -> Vec<(reeve_adapter::Tool, actix::Recipient<InvokeTool>)> {
+    use actix::Actor as _;
+    let send_message_tool = SendMessageTool::new(dispatcher);
+    vec![(
+        SendMessageTool::descriptor(),
+        send_message_tool.start().recipient(),
+    )]
+}
 
 // ── SpawnRequest handler ──────────────────────────────────────────────────────
 
@@ -403,6 +429,8 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             format!("{}\n\n{}", persona_config.system_prompt, system_prompt)
         };
 
+        let tools = build_subagent_tools(self.dispatcher.clone());
+
         let new_agent = match Agent::new(
             Arc::clone(&self.adapter),
             &dirs,
@@ -410,7 +438,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             final_system_prompt,
             agent_id,
             keypair,
-            vec![],
+            tools,
         ) {
             Ok(a) => a,
             Err(err) => {
@@ -460,12 +488,15 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::oneshot;
 
-    use super::{SpawnCoordinator, SpawnRequest, SpawnRequestError, SpawnResponse};
+    use super::{
+        build_subagent_tools, SpawnCoordinator, SpawnRequest, SpawnRequestError, SpawnResponse,
+    };
     use crate::agent_registry::{AgentRegistry, AgentStatus};
     use crate::identity_registry::IdentityRegistry;
     use crate::supervisor::WatchInbox;
     use crate::test_support::{
-        build_registries, secure_dir, MockAdapter, NullInboxStarter, ResponseCapture,
+        build_registries, secure_dir, MockAdapter, NullDispatcher, NullInboxStarter,
+        ResponseCapture,
     };
     use crate::watcher::Watcher;
     use reeve_types::IdentityId;
@@ -483,8 +514,10 @@ mod tests {
         agent_registry_path: std::path::PathBuf,
         inbox_starter: actix::Recipient<WatchInbox>,
     ) -> SpawnCoordinator {
+        use actix::Actor as _;
         let adapter: Arc<dyn reeve_adapter::Adapter> =
             Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+        let dispatcher = NullDispatcher.start().recipient();
         SpawnCoordinator::new(
             data_dir.to_path_buf(),
             agent_registry_path,
@@ -492,6 +525,7 @@ mod tests {
             adapter,
             watcher,
             inbox_starter,
+            dispatcher,
         )
     }
 
@@ -504,6 +538,28 @@ mod tests {
             .await
             .expect("SpawnResponse did not arrive within 5 seconds")
             .expect("SpawnResponse sender dropped without sending")
+    }
+
+    // ── SC0: subagent tool wiring ─────────────────────────────────────────────
+
+    /// Spawned subagents must receive the `send_message` tool so they can
+    /// reply to the lead (and to peers) via their own tool loop — Phase 4
+    /// `done_when` calls this out explicitly. A regression that drops the
+    /// dispatcher recipient and returns `vec![]` here would silently re-break
+    /// the cross-agent reply path.
+    #[test]
+    fn subagent_tools_include_send_message() {
+        actix::System::new().block_on(async move {
+            use actix::Actor as _;
+            let dispatcher = NullDispatcher.start().recipient();
+            let tools = build_subagent_tools(dispatcher);
+            let names: Vec<String> = tools.iter().map(|(t, _)| t.name.clone()).collect();
+            assert!(
+                names.iter().any(|n| n == "send_message"),
+                "subagent tools missing send_message; got: {names:?}"
+            );
+            actix::System::current().stop();
+        });
     }
 
     // ── SC1: persona not found ────────────────────────────────────────────────
