@@ -304,6 +304,29 @@ pub(crate) fn resolve_xdg_base_dir(
     }
 }
 
+/// Resolve the reeve data root: the single directory under which every piece
+/// of on-disk reeve state lives (identity TOMLs, personas, teams, audit,
+/// ledgers, per-agent runtime trees, and the agent registry).
+///
+/// Returns `<xdg-base>/reeve/identities/`. The trailing `identities` segment
+/// is historical — the directory was originally named for identity TOML files
+/// but has since accumulated every other piece of persistent state. Both
+/// [`IdentityRegistry::default_data_dir`](crate::IdentityRegistry::default_data_dir)
+/// and
+/// [`AgentRegistry::default_registry_path`](crate::agent_registry::AgentRegistry::default_registry_path)
+/// resolve through here so the registry file and the per-agent inboxes it
+/// references share one ancestor; rooting them at sibling paths invites the
+/// kind of layout drift that previously left agent records pointing at
+/// directories the daemon could not see.
+pub(crate) fn resolve_reeve_data_root(
+    xdg: Option<&OsStr>,
+    home: Option<&OsStr>,
+) -> Result<PathBuf, XdgBaseError> {
+    Ok(resolve_xdg_base_dir(xdg, home)?
+        .join("reeve")
+        .join("identities"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

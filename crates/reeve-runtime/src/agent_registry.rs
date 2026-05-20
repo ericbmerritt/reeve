@@ -26,8 +26,8 @@ use time::OffsetDateTime;
 use zeroize::Zeroizing;
 
 use crate::fs_util::{
-    atomic_write_file, ensure_directory, read_nofollow_bounded, resolve_xdg_base_dir, set_nofollow,
-    FsCheckError, XdgBaseError,
+    atomic_write_file, ensure_directory, read_nofollow_bounded, resolve_reeve_data_root,
+    set_nofollow, FsCheckError, XdgBaseError,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -533,13 +533,13 @@ fn resolve_default_registry_path(
     xdg_data_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Result<PathBuf, AgentRegistryError> {
-    let base = resolve_xdg_base_dir(xdg_data_home, home).map_err(|e| match e {
+    let data_root = resolve_reeve_data_root(xdg_data_home, home).map_err(|e| match e {
         XdgBaseError::MissingHome => AgentRegistryError::MissingHome,
         XdgBaseError::RelativeDir { var_name, path } => {
             AgentRegistryError::RelativeDataDir { var_name, path }
         }
     })?;
-    Ok(base.join("reeve").join("agents").join("registry.toml"))
+    Ok(data_root.join("agents").join("registry.toml"))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -720,7 +720,9 @@ pub(crate) mod tests {
         assert_eq!(dirs.identity_key_path(), dirs.root().join("identity.key"));
     }
 
-    // T12: default_registry_path uses XDG_DATA_HOME when set.
+    // T12: default_registry_path uses XDG_DATA_HOME when set; the registry
+    // lives under the shared reeve data root (`identities/`) so it shares an
+    // ancestor with the per-agent inboxes it references.
     #[test]
     fn resolve_default_registry_path_uses_xdg_when_set() {
         let path = resolve_default_registry_path(
@@ -728,7 +730,10 @@ pub(crate) mod tests {
             Some(OsStr::new("/home/op")),
         )
         .unwrap();
-        assert_eq!(path, PathBuf::from("/srv/data/reeve/agents/registry.toml"),);
+        assert_eq!(
+            path,
+            PathBuf::from("/srv/data/reeve/identities/agents/registry.toml"),
+        );
     }
 
     // T13: default_registry_path falls back to HOME when XDG unset.
@@ -737,7 +742,7 @@ pub(crate) mod tests {
         let path = resolve_default_registry_path(None, Some(OsStr::new("/home/op"))).unwrap();
         assert_eq!(
             path,
-            PathBuf::from("/home/op/.local/share/reeve/agents/registry.toml"),
+            PathBuf::from("/home/op/.local/share/reeve/identities/agents/registry.toml"),
         );
     }
 
