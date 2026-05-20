@@ -730,14 +730,37 @@ fn prepare_agent_startup(
         debug!(agent_id = %id, "reusing existing lead identity");
         id
     } else {
-        // Bootstrap: no operator identity exists yet. Use new_operator so
-        // created_by is None — there is no prior identity to reference, and
-        // a dangling foreign key would corrupt the registry.
-        let identity = reeve_types::Identity::new_operator(lead_member.persona_name.clone())
-            .map_err(|e| DaemonError::Resource {
-                component: "agent identity",
-                source: Box::new(e),
+        // Bootstrap: lead agent record does not exist yet. The reeve-cli
+        // first-run flow refuses to start the daemon without an enrolled
+        // operator, so the operator lookup below is expected to succeed; a
+        // missing operator here means the on-disk identity registry was
+        // tampered with between enrollment and daemon start.
+        let all_identities =
+            identity_registry
+                .list()
+                .map_err(|e| DaemonError::Resource {
+                    component: "identity registry list",
+                    source: Box::new(e),
+                })?;
+        let operator_id = all_identities
+            .iter()
+            .find(|s| s.identity().identity_type == reeve_types::IdentityType::Operator)
+            .map(|s| s.identity().identity_id)
+            .ok_or_else(|| DaemonError::Resource {
+                component: "operator lookup",
+                source: Box::<dyn std::error::Error + Send + Sync>::from(
+                    "no operator identity enrolled; run `reeve identity enroll` before starting the daemon",
+                ),
             })?;
+
+        let identity = reeve_types::Identity::new_agent(
+            lead_member.persona_name.clone(),
+            operator_id,
+        )
+        .map_err(|e| DaemonError::Resource {
+            component: "agent identity",
+            source: Box::new(e),
+        })?;
         let agent_id = identity.identity_id;
         let public_key = *keypair.public();
         let key_record = reeve_types::KeyRecord::new(agent_id, public_key).map_err(|e| {
@@ -930,7 +953,7 @@ mod tests {
     use super::wait_for_exit;
     use super::{confirm_started, daemon_status, prepare_agent_startup, DaemonError, DaemonStatus};
     use crate::agent_registry::tests::registry_path_for_data_dir;
-    use crate::test_support::{build_registries, MockAdapter};
+    use crate::test_support::{build_registries, enroll_test_operator, MockAdapter};
 
     fn write_pid(state_dir: &Path, pid: u32) {
         fs::create_dir_all(state_dir).unwrap();
@@ -1097,6 +1120,7 @@ mod tests {
         let data_dir = tmp.path().to_path_buf();
         let agent_registry_path = registry_path_for_data_dir(&data_dir);
         let (identity_registry, watcher, _) = build_registries(&data_dir);
+        enroll_test_operator(&identity_registry);
         let adapter: Arc<dyn reeve_adapter::Adapter> =
             Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
 
@@ -1145,6 +1169,7 @@ mod tests {
         let data_dir = tmp.path().to_path_buf();
         let agent_registry_path = registry_path_for_data_dir(&data_dir);
         let (identity_registry, watcher, _) = build_registries(&data_dir);
+        enroll_test_operator(&identity_registry);
         let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(WrongAdapter);
 
         let result = prepare_agent_startup(
@@ -1177,6 +1202,7 @@ mod tests {
             Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
 
         let (identity_registry1, watcher1, _) = build_registries(&data_dir);
+        enroll_test_operator(&identity_registry1);
         let first = prepare_agent_startup(
             &data_dir,
             &identity_registry1,
@@ -1208,8 +1234,9 @@ mod tests {
             "keypair public key must be stable across restarts"
         );
 
-        // The identity registry must contain exactly one entry for agent_id
-        // after the second call — no duplication.
+        // The identity registry must contain exactly one entry for the lead
+        // agent after the second call — no duplication on the second bootstrap.
+        // (The other entry is the test operator enrolled before the first call.)
         let stored = identity_registry2
             .lookup(second.agent_id)
             .expect("identity registry lookup must not fail")
@@ -1222,10 +1249,15 @@ mod tests {
         let all = identity_registry2
             .list()
             .expect("identity registry list must not fail");
+        let agents: Vec<_> = all
+            .iter()
+            .filter(|s| s.identity().identity_type == reeve_types::IdentityType::Agent)
+            .collect();
         assert_eq!(
-            all.len(),
+            agents.len(),
             1,
-            "identity registry must have exactly one entry, not duplicated; got: {all:?}"
+            "identity registry must contain exactly one Agent-typed entry (the lead), \
+             not duplicated; got: {agents:?}"
         );
 
         // The agent registry must show the lead record with status Running
@@ -1255,6 +1287,7 @@ mod tests {
 
         // First call: establishes identity and writes the keypair file.
         let (identity_registry1, watcher1, _) = build_registries(&data_dir);
+        enroll_test_operator(&identity_registry1);
         let first = prepare_agent_startup(
             &data_dir,
             &identity_registry1,
