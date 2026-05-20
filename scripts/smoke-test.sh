@@ -36,10 +36,10 @@ printf "Smoke Test Operator\n" | "$REEVE_BIN" identity enroll
 echo "==> Listing identities..."
 "$REEVE_BIN" identity list | grep -q "Smoke Test Operator"
 
-echo "==> Checking daemon status (should be 'no runtime')..."
+echo "==> Checking daemon status (should be 'not running')..."
 STATUS="$("$REEVE_BIN" daemon status)"
 echo "    $STATUS"
-echo "$STATUS" | grep -q "no runtime"
+echo "$STATUS" | grep -q "not running"
 
 echo "==> Unenrolling operator identity..."
 "$REEVE_BIN" identity unenroll --confirm
