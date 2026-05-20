@@ -28,8 +28,7 @@ use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
 use crate::fs_util::{
-    ensure_directory, resolve_xdg_base_dir, set_nofollow, sync_directory, FsCheckError,
-    XdgBaseError,
+    ensure_directory, set_nofollow, sync_directory, FsCheckError, XdgBaseError,
 };
 
 /// Maximum size in bytes of any single registry TOML file. Identities and
@@ -592,13 +591,12 @@ fn resolve_default_data_dir(
     xdg_data_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Result<PathBuf, RegistryError> {
-    let base = resolve_xdg_base_dir(xdg_data_home, home).map_err(|e| match e {
+    crate::fs_util::resolve_reeve_data_root(xdg_data_home, home).map_err(|e| match e {
         XdgBaseError::MissingHome => RegistryError::MissingHome,
         XdgBaseError::RelativeDir { var_name, path } => {
             RegistryError::RelativeDataDir { var_name, path }
         }
-    })?;
-    Ok(base.join("reeve").join("identities"))
+    })
 }
 
 /// Case-sensitive: registry files are lowercase `.toml` by convention;
