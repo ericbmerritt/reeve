@@ -339,6 +339,33 @@ pub(crate) fn tool_result_capture_pair() -> (
     (addr.recipient(), rx)
 }
 
+// ── Operator enrollment helper ────────────────────────────────────────────────
+
+/// Enroll a test operator into `registry` and return its `IdentityId`.
+///
+/// The daemon bootstrap refuses to start without an enrolled operator; tests
+/// that exercise [`crate::daemon::prepare_agent_startup`] (or any code that
+/// looks up the operator) must call this first or stub equivalent state.
+///
+/// The keypair generated here is discarded — only the public key reaches
+/// disk via the registry. Tests that need to *sign* as the operator must
+/// retain their own keypair separately; this helper only satisfies the
+/// "operator identity exists in the registry" precondition.
+pub(crate) fn enroll_test_operator(
+    registry: &crate::identity_registry::IdentityRegistry,
+) -> IdentityId {
+    use crate::identity_registry::StoredIdentity;
+    use reeve_types::{Identity, KeyRecord, Keypair};
+
+    let keypair = Keypair::generate();
+    let identity = Identity::new_operator("test-operator".to_owned()).unwrap();
+    let identity_id = identity.identity_id;
+    let key_record = KeyRecord::new(identity_id, *keypair.public()).unwrap();
+    let stored = StoredIdentity::new(identity, key_record).unwrap();
+    registry.write(&stored).unwrap();
+    identity_id
+}
+
 // ── Persona config writer ─────────────────────────────────────────────────────
 
 /// `model_pref` must match the prefix of the adapter id used by the test (the part before `'@'`).
