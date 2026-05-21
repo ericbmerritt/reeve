@@ -76,6 +76,13 @@ pub enum SendError {
     /// A path in the inbox layout was a symlink; delivery refused as a
     /// security policy. The `path` is the symlinked inbox component.
     SymlinkRejected { path: PathBuf },
+    /// Re-opening the agent registry from disk at dispatch time failed (I/O,
+    /// parse, permissions, etc.). Distinct from [`Self::RecipientNotFound`]:
+    /// that variant means the registry opened cleanly and the name is absent,
+    /// while this variant means the registry could not be read.
+    AgentRegistryOpen {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl fmt::Display for SendError {
@@ -123,6 +130,9 @@ impl fmt::Display for SendError {
                     path.display()
                 )
             }
+            Self::AgentRegistryOpen { source } => {
+                write!(f, "failed to open agent registry for dispatch: {source}")
+            }
         }
     }
 }
@@ -146,6 +156,7 @@ impl SendError {
             Self::BodyTooLarge { .. } => "BodyTooLarge",
             Self::MessageIdFailed(_) => "MessageIdFailed",
             Self::SymlinkRejected { .. } => "SymlinkRejected",
+            Self::AgentRegistryOpen { .. } => "AgentRegistryOpen",
         }
     }
 }
@@ -153,7 +164,9 @@ impl SendError {
 impl std::error::Error for SendError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::KeypairLoad { source, .. } => Some(source.as_ref()),
+            Self::KeypairLoad { source, .. } | Self::AgentRegistryOpen { source } => {
+                Some(source.as_ref())
+            }
             Self::Io { source, .. } => Some(source),
             Self::IdentityLookupFailed { source } => Some(source),
             Self::RecipientNotFound { .. }
@@ -226,22 +239,33 @@ impl Message for SendFailed {
 
 /// Supervised actor that signs and deposits message envelopes.
 ///
-/// Holds a snapshot of the agent registry and the identity registry. Keypairs
-/// are loaded from disk on each dispatch so a crash never loses key material
-/// and the supervisor can restart the actor cleanly.
+/// Holds the **path** to the agent registry and re-opens it from disk on every
+/// dispatch. A held [`Arc<AgentRegistry>`] snapshot would freeze the registry
+/// at daemon-startup time and miss agents the spawn coordinator persists
+/// later; `send_message` to a just-spawned subagent would surface as
+/// [`SendError::RecipientNotFound`] until the next daemon restart. The
+/// spawn coordinator follows the same open-per-operation pattern, so the
+/// dispatcher reading the same path stays in lockstep.
+///
+/// Identity registry stays as an `Arc` snapshot because identities are
+/// written as one file per id and [`IdentityRegistry::lookup`] already reads
+/// each lookup from disk through the held `data_dir` handle.
+///
+/// Keypairs are loaded from disk on each dispatch so a crash never loses
+/// key material and the supervisor can restart the actor cleanly.
 pub struct MessageDispatcher {
-    agent_registry: Arc<AgentRegistry>,
+    agent_registry_path: PathBuf,
     identity_registry: Arc<IdentityRegistry>,
 }
 
 impl MessageDispatcher {
-    /// Construct a dispatcher with the given registry snapshots.
+    /// Construct a dispatcher.
     pub fn new(
-        agent_registry: Arc<AgentRegistry>,
+        agent_registry_path: PathBuf,
         identity_registry: Arc<IdentityRegistry>,
     ) -> Self {
         Self {
-            agent_registry,
+            agent_registry_path,
             identity_registry,
         }
     }
@@ -257,8 +281,27 @@ impl Handler<SendMessage> for MessageDispatcher {
     type Result = ();
 
     fn handle(&mut self, mut msg: SendMessage, _ctx: &mut Context<Self>) {
+        let agent_registry = match AgentRegistry::open(self.agent_registry_path.clone()) {
+            Ok(reg) => reg,
+            Err(source) => {
+                let err = SendError::AgentRegistryOpen {
+                    source: Box::new(source),
+                };
+                warn!(
+                    from_id = %msg.from_id,
+                    to_name = %msg.to_name,
+                    error = err.category(),
+                    "MessageDispatcher: failed to open agent registry"
+                );
+                if let Some(tx) = msg.error_to.take() {
+                    tx.do_send(SendFailed { error: err });
+                }
+                return;
+            }
+        };
+
         match dispatch(
-            &self.agent_registry,
+            &agent_registry,
             &self.identity_registry,
             msg.from_id,
             &msg.to_name,
@@ -474,13 +517,14 @@ mod tests {
     ) -> (
         AgentRegistry,
         IdentityRegistry,
-        PathBuf,
-        PathBuf,
+        PathBuf, // agent registry file path (for the dispatcher)
+        PathBuf, // sender_root
+        PathBuf, // recipient_root
         IdentityId,
         IdentityId,
     ) {
         let agent_registry_path = base.join("registry.toml");
-        let mut agent_registry = AgentRegistry::open(agent_registry_path).unwrap();
+        let mut agent_registry = AgentRegistry::open(agent_registry_path.clone()).unwrap();
 
         let identity_registry_dir = base.join("identities");
         fs::create_dir_all(&identity_registry_dir).unwrap();
@@ -541,6 +585,7 @@ mod tests {
         (
             agent_registry,
             identity_registry,
+            agent_registry_path,
             sender_root,
             recipient_root,
             sender_id,
@@ -561,13 +606,14 @@ mod tests {
         let (
             agent_registry,
             identity_registry,
+            agent_registry_path,
             sender_root,
             recipient_root,
             sender_id,
             recipient_id,
         ) = build_test_registry(base);
+        let _ = agent_registry;
 
-        let arc_agent = Arc::new(agent_registry);
         let arc_identity = Arc::new(identity_registry);
 
         actix::System::new().block_on(async {
@@ -576,7 +622,7 @@ mod tests {
             let capture = SendResultCapture { tx: Some(tx) }.start();
 
             let dispatcher =
-                MessageDispatcher::new(Arc::clone(&arc_agent), Arc::clone(&arc_identity));
+                MessageDispatcher::new(agent_registry_path.clone(), Arc::clone(&arc_identity));
             let dispatcher_addr = actix::Supervisor::start(move |_| dispatcher);
 
             dispatcher_addr.do_send(SendMessage {
@@ -637,6 +683,87 @@ mod tests {
         });
     }
 
+    // ── D1b: dispatcher sees runtime-registered agents ────────────────────────
+
+    /// `D1b`: After the dispatcher actor is constructed, a new agent registered
+    /// in the file-backed agent registry must be reachable on the next send.
+    /// Guards against the regression where the dispatcher held a snapshot
+    /// taken at construction time and `send_message` to a just-spawned
+    /// subagent surfaced `RecipientNotFound` until the daemon restarted.
+    #[test]
+    fn dispatch_finds_agent_registered_after_dispatcher_started() {
+        let tmp = secure_dir();
+        let base = tmp.path();
+
+        let (
+            mut agent_registry,
+            identity_registry,
+            agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
+
+        let arc_identity = Arc::new(identity_registry);
+
+        // Register a NEW recipient after the dispatcher's registry handle
+        // would have been captured by a snapshot-style implementation. We do
+        // this via the same on-disk file the dispatcher reads.
+        let late_root = base.join("late-recipient");
+        fs::create_dir_all(&late_root).unwrap();
+        provision_inbox(&late_root);
+        let late_id = IdentityId::new().unwrap();
+        agent_registry
+            .register(AgentRecord {
+                name: ValidatedAgentName::new("late-recipient").unwrap(),
+                identity_id: late_id,
+                inbox_dir: late_root.join("inbox"),
+                persona_name: None,
+                spawned_at: OffsetDateTime::now_utc(),
+                status: AgentStatus::Running,
+            })
+            .unwrap();
+        let _ = agent_registry; // dispatcher re-opens from disk
+
+        actix::System::new().block_on(async {
+            let (tx, rx) = tokio::sync::oneshot::channel::<SendResult>();
+            let capture = SendResultCapture { tx: Some(tx) }.start();
+
+            let dispatcher =
+                MessageDispatcher::new(agent_registry_path.clone(), Arc::clone(&arc_identity));
+            let dispatcher_addr = actix::Supervisor::start(move |_| dispatcher);
+
+            dispatcher_addr.do_send(SendMessage {
+                from_id: sender_id,
+                to_name: ValidatedAgentName::new("late-recipient").unwrap(),
+                body: "hello late".to_owned(),
+                reply_to: Some(capture.recipient()),
+                error_to: None,
+            });
+
+            let result = tokio::time::timeout(Duration::from_millis(500), rx)
+                .await
+                .expect("timed out waiting for SendResult")
+                .expect("oneshot sender dropped");
+
+            let new_dir = late_root.join("inbox").join("new");
+            let entries: Vec<_> = fs::read_dir(&new_dir).unwrap().flatten().collect();
+            assert_eq!(
+                entries.len(),
+                1,
+                "late-recipient should have received exactly one envelope"
+            );
+            assert_eq!(
+                entries[0].file_name().to_string_lossy(),
+                result.message_id.to_string(),
+                "deposited filename must match the returned message_id"
+            );
+
+            actix::System::current().stop();
+        });
+    }
+
     // ── D2: unknown recipient ─────────────────────────────────────────────────
 
     /// D2: Sending to an unknown recipient delivers `SendFailed` with
@@ -646,10 +773,17 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, _recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
+        let _ = agent_registry;
 
-        let arc_agent = Arc::new(agent_registry);
         let arc_identity = Arc::new(identity_registry);
 
         actix::System::new().block_on(async {
@@ -657,7 +791,7 @@ mod tests {
             let err_capture = SendFailedCapture { tx: Some(err_tx) }.start();
 
             let dispatcher =
-                MessageDispatcher::new(Arc::clone(&arc_agent), Arc::clone(&arc_identity));
+                MessageDispatcher::new(agent_registry_path.clone(), Arc::clone(&arc_identity));
             let dispatcher_addr = actix::Supervisor::start(move |_| dispatcher);
 
             dispatcher_addr.do_send(SendMessage {
@@ -692,10 +826,17 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, _recipient_root, _, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            _,
+            _,
+        ) = build_test_registry(base);
+        let _ = agent_registry;
 
-        let arc_agent = Arc::new(agent_registry);
         let arc_identity = Arc::new(identity_registry);
         let unknown_from_id = IdentityId::new().unwrap();
 
@@ -704,7 +845,7 @@ mod tests {
             let err_capture = SendFailedCapture { tx: Some(err_tx) }.start();
 
             let dispatcher =
-                MessageDispatcher::new(Arc::clone(&arc_agent), Arc::clone(&arc_identity));
+                MessageDispatcher::new(agent_registry_path.clone(), Arc::clone(&arc_identity));
             let dispatcher_addr = actix::Supervisor::start(move |_| dispatcher);
 
             dispatcher_addr.do_send(SendMessage {
@@ -739,8 +880,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         // Remove recipient's inbox/tmp/.
         fs::remove_dir(recipient_root.join("inbox").join("tmp")).unwrap();
@@ -771,8 +919,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, _recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         // A body more than 1 MiB over the limit guarantees the serialized
         // envelope exceeds MAX_ENVELOPE_BYTES even after JSON overhead.
@@ -805,8 +960,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, _recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         let at_limit_body = "x".repeat(MAX_ENVELOPE_BYTES);
         let to_name = ValidatedAgentName::new("recipient").unwrap();
@@ -841,8 +1003,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, _recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         // Replace the sender's registry file with a symlink. The identity
         // registry's `lookup()` rejects symlinked entry files with
@@ -884,8 +1053,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (mut agent_registry, identity_registry, _sender_root, _recipient_root, _, _) =
-            build_test_registry(base);
+        let (
+            mut agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            _,
+            _,
+        ) = build_test_registry(base);
 
         // Add a third agent that is in AgentRegistry but NOT IdentityRegistry.
         let orphan_root = base.join("orphan");
@@ -927,8 +1103,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, sender_root, _recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            sender_root,
+            _recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         // Overwrite the sender's identity.key with bytes that are neither 32
         // bytes in length nor a valid seed — generate_or_load_keypair rejects
@@ -964,8 +1147,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, _recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         let near_limit_body = "x".repeat(MAX_ENVELOPE_BYTES - 1);
         let to_name = ValidatedAgentName::new("recipient").unwrap();
@@ -996,8 +1186,15 @@ mod tests {
         let base = tmp.path();
 
         // Build base registry
-        let (mut agent_registry, identity_registry, _sender_root, _recipient_root, _sender_id, _) =
-            build_test_registry(base);
+        let (
+            mut agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            _recipient_root,
+            _sender_id,
+            _,
+        ) = build_test_registry(base);
 
         // Add a "revoked-sender" agent whose identity registry entry has
         // a Revoked (not Active) key state.
@@ -1062,8 +1259,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         // Replace inbox/tmp with a symlink to an outside directory.
         let tmp_dir = recipient_root.join("inbox").join("tmp");
@@ -1097,8 +1301,15 @@ mod tests {
         let tmp = secure_dir();
         let base = tmp.path();
 
-        let (agent_registry, identity_registry, _sender_root, recipient_root, sender_id, _) =
-            build_test_registry(base);
+        let (
+            agent_registry,
+            identity_registry,
+            _agent_registry_path,
+            _sender_root,
+            recipient_root,
+            sender_id,
+            _,
+        ) = build_test_registry(base);
 
         // Replace the entire recipient inbox dir with a symlink to an outside directory.
         let inbox_dir = recipient_root.join("inbox");
