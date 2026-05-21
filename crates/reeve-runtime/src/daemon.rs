@@ -866,18 +866,20 @@ fn launch_actors(
     let watcher_for_coord = Arc::clone(&watcher);
     let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
 
-    // Opened as a fresh registry snapshot — keys and inbox_dir paths for the
-    // registered agents are stable after this point in the current ladder.
-    let dispatcher_registry =
-        AgentRegistry::open(agent_registry_path.clone()).map_err(|e| DaemonError::Resource {
-            component: "message dispatcher registry",
-            source: Box::new(e),
-        })?;
+    // The dispatcher re-opens the agent registry on every dispatch so it
+    // stays in lockstep with records the spawn coordinator persists at
+    // runtime; pre-flighting an open here only validates the path is well
+    // formed and surfaces config errors at startup rather than at first send.
+    AgentRegistry::open(agent_registry_path.clone()).map_err(|e| DaemonError::Resource {
+        component: "message dispatcher registry",
+        source: Box::new(e),
+    })?;
     let identity_registry_for_dispatcher = Arc::clone(&identity_registry);
+    let dispatcher_registry_path = agent_registry_path.clone();
     let dispatcher_addr = actix::Supervisor::start(move |_| {
         MessageDispatcher::new(
-            Arc::new(dispatcher_registry),
-            identity_registry_for_dispatcher,
+            dispatcher_registry_path.clone(),
+            Arc::clone(&identity_registry_for_dispatcher),
         )
     });
 

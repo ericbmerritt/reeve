@@ -801,13 +801,14 @@ mod tests {
             agent_registry_path.clone(),
         );
 
-        let agent_registry = Arc::new(agent_registry);
+        let _ = agent_registry; // fixture-built; dispatcher re-opens from path
 
+        let dispatcher_registry_path = agent_registry_path.clone();
         let message_id_str = actix::System::new().block_on(async move {
             use actix::Actor as _;
 
             let dispatcher = MessageDispatcher::new(
-                Arc::clone(&agent_registry),
+                dispatcher_registry_path,
                 Arc::clone(&identity_registry),
             );
             let dispatcher_addr = actix::Supervisor::start(move |_| dispatcher);
