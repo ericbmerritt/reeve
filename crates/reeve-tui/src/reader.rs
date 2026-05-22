@@ -76,10 +76,12 @@ fn parse_conversation_line(line: &str) -> Option<ConversationEntry> {
                 .unwrap_or("")
                 .to_owned();
             let timestamp = parse_timestamp(&value);
+            let sender_id = parse_sender_id(&value);
             Some(ConversationEntry {
                 kind: EntryKind::Inbound,
                 text,
                 timestamp,
+                sender_id,
             })
         }
         "outbound" => {
@@ -93,6 +95,7 @@ fn parse_conversation_line(line: &str) -> Option<ConversationEntry> {
                 kind: EntryKind::Outbound,
                 text,
                 timestamp,
+                sender_id: None,
             })
         }
         "system" => {
@@ -106,11 +109,28 @@ fn parse_conversation_line(line: &str) -> Option<ConversationEntry> {
                 kind: EntryKind::System,
                 text,
                 timestamp,
+                sender_id: None,
             })
         }
         // "model_call" and any future variants are not shown in chat view.
         _ => None,
     }
+}
+
+/// Extract `sender_id` from an inbound JSON entry. Returns `None` for legacy
+/// entries (written before sender attribution was wired through) and for
+/// malformed UUIDs (the renderer falls back to an "unknown" tag).
+///
+/// Deserializes through `IdentityId`'s own `serde::Deserialize` impl so the
+/// TUI does not need a direct dependency on the `uuid` crate and so the
+/// `UUIDv7` invariant `IdentityId` enforces (rejecting non-v7 UUIDs) is
+/// shared between writer and reader.
+fn parse_sender_id(value: &Value) -> Option<reeve_types::IdentityId> {
+    let raw = value.get("sender_id")?;
+    if raw.is_null() {
+        return None;
+    }
+    serde_json::from_value(raw.clone()).ok()
 }
 
 /// Extract `timestamp_utc` as an [`OffsetDateTime`] from a JSON entry.
@@ -268,19 +288,50 @@ mod tests {
         // model_call is skipped, so only 2 entries expected.
         assert_eq!(entries.len(), 2, "expected 2 parsed entries");
         assert_eq!(entries[0].kind, EntryKind::Inbound);
+        // Legacy inbound entries (no sender_id field) render as "unknown".
         assert_eq!(
-            entries[0].kind.speaker_label("lead"),
-            "you",
-            "inbound speaker_label should return 'you' (the operator)"
+            entries[0].speaker_label("lead", None),
+            "unknown",
+            "inbound speaker_label without sender_id should be 'unknown'"
         );
         assert_eq!(entries[0].text, "hello");
         assert_eq!(entries[1].kind, EntryKind::Outbound);
         assert_eq!(
-            entries[1].kind.speaker_label("lead"),
+            entries[1].speaker_label("lead", None),
             "lead",
             "outbound speaker_label should return the persona name"
         );
         assert_eq!(entries[1].text, "world");
+    }
+
+    // R12b: speaker_label distinguishes operator-signed inbound from
+    // peer-agent-signed inbound. Regression guard for the bug where every
+    // inbound rendered as "you" regardless of who sent it.
+    #[test]
+    fn inbound_speaker_label_distinguishes_operator_from_peer() {
+        let operator_id = reeve_types::IdentityId::new().unwrap();
+        let worker_id = reeve_types::IdentityId::new().unwrap();
+
+        let from_operator = ConversationEntry {
+            kind: EntryKind::Inbound,
+            text: String::from("hi from the operator"),
+            timestamp: None,
+            sender_id: Some(operator_id),
+        };
+        let from_worker = ConversationEntry {
+            kind: EntryKind::Inbound,
+            text: String::from("hi from the worker"),
+            timestamp: None,
+            sender_id: Some(worker_id),
+        };
+
+        assert_eq!(from_operator.speaker_label("lead", Some(operator_id)), "you");
+        let worker_label = from_worker.speaker_label("lead", Some(operator_id));
+        assert_ne!(worker_label, "you", "peer-signed inbound must not say 'you'");
+        assert!(
+            worker_id.to_string().starts_with(&worker_label),
+            "worker label should be the leading UUID segment; got: {worker_label}"
+        );
     }
 
     // R13: read_conversation parses system entries.
@@ -295,7 +346,7 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].kind, EntryKind::System);
         assert_eq!(
-            entries[0].kind.speaker_label("lead"),
+            entries[0].speaker_label("lead", None),
             "system",
             "system speaker_label should return 'system'"
         );

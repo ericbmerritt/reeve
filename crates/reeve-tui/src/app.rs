@@ -112,6 +112,17 @@ fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard
     Ok((terminal, guard))
 }
 
+/// Pick the first operator-typed identity from the registry. Used at startup
+/// to seed `AppState.operator_id` so the renderer can label inbound entries
+/// signed by the operator as `"you"`. Returns `None` if no operator exists or
+/// the registry read fails — the renderer falls back to a short-id label.
+fn first_operator_id(registry: &IdentityRegistry) -> Option<reeve_types::IdentityId> {
+    registry.list().ok()?.into_iter().find_map(|stored| {
+        (stored.identity().identity_type == reeve_types::IdentityType::Operator)
+            .then(|| stored.identity().identity_id)
+    })
+}
+
 // ── State loading ─────────────────────────────────────────────────────────────
 
 /// Reload all agent state from disk into `state`.
@@ -160,6 +171,11 @@ pub fn run(
     .map_err(TuiError::Watcher)?;
 
     let mut state = AppState::default();
+    // Resolve the operator identity once at startup so inbound entries can
+    // render with "you" for the operator and a distinct sender label for
+    // worker/peer replies. If lookup fails the label falls back to a short
+    // id, which is still better than the pre-attribution "you for everyone".
+    state.operator_id = first_operator_id(registry);
 
     loop {
         if needs_reload.swap(false, Ordering::Acquire) {
