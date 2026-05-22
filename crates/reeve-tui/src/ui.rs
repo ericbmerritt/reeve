@@ -21,7 +21,7 @@
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::state::{AgentStatus, AppState};
@@ -104,7 +104,11 @@ fn format_timestamp(ts: Option<time::OffsetDateTime>) -> String {
 ///
 /// Each entry renders as two parts:
 /// 1. Speaker line: `{label} · {timestamp_or_blank}`
-/// 2. Text line:   `  {text}`
+/// 2. Text line:   `  {text}` (possibly multiple visual rows after wrapping)
+///
+/// When the agent is in `Working` status, appends a "thinking" indicator
+/// with a clock-driven spinner so a long model call does not look like the
+/// TUI is frozen.
 fn build_conversation_lines(state: &AppState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -119,13 +123,54 @@ fn build_conversation_lines(state: &AppState) -> Vec<Line<'static>> {
         };
         lines.push(speaker_line);
 
-        let text_line = Line::from(format!("  {}", entry.text));
-        lines.push(text_line);
+        // Preserve text line-breaks the agent put in the payload; wrapping is
+        // handled by the Paragraph widget at render time.
+        for line in entry.text.lines() {
+            lines.push(Line::from(format!("  {line}")));
+        }
+        if entry.text.is_empty() {
+            lines.push(Line::from("  "));
+        }
 
         lines.push(Line::from(""));
     }
 
+    if let Some(line) = thinking_indicator(state) {
+        lines.push(line);
+    }
+
     lines
+}
+
+/// 10-phase Braille dot spinner. Phase advances ~8 frames per second based on
+/// the wall clock so the indicator animates without needing tick state in
+/// `AppState`; every `draw` call recomputes from `Instant::now`.
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+/// When the lead agent is `Working`, return a styled "thinking" line for the
+/// conversation pane. Returns `None` in every other state so an idle agent
+/// shows nothing extra below the last conversation entry.
+fn thinking_indicator(state: &AppState) -> Option<Line<'static>> {
+    if state.status != AgentStatus::Working {
+        return None;
+    }
+    // ~125ms per frame. SystemTime is fine here: the spinner is an animation,
+    // not a security boundary, and a clock step would just resync the phase.
+    let millis_since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis());
+    let frames_len = u128::try_from(SPINNER_FRAMES.len()).unwrap_or(u128::MAX);
+    let phase = usize::try_from((millis_since_epoch / 125) % frames_len).unwrap_or(0);
+    let frame = SPINNER_FRAMES[phase];
+    let style = if no_color() {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Yellow)
+    };
+    Some(Line::from(vec![
+        Span::styled(format!("  {frame} "), style),
+        Span::styled("thinking…".to_owned(), style),
+    ]))
 }
 
 fn build_separator(width: u16) -> Line<'static> {
@@ -186,18 +231,92 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
 
 /// Wrap conversation lines in a scrolled-to-bottom `Paragraph`.
 ///
-/// If the conversation is taller than the available area, scroll so the
-/// most recent entries are visible.
+/// Word-wraps long entries so the model's responses (which can easily exceed
+/// 200 columns) stay visible — without wrap, a single overflowing line would
+/// render as a single chopped-off row. `trim: false` preserves the two-space
+/// text indent and any leading whitespace inside model responses.
+///
+/// Scroll calculation approximates the post-wrap row count via
+/// [`count_wrapped_rows`]: ratatui's exact `Paragraph::line_count` API is
+/// behind an unstable feature in 0.29, and we'd rather not opt in to a
+/// future-breaking signature for a UI nicety. The ceiling-divide
+/// approximation overcounts by at most one row per logical line, which
+/// errs on the side of "scroll just a bit too far" rather than clipping
+/// recent entries off the bottom.
 fn render_conversation(
     lines: Vec<Line<'static>>,
     area: ratatui::layout::Rect,
 ) -> Paragraph<'static> {
-    let total = lines.len();
+    let total = count_wrapped_rows(&lines, area.width);
     let visible = usize::from(area.height);
-    let scroll = if total > visible {
-        u16::try_from(total - visible).unwrap_or(u16::MAX)
-    } else {
-        0
-    };
-    Paragraph::new(Text::from(lines)).scroll((scroll, 0))
+    let scroll = total
+        .saturating_sub(visible)
+        .try_into()
+        .unwrap_or(u16::MAX);
+    Paragraph::new(Text::from(lines))
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0))
+}
+
+/// Approximate the number of terminal rows that `lines` will occupy after
+/// word-wrap at `width` columns. Empty lines count as one row each. The
+/// approximation is the ceiling-divide of each line's visual width by the
+/// render width; it overcounts by at most one row per line versus ratatui's
+/// real wrap implementation (which is word-aware), and never undercounts,
+/// so the auto-scroll target never clips the latest entry off the bottom.
+fn count_wrapped_rows(lines: &[Line<'_>], width: u16) -> usize {
+    let width = usize::from(width.max(1));
+    lines
+        .iter()
+        .map(|line| {
+            let len = line.width();
+            if len == 0 {
+                1
+            } else {
+                len.div_ceil(width)
+            }
+        })
+        .sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // U1: count_wrapped_rows returns 1 per empty line and ceil-divide for
+    // overflowing lines. Regression guard for the auto-scroll calculation.
+    #[test]
+    fn count_wrapped_rows_handles_empty_and_overflow() {
+        let lines = vec![
+            Line::from(""),                            // 1 row
+            Line::from("short"),                       // 1 row (5 chars)
+            Line::from("x".repeat(80)),                // 4 rows at width=20
+            Line::from("y".repeat(21)),                // 2 rows at width=20
+        ];
+        assert_eq!(count_wrapped_rows(&lines, 20), 1 + 1 + 4 + 2);
+    }
+
+    // U2: zero render width is treated as width=1 so we never divide by zero
+    // and the function still terminates with a sensible upper bound.
+    #[test]
+    fn count_wrapped_rows_zero_width_is_safe() {
+        let lines = vec![Line::from("hello")];
+        // width treated as 1, so 5 chars → 5 rows
+        assert_eq!(count_wrapped_rows(&lines, 0), 5);
+    }
+
+    // U3: thinking_indicator is None unless the agent is Working — idle / crashed
+    // / unknown agents should not show the spinner.
+    #[test]
+    fn thinking_indicator_only_when_working() {
+        let mut state = AppState::default();
+        state.status = AgentStatus::Idle;
+        assert!(thinking_indicator(&state).is_none());
+        state.status = AgentStatus::Crashed;
+        assert!(thinking_indicator(&state).is_none());
+        state.status = AgentStatus::Unknown;
+        assert!(thinking_indicator(&state).is_none());
+        state.status = AgentStatus::Working;
+        assert!(thinking_indicator(&state).is_some());
+    }
 }
