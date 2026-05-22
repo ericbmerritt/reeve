@@ -668,12 +668,11 @@ fn prepare_agent_startup(
     })?;
 
     // 6. On first run mint a new identity and register it; on restart reuse the stored identity_id.
-    let keypair = generate_or_load_keypair(&dirs.identity_key_path()).map_err(|e| {
-        DaemonError::Resource {
+    let keypair =
+        generate_or_load_keypair(&dirs.identity_key_path()).map_err(|e| DaemonError::Resource {
             component: "agent keypair",
             source: Box::new(e),
-        }
-    })?;
+        })?;
 
     let mut agent_registry =
         AgentRegistry::open(agent_registry_path.clone()).map_err(|e| DaemonError::Resource {
@@ -737,13 +736,12 @@ fn prepare_agent_startup(
         // operator, so the operator lookup below is expected to succeed; a
         // missing operator here means the on-disk identity registry was
         // tampered with between enrollment and daemon start.
-        let all_identities =
-            identity_registry
-                .list()
-                .map_err(|e| DaemonError::Resource {
-                    component: "identity registry list",
-                    source: Box::new(e),
-                })?;
+        let all_identities = identity_registry
+            .list()
+            .map_err(|e| DaemonError::Resource {
+                component: "identity registry list",
+                source: Box::new(e),
+            })?;
         let operator_id = all_identities
             .iter()
             .find(|s| s.identity().identity_type == reeve_types::IdentityType::Operator)
@@ -755,14 +753,12 @@ fn prepare_agent_startup(
                 ),
             })?;
 
-        let identity = reeve_types::Identity::new_agent(
-            lead_member.persona_name.clone(),
-            operator_id,
-        )
-        .map_err(|e| DaemonError::Resource {
-            component: "agent identity",
-            source: Box::new(e),
-        })?;
+        let identity =
+            reeve_types::Identity::new_agent(lead_member.persona_name.clone(), operator_id)
+                .map_err(|e| DaemonError::Resource {
+                    component: "agent identity",
+                    source: Box::new(e),
+                })?;
         let agent_id = identity.identity_id;
         let public_key = *keypair.public();
         let key_record = reeve_types::KeyRecord::new(agent_id, public_key).map_err(|e| {
@@ -914,8 +910,7 @@ fn launch_actors(
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
 
     let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord_addr.recipient());
-    let send_message_tool =
-        crate::tool::SendMessageTool::new(dispatcher_addr.clone().recipient());
+    let send_message_tool = crate::tool::SendMessageTool::new(dispatcher_addr.clone().recipient());
     let tools: Vec<(
         reeve_adapter::Tool,
         actix::Recipient<crate::tool::InvokeTool>,
@@ -1154,8 +1149,8 @@ mod tests {
     #[cfg(unix)]
     use super::wait_for_exit;
     use super::{confirm_started, daemon_status, prepare_agent_startup, DaemonError, DaemonStatus};
-    use crate::agent_registry::tests::registry_path_for_data_dir;
     use crate::agent_fs::AgentDirs;
+    use crate::agent_registry::tests::registry_path_for_data_dir;
     use crate::agent_registry::{
         generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
     };
@@ -1472,8 +1467,7 @@ mod tests {
 
         // The agent registry must show the lead record with status Running
         // after the second call.
-        let agent_registry =
-            AgentRegistry::open(registry_path_for_data_dir(&data_dir)).unwrap();
+        let agent_registry = AgentRegistry::open(registry_path_for_data_dir(&data_dir)).unwrap();
         let record = agent_registry
             .lookup("lead")
             .expect("lead record must be present in agent registry after second call");
@@ -1562,8 +1556,7 @@ mod tests {
         // (SpawnSnapshot), keypair file, persona config.
         crate::test_support::write_persona_config(&data_dir, "worker", "claude-opus-4-7");
         let worker_dirs = AgentDirs::provision(&data_dir, "worker").unwrap();
-        let worker_keypair =
-            generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
+        let worker_keypair = generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
         let worker_id = reeve_types::IdentityId::new().unwrap();
 
         // Identity registry entry
@@ -1656,15 +1649,13 @@ mod tests {
 
         crate::test_support::write_persona_config(&data_dir, "worker", "claude-opus-4-7");
         let worker_dirs = AgentDirs::provision(&data_dir, "worker").unwrap();
-        let worker_keypair =
-            generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
+        let worker_keypair = generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
         let worker_id = reeve_types::IdentityId::new().unwrap();
 
         let mut identity =
             reeve_types::Identity::new_agent("worker".to_owned(), operator_id).unwrap();
         identity.identity_id = worker_id;
-        let key_record =
-            reeve_types::KeyRecord::new(worker_id, *worker_keypair.public()).unwrap();
+        let key_record = reeve_types::KeyRecord::new(worker_id, *worker_keypair.public()).unwrap();
         let stored = StoredIdentity::new(identity, key_record).unwrap();
         identity_registry.write(&stored).unwrap();
 

@@ -260,10 +260,7 @@ pub struct MessageDispatcher {
 
 impl MessageDispatcher {
     /// Construct a dispatcher.
-    pub fn new(
-        agent_registry_path: PathBuf,
-        identity_registry: Arc<IdentityRegistry>,
-    ) -> Self {
+    pub fn new(agent_registry_path: PathBuf, identity_registry: Arc<IdentityRegistry>) -> Self {
         Self {
             agent_registry_path,
             identity_registry,
