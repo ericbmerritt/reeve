@@ -17,7 +17,15 @@ reeve-types = { workspace = true }
 reeve-transport = { workspace = true }
 reeve-runtime = { workspace = true }
 
-ratatui = { workspace = true }
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which we use
+# for accurate auto-scroll in the wrapped conversation pane. The manual
+# ceiling-divide approximation we tried first under-counted by enough rows
+# that the latest entry could sit below the viewport — `Wrap { trim: false }`
+# preserves leading whitespace on continuation rows, effectively narrowing
+# the wrap width past column 0, so the row count is not just text-len /
+# render-width. If ratatui changes this API in a future release we'll get a
+# clear compile-time signal to revisit.
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
 crossterm = { workspace = true }
 notify = { workspace = true }
 serde_json = { workspace = true }
