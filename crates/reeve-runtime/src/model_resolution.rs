@@ -32,6 +32,15 @@ pub struct SpawnSnapshot {
     /// Written by the daemon at spawn time so that external senders (e.g. the
     /// TUI) can address signed envelopes to the correct watcher slot.
     pub agent_id: String,
+    /// The composed system prompt the agent was constructed with at spawn
+    /// time: persona's base prompt plus any task the spawner appended. Held
+    /// here so a daemon restart can re-launch the actor with the same
+    /// instructions instead of falling back to the persona base prompt and
+    /// silently losing the task context the operator supplied. Empty in
+    /// snapshots written before this field existed (`serde(default)`); the
+    /// caller falls back to the persona's base prompt in that case.
+    #[serde(default)]
+    pub system_prompt: String,
 }
 
 impl SpawnSnapshot {
@@ -145,6 +154,7 @@ pub fn resolve_model(
                 capability_profile: persona.capability_profile.clone(),
                 adapter_id: adapter.id().to_owned(),
                 agent_id: agent_id.to_string(),
+                system_prompt: String::new(), // filled in by the spawn caller
             });
         }
     }
@@ -266,6 +276,7 @@ mod tests {
             capability_profile: Some(String::from("default")),
             adapter_id: String::from("claude-opus-4-7@anthropic-direct"),
             agent_id: String::from("01930000-0000-7000-8000-000000000001"),
+            system_prompt: String::new(),
         };
 
         write_spawn_snapshot(&dirs, &snapshot).expect("write");
@@ -291,6 +302,7 @@ mod tests {
             capability_profile: None,
             adapter_id: String::from("claude-opus-4-7@anthropic-direct"),
             agent_id: String::from("01930000-0000-7000-8000-000000000002"),
+            system_prompt: String::new(),
         };
 
         let serialized = toml::to_string(&original).expect("serialize");

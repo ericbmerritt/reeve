@@ -16,20 +16,22 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::agent::Agent;
 use crate::agent_fs::AgentDirs;
-use crate::agent_registry::{AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName};
+use crate::agent_registry::{
+    generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
+};
 use crate::audit::AuditLog;
 use crate::config::{install_defaults, load_persona_config, load_team_config};
-use crate::dispatcher::MessageDispatcher;
+use crate::dispatcher::{MessageDispatcher, SendMessage};
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
-use crate::model_resolution::{resolve_model, write_spawn_snapshot};
+use crate::model_resolution::{resolve_model, write_spawn_snapshot, SpawnSnapshot};
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
-use crate::spawn_coordinator::SpawnCoordinator;
+use crate::spawn_coordinator::{build_subagent_tools, SpawnCoordinator};
 use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 use crate::watcher::Watcher;
 
@@ -593,7 +595,7 @@ fn run_actor_system(
 struct AgentStartup {
     adapter: Arc<dyn reeve_adapter::Adapter>,
     dirs: AgentDirs,
-    snapshot: crate::model_resolution::SpawnSnapshot,
+    snapshot: SpawnSnapshot,
     system_prompt: String,
     inbox: AgentInbox,
     agent_id: reeve_types::IdentityId,
@@ -666,7 +668,7 @@ fn prepare_agent_startup(
     })?;
 
     // 6. On first run mint a new identity and register it; on restart reuse the stored identity_id.
-    let keypair = crate::generate_or_load_keypair(&dirs.identity_key_path()).map_err(|e| {
+    let keypair = generate_or_load_keypair(&dirs.identity_key_path()).map_err(|e| {
         DaemonError::Resource {
             component: "agent keypair",
             source: Box::new(e),
@@ -840,6 +842,13 @@ fn prepare_agent_startup(
 /// Start all supervised actors inside the running actix system.
 ///
 /// Must be called from within an actix `block_on` context.
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear actor wiring sequence: heartbeat, watcher, dispatcher, \
+              spawn coordinator, lead agent, and the persisted-subagent \
+              resume pass. Each step depends on outputs of the previous; \
+              splitting just to chase a line budget would obscure the order."
+)]
 fn launch_actors(
     state_dir: PathBuf,
     startup: AgentStartup,
@@ -882,6 +891,16 @@ fn launch_actors(
             Arc::clone(&identity_registry_for_dispatcher),
         )
     });
+
+    // Keep clones for the subagent re-launch pass below; the spawn coordinator
+    // and lead agent both consume their respective handles.
+    let data_dir_for_resume = data_dir.clone();
+    let agent_registry_path_for_resume = agent_registry_path.clone();
+    let identity_registry_for_resume = Arc::clone(&identity_registry);
+    let adapter_for_resume = Arc::clone(&adapter);
+    let watcher_for_resume = Arc::clone(&watcher_for_coord);
+    let watcher_addr_for_resume = watcher_addr.clone();
+    let dispatcher_recipient_for_resume = dispatcher_addr.clone().recipient();
 
     let spawn_coordinator = SpawnCoordinator::new(
         data_dir,
@@ -938,7 +957,188 @@ fn launch_actors(
         recipient: lead_addr_clone.recipient(),
     });
 
+    // Re-launch any non-lead agents the previous daemon left in the registry.
+    // Without this, the lead's send_message to a subagent that was alive in a
+    // prior daemon run would silently land in an unwatched inbox.
+    let resume_inbox_starter = watcher_addr_for_resume.recipient();
+    resume_persisted_subagents(
+        &data_dir_for_resume,
+        &agent_registry_path_for_resume,
+        &identity_registry_for_resume,
+        &adapter_for_resume,
+        &watcher_for_resume,
+        &resume_inbox_starter,
+        &dispatcher_recipient_for_resume,
+    );
+
     Ok(dispatcher_addr)
+}
+
+/// Re-launch every non-lead agent in the registry. Called once on daemon
+/// start, after the lead is up. Each non-lead record is treated as a
+/// best-effort resume: per-agent failures (missing snapshot, persona
+/// removed, adapter id mismatch, keypair drift) are logged and skipped
+/// rather than failing the whole daemon — one corrupt persisted agent
+/// must not prevent the lead from coming up at all.
+///
+/// Symmetry with the spawn-time path: this performs steps L–P of the
+/// spawn coordinator (build tools, construct Agent, supervise, register
+/// route, watch inbox) without redoing A–K (validation, mint identity,
+/// write snapshot) which already ran when the operator spawned the agent.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the function wires together every piece of daemon state a \
+              subagent's lifecycle touches; bundling into a struct trades \
+              clarity for indirection at the one call site"
+)]
+fn resume_persisted_subagents(
+    data_dir: &Path,
+    agent_registry_path: &Path,
+    identity_registry: &Arc<IdentityRegistry>,
+    adapter: &Arc<dyn reeve_adapter::Adapter>,
+    watcher: &Arc<Watcher>,
+    inbox_starter: &actix::Recipient<WatchInbox>,
+    dispatcher: &actix::Recipient<SendMessage>,
+) {
+    let registry = match AgentRegistry::open(agent_registry_path.to_path_buf()) {
+        Ok(r) => r,
+        Err(err) => {
+            warn!(err = %err, "resume: failed to open agent registry; skipping subagent resume");
+            return;
+        }
+    };
+
+    for record in registry.list() {
+        if record.name.as_str() == "lead" {
+            continue;
+        }
+        if let Err(err) = resume_one_subagent(
+            data_dir,
+            identity_registry,
+            adapter,
+            watcher,
+            inbox_starter,
+            dispatcher,
+            record,
+        ) {
+            warn!(
+                agent_name = %record.name,
+                err = %err,
+                "resume: failed to re-launch subagent; record remains but no actor; \
+                 next send_message to this name will land in an unwatched inbox"
+            );
+        }
+    }
+}
+
+/// Single-agent resume. Returns a string error description on failure; the
+/// caller logs the error context and moves on. Symmetric with the steps
+/// `SpawnCoordinator::handle` performs from `build_subagent_tools` onward.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "subagent resume needs every collaborator the spawn-time path \
+              uses minus the parts already done at spawn (identity mint, \
+              registry write); bundling into a context struct trades \
+              clarity for indirection at the only call site"
+)]
+fn resume_one_subagent(
+    data_dir: &Path,
+    identity_registry: &Arc<IdentityRegistry>,
+    adapter: &Arc<dyn reeve_adapter::Adapter>,
+    watcher: &Arc<Watcher>,
+    inbox_starter: &actix::Recipient<WatchInbox>,
+    dispatcher: &actix::Recipient<SendMessage>,
+    record: &AgentRecord,
+) -> Result<(), String> {
+    let dirs = AgentDirs::open(data_dir, record.name.as_str())
+        .map_err(|e| format!("open agent dirs: {e}"))?;
+
+    let keypair = generate_or_load_keypair(&dirs.identity_key_path())
+        .map_err(|e| format!("load keypair: {e}"))?;
+
+    // Verify the identity registry still has this agent and the on-disk key
+    // matches what was registered at spawn time. If they don't match the
+    // recipient verification on every envelope would fail anyway.
+    let stored = identity_registry
+        .lookup(record.identity_id)
+        .map_err(|e| format!("identity lookup: {e}"))?
+        .ok_or_else(|| "identity registry has no entry for this agent".to_owned())?;
+    let stored_key = &stored
+        .key_records()
+        .first()
+        .ok_or_else(|| "stored identity has no key records".to_owned())?
+        .public_key;
+    if keypair.public() != stored_key {
+        return Err(
+            "on-disk identity.key does not match stored public key for this agent".to_owned(),
+        );
+    }
+
+    // Load the snapshot to recover the resolved adapter id and the composed
+    // system prompt the agent was originally spawned with.
+    let snapshot_text = std::fs::read_to_string(dirs.agent_toml_path())
+        .map_err(|e| format!("read agent.toml: {e}"))?;
+    let snapshot: SpawnSnapshot =
+        toml::from_str(&snapshot_text).map_err(|e| format!("parse agent.toml: {e}"))?;
+
+    // Refuse to resume if the daemon was reconfigured with a different
+    // adapter than the agent was spawned against — calls would fail at the
+    // model-resolution boundary in confusing ways.
+    if snapshot.adapter_id != adapter.id() {
+        return Err(format!(
+            "snapshot adapter_id '{}' does not match the running daemon's adapter '{}'",
+            snapshot.adapter_id,
+            adapter.id()
+        ));
+    }
+
+    // System prompt fallback: snapshots written before the field existed
+    // serialize with system_prompt == "". Use the persona's base prompt in
+    // that case so an upgrade does not blank the agent out.
+    let system_prompt = if snapshot.system_prompt.is_empty() {
+        let persona_name = record
+            .persona_name
+            .as_deref()
+            .unwrap_or(&snapshot.persona_name);
+        let persona_path = data_dir
+            .join("personas")
+            .join(persona_name)
+            .join("config.toml");
+        load_persona_config(&persona_path)
+            .map_err(|e| format!("load persona for prompt fallback: {e}"))?
+            .system_prompt
+    } else {
+        snapshot.system_prompt.clone()
+    };
+
+    let tools = build_subagent_tools(dispatcher.clone());
+    let new_agent = Agent::new(
+        Arc::clone(adapter),
+        &dirs,
+        snapshot,
+        system_prompt,
+        record.identity_id,
+        keypair,
+        tools,
+    )
+    .map_err(|e| format!("construct Agent: {e}"))?;
+    let agent_addr = actix::Supervisor::start(move |_| new_agent);
+
+    watcher.register_route(record.identity_id, agent_addr.clone().recipient());
+    let inbox = AgentInbox::from_path(dirs.inbox_root());
+    inbox_starter.do_send(WatchInbox {
+        agent_id: record.identity_id,
+        inbox,
+        on_quarantine: None,
+        recipient: agent_addr.recipient(),
+    });
+
+    tracing::info!(
+        agent_name = %record.name,
+        identity_id = %record.identity_id,
+        "resume: re-launched persisted subagent"
+    );
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -955,7 +1155,15 @@ mod tests {
     use super::wait_for_exit;
     use super::{confirm_started, daemon_status, prepare_agent_startup, DaemonError, DaemonStatus};
     use crate::agent_registry::tests::registry_path_for_data_dir;
+    use crate::agent_fs::AgentDirs;
+    use crate::agent_registry::{
+        generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
+    };
+    use crate::identity_registry::StoredIdentity;
+    use crate::model_resolution::{write_spawn_snapshot, SpawnSnapshot};
     use crate::test_support::{build_registries, enroll_test_operator, MockAdapter};
+
+    use super::resume_persisted_subagents;
 
     fn write_pid(state_dir: &Path, pid: u32) {
         fs::create_dir_all(state_dir).unwrap();
@@ -1265,14 +1473,13 @@ mod tests {
         // The agent registry must show the lead record with status Running
         // after the second call.
         let agent_registry =
-            crate::agent_registry::AgentRegistry::open(registry_path_for_data_dir(&data_dir))
-                .unwrap();
+            AgentRegistry::open(registry_path_for_data_dir(&data_dir)).unwrap();
         let record = agent_registry
             .lookup("lead")
             .expect("lead record must be present in agent registry after second call");
         assert_eq!(
             record.status,
-            crate::agent_registry::AgentStatus::Running,
+            AgentStatus::Running,
             "lead agent status must be Running after second prepare_agent_startup"
         );
     }
@@ -1327,6 +1534,185 @@ mod tests {
             ),
             "mismatched keypair must produce Resource(keypair mismatch); got: {:?}",
             result.err().map(|e| e.to_string())
+        );
+    }
+
+    // ── resume_persisted_subagents tests ──────────────────────────────────────
+
+    // R1: After a subagent's on-disk fixture is set up, resume_persisted_subagents
+    // re-launches it: the watcher's routing table picks up the agent's
+    // identity_id. Without this, the lead's send_message to a subagent that
+    // survived a daemon restart would drop the envelope into an unwatched
+    // inbox/new/ and surface nothing in the logs.
+    #[test]
+    #[cfg(unix)]
+    fn resume_persisted_subagents_registers_route_for_persisted_subagent() {
+        use crate::test_support::{NullDispatcher, NullInboxStarter};
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let operator_id = enroll_test_operator(&identity_registry);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+
+        // Provision a persisted "worker" subagent as if a prior daemon spawn
+        // had completed: identity in registry, agent record, agent.toml
+        // (SpawnSnapshot), keypair file, persona config.
+        crate::test_support::write_persona_config(&data_dir, "worker", "claude-opus-4-7");
+        let worker_dirs = AgentDirs::provision(&data_dir, "worker").unwrap();
+        let worker_keypair =
+            generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
+        let worker_id = reeve_types::IdentityId::new().unwrap();
+
+        // Identity registry entry
+        {
+            let mut identity =
+                reeve_types::Identity::new_agent("worker".to_owned(), operator_id).unwrap();
+            identity.identity_id = worker_id;
+            let key_record =
+                reeve_types::KeyRecord::new(worker_id, *worker_keypair.public()).unwrap();
+            let stored = StoredIdentity::new(identity, key_record).unwrap();
+            identity_registry.write(&stored).unwrap();
+        }
+
+        // Snapshot on disk
+        let snapshot = SpawnSnapshot {
+            persona_name: "worker".to_owned(),
+            persona_version: 1,
+            capability_profile: None,
+            adapter_id: adapter.id().to_owned(),
+            agent_id: worker_id.to_string(),
+            system_prompt: "You are a worker. Reply with 'ack' to any inbound.".to_owned(),
+        };
+        write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
+
+        // Agent registry record
+        {
+            let mut agent_registry = AgentRegistry::open(agent_registry_path.clone()).unwrap();
+            agent_registry
+                .register(AgentRecord {
+                    name: ValidatedAgentName::new("worker").unwrap(),
+                    identity_id: worker_id,
+                    inbox_dir: worker_dirs.inbox_root(),
+                    persona_name: Some("worker".to_owned()),
+                    spawned_at: time::OffsetDateTime::now_utc(),
+                    status: AgentStatus::Running,
+                })
+                .unwrap();
+        }
+
+        // Resume runs inside an actix system because it starts an actor
+        // and sends messages to recipients.
+        let watcher_for_assert = Arc::clone(&watcher);
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let dispatcher = NullDispatcher.start().recipient();
+
+            resume_persisted_subagents(
+                &data_dir,
+                &agent_registry_path,
+                &identity_registry,
+                &adapter,
+                &watcher,
+                &inbox_starter,
+                &dispatcher,
+            );
+
+            // resume runs synchronously: by the time it returns the worker
+            // actor has been started and watcher.register_route has run.
+            assert!(
+                watcher.has_route(worker_id),
+                "watcher must have a route for the resumed subagent; \
+                 send_message would otherwise land in an unwatched inbox"
+            );
+
+            actix::System::current().stop();
+        });
+
+        // Belt-and-suspenders: same assertion on the Arc held outside the
+        // System block, so a regression that registers on an inner clone
+        // shows up.
+        assert!(watcher_for_assert.has_route(worker_id));
+    }
+
+    // R2: A persisted subagent whose snapshot adapter_id does not match the
+    // running daemon's adapter is skipped (logged at warn). The watcher's
+    // routing table must NOT contain a route for it — the alternative would
+    // be a route to an actor that immediately fails on the first model call.
+    #[test]
+    #[cfg(unix)]
+    fn resume_persisted_subagents_skips_subagent_with_adapter_drift() {
+        use crate::test_support::{NullDispatcher, NullInboxStarter};
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let operator_id = enroll_test_operator(&identity_registry);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+
+        crate::test_support::write_persona_config(&data_dir, "worker", "claude-opus-4-7");
+        let worker_dirs = AgentDirs::provision(&data_dir, "worker").unwrap();
+        let worker_keypair =
+            generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
+        let worker_id = reeve_types::IdentityId::new().unwrap();
+
+        let mut identity =
+            reeve_types::Identity::new_agent("worker".to_owned(), operator_id).unwrap();
+        identity.identity_id = worker_id;
+        let key_record =
+            reeve_types::KeyRecord::new(worker_id, *worker_keypair.public()).unwrap();
+        let stored = StoredIdentity::new(identity, key_record).unwrap();
+        identity_registry.write(&stored).unwrap();
+
+        // Snapshot with a DIFFERENT adapter than the daemon will run with.
+        let snapshot = SpawnSnapshot {
+            persona_name: "worker".to_owned(),
+            persona_version: 1,
+            capability_profile: None,
+            adapter_id: "claude-opus-4-7@some-other-route".to_owned(),
+            agent_id: worker_id.to_string(),
+            system_prompt: String::from("ignored"),
+        };
+        write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
+
+        let mut agent_registry = AgentRegistry::open(agent_registry_path.clone()).unwrap();
+        agent_registry
+            .register(AgentRecord {
+                name: ValidatedAgentName::new("worker").unwrap(),
+                identity_id: worker_id,
+                inbox_dir: worker_dirs.inbox_root(),
+                persona_name: Some("worker".to_owned()),
+                spawned_at: time::OffsetDateTime::now_utc(),
+                status: AgentStatus::Running,
+            })
+            .unwrap();
+
+        let watcher_for_assert = Arc::clone(&watcher);
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let dispatcher = NullDispatcher.start().recipient();
+
+            resume_persisted_subagents(
+                &data_dir,
+                &agent_registry_path,
+                &identity_registry,
+                &adapter,
+                &watcher,
+                &inbox_starter,
+                &dispatcher,
+            );
+
+            actix::System::current().stop();
+        });
+
+        assert!(
+            !watcher_for_assert.has_route(worker_id),
+            "watcher must not register a route for a subagent whose snapshot \
+             adapter_id differs from the running daemon's adapter"
         );
     }
 }

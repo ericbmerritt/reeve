@@ -1209,6 +1209,7 @@ mod tests {
             capability_profile: None,
             adapter_id: String::from("mock@test"),
             agent_id: String::new(),
+            system_prompt: String::new(),
         }
     }
 
