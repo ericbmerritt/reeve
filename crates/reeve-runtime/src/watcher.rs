@@ -396,6 +396,7 @@ impl Watcher {
             r.do_send(crate::agent::ProcessInbound {
                 payload,
                 message_id,
+                sender_id: envelope.sender_id,
             });
         } else {
             warn!(

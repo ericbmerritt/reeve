@@ -57,6 +57,30 @@ use crate::tool::{InvokeTool, ToolResult};
 /// journal insertion order.
 ///
 /// A turn is *completed* when its final `ModelCall` is not followed by a
+/// Format an inbound payload for the model's view of the conversation with a
+/// sender-attribution prefix. The runtime cannot model "another agent" as a
+/// distinct role under the Anthropic API (every turn is User or Assistant),
+/// so a worker's reply and an operator's prompt would otherwise be
+/// indistinguishable user-role text. Prefixing keeps the disambiguation
+/// inside the content block.
+///
+/// Format: `[from <sender_id>]\n<payload>`. The UUID is used directly rather
+/// than the agent name because name resolution would require threading the
+/// `AgentRegistry` into the agent actor; until that lands, the operator and
+/// peers each show up as a stable identifier the model can reason about.
+///
+/// Legacy journal entries deserialize with `sender_id = None`; for those the
+/// raw payload is returned unchanged.
+pub(crate) fn format_inbound_payload(
+    sender_id: Option<reeve_types::IdentityId>,
+    payload: &str,
+) -> String {
+    match sender_id {
+        Some(id) => format!("[from {id}]\n{payload}"),
+        None => payload.to_owned(),
+    }
+}
+
 /// `ToolUse` entry before the next `Inbound` or end of journal. An `Inbound`
 /// with an incomplete round-trip (crash before the final `ModelCall`, or
 /// a `ModelCall` followed by a dangling `ToolUse`) is an interrupted turn.
@@ -118,6 +142,7 @@ pub(crate) fn load_history_from_journal(
         let (role, block) = match entry {
             ConversationEntry::Inbound {
                 message_id,
+                sender_id,
                 payload,
                 ..
             } => {
@@ -133,7 +158,9 @@ pub(crate) fn load_history_from_journal(
                 tool_use_after_last_mc = false;
                 (
                     reeve_adapter::Role::User,
-                    reeve_adapter::MessageContent::Text(payload),
+                    reeve_adapter::MessageContent::Text(format_inbound_payload(
+                        sender_id, &payload,
+                    )),
                 )
             }
             ConversationEntry::Outbound { payload, .. } => (
@@ -292,6 +319,10 @@ pub struct ProcessInbound {
     pub payload: String,
     /// Stable identifier from the message envelope.
     pub message_id: String,
+    /// Identity that signed the envelope. Threaded through to the journal
+    /// and to the model's view of the conversation so a worker's reply is
+    /// not silently rendered as if it came from the operator.
+    pub sender_id: reeve_types::IdentityId,
 }
 
 impl actix::Message for ProcessInbound {
@@ -575,9 +606,16 @@ impl Agent {
     ///
     /// Returns `true` on success. On failure stops the actor and returns
     /// `false` so the caller can skip subsequent steps.
-    fn append_inbound(&self, message_id: &str, payload: &str, ctx: &mut Context<Self>) -> bool {
+    fn append_inbound(
+        &self,
+        message_id: &str,
+        sender_id: reeve_types::IdentityId,
+        payload: &str,
+        ctx: &mut Context<Self>,
+    ) -> bool {
         let entry = ConversationEntry::Inbound {
             message_id: message_id.to_owned(),
+            sender_id: Some(sender_id),
             payload: payload.to_owned(),
             timestamp_utc: OffsetDateTime::now_utc(),
         };
@@ -936,18 +974,24 @@ impl Agent {
     /// flips status to working, journals the inbound, pushes the user turn
     /// to history, and fires the adapter call.
     fn start_turn_with(&mut self, msg: ProcessInbound, ctx: &mut Context<Self>) {
-        info!(message_id = %msg.message_id, "processing");
+        let ProcessInbound {
+            payload,
+            message_id,
+            sender_id,
+        } = msg;
+        info!(message_id = %message_id, "processing");
         self.in_flight = true;
         if self.status_writer.write("working").is_err() {
             ctx.stop();
             return;
         }
-        if !self.append_inbound(&msg.message_id, &msg.payload, ctx) {
+        if !self.append_inbound(&message_id, sender_id, &payload, ctx) {
             return;
         }
+        let attributed = format_inbound_payload(Some(sender_id), &payload);
         self.history.push(reeve_adapter::Message {
             role: reeve_adapter::Role::User,
-            content: vec![reeve_adapter::MessageContent::Text(msg.payload)],
+            content: vec![reeve_adapter::MessageContent::Text(attributed)],
         });
         self.spawn_adapter_call(ctx);
     }
@@ -968,7 +1012,7 @@ impl Agent {
         );
         let mut combined = String::new();
         while let Some(msg) = self.pending_inbound.pop_front() {
-            if !self.append_inbound(&msg.message_id, &msg.payload, ctx) {
+            if !self.append_inbound(&msg.message_id, msg.sender_id, &msg.payload, ctx) {
                 return;
             }
             if msg.payload.is_empty() {
@@ -980,7 +1024,7 @@ impl Agent {
             if !combined.is_empty() {
                 combined.push_str("\n\n");
             }
-            combined.push_str(&msg.payload);
+            combined.push_str(&format_inbound_payload(Some(msg.sender_id), &msg.payload));
         }
         if combined.is_empty() {
             // All queued payloads were empty. No user turn to send; just go
@@ -1083,6 +1127,7 @@ mod tests {
     use super::{Agent, ProcessInbound};
     use crate::agent_fs::{AgentDirs, ConversationEntry};
     use crate::model_resolution::SpawnSnapshot;
+    use reeve_types::IdentityId;
 
     // ── Mock adapters ─────────────────────────────────────────────────────────
 
@@ -1180,7 +1225,7 @@ mod tests {
             dirs,
             mock_snapshot(),
             String::new(),
-            reeve_types::IdentityId::new().unwrap(),
+            IdentityId::new().unwrap(),
             reeve_types::Keypair::generate(),
             tools,
         )
@@ -1261,6 +1306,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: String::from("hello"),
                 message_id: String::from("test-1"),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Poll until the conversation journal has at least 4 lines:
@@ -1343,6 +1389,7 @@ mod tests {
                 addr.do_send(ProcessInbound {
                     payload: String::from("hello"),
                     message_id: String::from("dup-1"),
+                    sender_id: IdentityId::new().unwrap(),
                 });
             }
 
@@ -1461,6 +1508,7 @@ mod tests {
         let now = OffsetDateTime::now_utc();
         let inbound = ConversationEntry::Inbound {
             message_id: String::from("m1"),
+            sender_id: None,
             payload: String::from("hello"),
             timestamp_utc: now,
         };
@@ -1588,10 +1636,12 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: String::from("first"),
                 message_id: String::from("msg-1"),
+                sender_id: IdentityId::new().unwrap(),
             });
             addr.do_send(ProcessInbound {
                 payload: String::from("second"),
                 message_id: String::from("msg-2"),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Wait for the journal to contain two model_call entries (two
@@ -1693,6 +1743,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: String::from("first message"),
                 message_id: String::from("msg-1"),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Wait for the error to be processed and actor to return to idle.
@@ -1714,6 +1765,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: String::from("second message"),
                 message_id: String::from("msg-2"),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Wait for the second call to complete.
@@ -1744,12 +1796,15 @@ mod tests {
             "second adapter call should carry exactly one message; got: {:?}",
             calls[1]
         );
-        assert_eq!(
-            calls[1][0].content,
-            vec![reeve_adapter::MessageContent::Text(
-                "second message".to_owned()
-            )],
-            "second adapter call should carry the second user message"
+        // The runtime now prefixes inbound payloads with the sender id
+        // (`[from <uuid>]\n…`) so the model can distinguish operator messages
+        // from peer-agent replies. Verify the trailing payload matches.
+        let reeve_adapter::MessageContent::Text(ref text) = calls[1][0].content[0] else {
+            panic!("expected text content; got: {:?}", calls[1][0].content)
+        };
+        assert!(
+            text.ends_with("second message"),
+            "second adapter call should carry the second user message; got: {text}"
         );
     }
 
@@ -1787,6 +1842,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: String::from("hi"),
                 message_id: String::from("err-1"),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Poll until the conversation journal has at least 3 entries:
@@ -2056,6 +2112,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: String::from("trigger"),
                 message_id: String::from("m-1"),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Expect 8 entries:
@@ -2223,6 +2280,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: String::from("trigger"),
                 message_id: String::from("m-1"),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Wait for the abort system entry to appear.
@@ -2383,6 +2441,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: "go".to_owned(),
                 message_id: "m-1".to_owned(),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Wait until the second outbound (with "done") appears.
@@ -2523,6 +2582,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: "go".to_owned(),
                 message_id: "m-1".to_owned(),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -2706,6 +2766,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: "go".to_owned(),
                 message_id: "m-1".to_owned(),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Poll until a spawned agent's status file appears and reads "idle".
@@ -2862,6 +2923,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: "go".to_owned(),
                 message_id: "m-1".to_owned(),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Wait for the tool_result with is_error=true to appear in the journal.
@@ -3174,6 +3236,12 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "integration-style test: provisions dirs, primes the journal, \
+                  drives a turn, and asserts both the journal contents and the \
+                  in-memory history. Splitting fragments a tightly coupled scenario."
+    )]
     fn agent_new_loads_prior_history_and_appends_after_it() {
         let tmp = tempdir().unwrap();
         let data_dir = tmp.path().to_path_buf();
@@ -3186,6 +3254,7 @@ mod tests {
             thread
                 .append(&ConversationEntry::Inbound {
                     message_id: "prior-1".to_owned(),
+                    sender_id: None,
                     payload: "seed message".to_owned(),
                     timestamp_utc: time::OffsetDateTime::now_utc(),
                 })
@@ -3232,6 +3301,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: "new message".to_owned(),
                 message_id: "new-1".to_owned(),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Wait until at least: prior 2 + system(started) + inbound + outbound + model_call = 6.
@@ -3737,6 +3807,7 @@ mod tests {
             thread
                 .append(&ConversationEntry::Inbound {
                     message_id: "msg-already-processed".to_owned(),
+                    sender_id: None,
                     payload: "prior turn".to_owned(),
                     timestamp_utc: time::OffsetDateTime::now_utc(),
                 })
@@ -3785,6 +3856,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: "re-delivered payload".to_owned(),
                 message_id: "msg-already-processed".to_owned(),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Send a distinct probe message after the duplicate. The actor
@@ -3794,6 +3866,7 @@ mod tests {
             addr.do_send(ProcessInbound {
                 payload: "probe".to_owned(),
                 message_id: "msg-probe".to_owned(),
+                sender_id: IdentityId::new().unwrap(),
             });
 
             // Poll until the probe's Inbound entry is visible in the journal.
