@@ -91,7 +91,25 @@ fn build_title_bar(state: &AppState) -> Line<'static> {
 
     let status_span = Span::raw(format!(" {status}"));
 
-    Line::from(vec![prefix, lead_part, sigil_span, status_span])
+    let mut spans = vec![prefix, lead_part, sigil_span, status_span];
+    if !state.is_at_bottom() {
+        // Surface scroll position so the operator knows new entries are
+        // arriving above their viewport and how to get back. End is the
+        // shortest path; PageDown is documented in the footer.
+        let scroll_style = if no_color() {
+            Style::default()
+        } else {
+            Style::default().fg(Color::Cyan)
+        };
+        spans.push(Span::styled(
+            format!(
+                " \u{00B7} \u{2191} scrolled {} (End to bottom)",
+                state.scroll_offset
+            ),
+            scroll_style,
+        ));
+    }
+    Line::from(spans)
 }
 
 /// Format an optional timestamp as `HH:MM`, or return an empty string.
@@ -183,10 +201,9 @@ fn build_input_line(state: &AppState) -> Line<'static> {
     Line::from(format!("> {}_", state.input))
 }
 
-/// Format: `Tab panopticon · ? help · /search · q quit ─── ${cost:.4} USD`
+/// Format: `PgUp/PgDn scroll · End bottom · q quit ─── ${cost:.4} USD`
 fn build_footer(state: &AppState) -> Line<'static> {
-    let nav =
-        "Tab panopticon \u{00B7} ? help \u{00B7} /search \u{00B7} q quit \u{2500}\u{2500}\u{2500} ";
+    let nav = "PgUp/PgDn scroll \u{00B7} End bottom \u{00B7} q quit \u{2500}\u{2500}\u{2500} ";
     let cost = format!("${:.4} USD", state.cost_usd);
     Line::from(format!("{nav}{cost}"))
 }
@@ -213,7 +230,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(title_widget, chunks[0]);
 
     let conv_lines = build_conversation_lines(state);
-    let conv_widget = render_conversation(conv_lines, chunks[1]);
+    let conv_widget = render_conversation(&conv_lines, chunks[1], state.scroll_offset);
     frame.render_widget(conv_widget, chunks[1]);
 
     let sep_line = build_separator(chunks[2].width);
@@ -229,33 +246,43 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     frame.render_widget(footer_widget, chunks[4]);
 }
 
-/// Wrap conversation lines in a scrolled-to-bottom `Paragraph`.
+/// Wrap conversation lines in a `Paragraph`, scrolled either to the bottom
+/// (default) or `user_scroll` rows up from the bottom.
 ///
 /// Word-wraps long entries so the model's responses (which can easily exceed
 /// 200 columns) stay visible — without wrap, a single overflowing line would
 /// render as a single chopped-off row. `trim: false` preserves the two-space
 /// text indent and any leading whitespace inside model responses.
 ///
-/// Scroll calculation approximates the post-wrap row count via
-/// [`count_wrapped_rows`]: ratatui's exact `Paragraph::line_count` API is
-/// behind an unstable feature in 0.29, and we'd rather not opt in to a
-/// future-breaking signature for a UI nicety. The ceiling-divide
-/// approximation overcounts by at most one row per logical line, which
-/// errs on the side of "scroll just a bit too far" rather than clipping
-/// recent entries off the bottom.
+/// Scroll math:
+/// - `bottom_scroll = total_rows - visible_rows`, clamped at 0. This is the
+///   scroll offset needed to anchor the latest entry to the bottom.
+/// - `user_scroll` is how many rows the operator has scrolled up via
+///   `PageUp` / mouse wheel / `Shift-Up`. It's clamped to `[0, bottom_scroll]`
+///   on the render side so over-scrolling is harmless.
+/// - Effective scroll passed to ratatui is `bottom_scroll - clamped_user`.
+///
+/// Total row count uses [`count_wrapped_rows`]: ratatui's exact
+/// `Paragraph::line_count` API is behind an unstable feature in 0.29, and
+/// we'd rather not opt in to a future-breaking signature for a UI nicety.
+/// The ceiling-divide approximation overcounts by at most one row per logical
+/// line — bias is toward "scroll a hair too far" rather than clipping recent
+/// entries off the bottom.
 fn render_conversation(
-    lines: Vec<Line<'static>>,
+    lines: &[Line<'static>],
     area: ratatui::layout::Rect,
+    user_scroll: u16,
 ) -> Paragraph<'static> {
-    let total = count_wrapped_rows(&lines, area.width);
+    let total = count_wrapped_rows(lines, area.width);
     let visible = usize::from(area.height);
-    let scroll = total
+    let bottom_scroll: u16 = total
         .saturating_sub(visible)
         .try_into()
         .unwrap_or(u16::MAX);
-    Paragraph::new(Text::from(lines))
+    let effective = bottom_scroll.saturating_sub(user_scroll);
+    Paragraph::new(Text::from(lines.to_vec()))
         .wrap(Wrap { trim: false })
-        .scroll((scroll, 0))
+        .scroll((effective, 0))
 }
 
 /// Approximate the number of terminal rows that `lines` will occupy after
@@ -318,5 +345,33 @@ mod tests {
         assert!(thinking_indicator(&state).is_none());
         state.status = AgentStatus::Working;
         assert!(thinking_indicator(&state).is_some());
+    }
+
+    // U4: scroll_up / scroll_down / scroll_to_bottom each move the offset in
+    // the documented direction and saturate at their bounds.
+    #[test]
+    fn app_state_scroll_helpers() {
+        let mut state = AppState::default();
+        assert!(state.is_at_bottom());
+
+        state.scroll_up(10);
+        assert_eq!(state.scroll_offset, 10);
+        assert!(!state.is_at_bottom());
+
+        state.scroll_down(3);
+        assert_eq!(state.scroll_offset, 7);
+
+        // saturating downscroll never wraps under zero
+        state.scroll_down(99);
+        assert_eq!(state.scroll_offset, 0);
+        assert!(state.is_at_bottom());
+
+        // saturating up at u16::MAX never wraps over
+        state.scroll_up(u16::MAX);
+        state.scroll_up(1);
+        assert_eq!(state.scroll_offset, u16::MAX);
+
+        state.scroll_to_bottom();
+        assert_eq!(state.scroll_offset, 0);
     }
 }
