@@ -153,13 +153,20 @@ fn format_status(
 fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize structured logging. REEVE_LOG controls the filter
     // (default: debug for reeve crates, warn for everything else).
-    // Output goes to the file handle on stderr, which daemon_log_stdio()
-    // redirected to state_dir/daemon.log.
+    //
+    // The fmt subscriber's default writer is stdout. The daemon spawner only
+    // redirects stderr to <state_dir>/daemon.log (see daemon_log_stdio),
+    // leaving stdout pointed at /dev/null. Without with_writer(io::stderr)
+    // every tracing call would be silently discarded and the only entries
+    // in daemon.log would be pre-subscriber `Error:` prints from `?`
+    // propagation at startup. Cost us several hours; pin the writer
+    // explicitly.
     let filter = std::env::var("REEVE_LOG").unwrap_or_else(|_| "reeve=debug,warn".to_owned());
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
         .with_target(true)
         .with_thread_ids(false)
+        .with_writer(io::stderr)
         .init();
 
     let state_dir = default_state_dir()?;
