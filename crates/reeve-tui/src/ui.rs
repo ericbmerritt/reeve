@@ -109,7 +109,7 @@ fn build_conversation_lines(state: &AppState) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for entry in &state.conversation {
-        let label = entry.kind.speaker_label(&state.persona_name).to_owned();
+        let label = entry.speaker_label(&state.persona_name, state.operator_id);
         let ts = format_timestamp(entry.timestamp);
 
         let speaker_line = if ts.is_empty() {

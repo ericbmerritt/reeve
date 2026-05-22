@@ -6,6 +6,7 @@
 //! from disk are in `crate::reader`; the watcher loop calls back into
 //! those readers and replaces the state.
 
+use reeve_types::IdentityId;
 use time::OffsetDateTime;
 
 // ── EntryKind ─────────────────────────────────────────────────────────────────
@@ -21,29 +22,51 @@ pub enum EntryKind {
     System,
 }
 
-impl EntryKind {
-    /// Display label for this entry kind, given the persona name.
-    pub fn speaker_label<'a>(&self, persona_name: &'a str) -> &'a str {
-        match self {
-            Self::Inbound => "you",
-            Self::Outbound => persona_name,
-            Self::System => "system",
-        }
-    }
-}
-
 // ── ConversationEntry ─────────────────────────────────────────────────────────
 
 /// A single display-ready entry in the lead agent's conversation history.
 ///
 /// Parsed from `agents/lead/log/conversation.jsonl` by `crate::reader`. The
 /// renderer uses `kind` and `text`; `timestamp` is shown in the speaker tag
-/// when present. Use [`EntryKind::speaker_label`] to obtain the display label.
+/// when present. `sender_id` is set for inbound entries written by the
+/// post-attribution runtime and `None` for legacy entries (or for variants
+/// where the sender concept does not apply).
 #[derive(Debug, Clone)]
 pub struct ConversationEntry {
     pub kind: EntryKind,
     pub text: String,
     pub timestamp: Option<OffsetDateTime>,
+    pub sender_id: Option<IdentityId>,
+}
+
+impl ConversationEntry {
+    /// Resolve the display label for this entry given the lead persona name
+    /// and the operator's identity id. Routing is:
+    /// - `Outbound` → the persona name (the lead is talking)
+    /// - `System` → `"system"`
+    /// - `Inbound` with `sender_id == operator_id` → `"you"` (operator typed)
+    /// - `Inbound` with another `sender_id` → that sender's id, truncated to
+    ///   the leading UUID segment so the tag stays scannable
+    /// - `Inbound` with no `sender_id` (legacy journals) → `"unknown"`
+    pub fn speaker_label(&self, persona_name: &str, operator_id: Option<IdentityId>) -> String {
+        match self.kind {
+            EntryKind::Outbound => persona_name.to_owned(),
+            EntryKind::System => "system".to_owned(),
+            EntryKind::Inbound => match self.sender_id {
+                Some(id) if Some(id) == operator_id => "you".to_owned(),
+                Some(id) => short_id(id),
+                None => "unknown".to_owned(),
+            },
+        }
+    }
+}
+
+/// First UUID segment (8 hex chars) for a tag-friendly sender label. Full ids
+/// are long; this keeps the speaker bar scannable while still being unique
+/// enough to disambiguate within a single conversation.
+fn short_id(id: IdentityId) -> String {
+    let s = id.to_string();
+    s.split('-').next().unwrap_or(&s).to_owned()
 }
 
 // ── AgentStatus ───────────────────────────────────────────────────────────────
@@ -78,6 +101,10 @@ pub struct AppState {
     pub cost_usd: f64,
     pub persona_name: String,
     pub model_id: String,
+    /// Operator identity used to resolve the `"you"` label on inbound entries.
+    /// Populated at startup from the identity registry; left `None` until the
+    /// registry lookup completes (renderer falls back to a short-id label).
+    pub operator_id: Option<IdentityId>,
     pub(crate) input: String,
     cursor_pos: usize, // private: always a valid byte boundary in input
 }
@@ -132,6 +159,7 @@ impl Default for AppState {
             cost_usd: 0.0,
             persona_name: String::from("lead"),
             model_id: String::from("unknown"),
+            operator_id: None,
             input: String::new(),
             cursor_pos: 0,
         }
