@@ -22,7 +22,10 @@ use std::time::Duration;
 
 use reeve_runtime::{IdentityRegistry, OperatorKeyStore};
 
-use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers, MouseEvent,
+    MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -90,6 +93,7 @@ struct TerminalGuard;
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         // Ignore errors during cleanup: nothing useful can be done if restore fails.
+        let _ = execute!(io::stdout(), DisableMouseCapture);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
@@ -106,6 +110,12 @@ fn setup_terminal() -> Result<(Terminal<CrosstermBackend<Stdout>>, TerminalGuard
     let mut stdout = io::stdout();
     stdout
         .execute(EnterAlternateScreen)
+        .map_err(TuiError::Terminal)?;
+    // Capture mouse so wheel events route into the event loop for
+    // scrolling the conversation pane. DisableMouseCapture runs in
+    // TerminalGuard::drop so the terminal is restored even on panic.
+    stdout
+        .execute(EnableMouseCapture)
         .map_err(TuiError::Terminal)?;
     let backend = CrosstermBackend::new(io::stdout());
     let terminal = Terminal::new(backend).map_err(TuiError::Terminal)?;
@@ -194,14 +204,31 @@ pub fn run(
                         return Ok(());
                     }
                 }
+                Event::Mouse(mouse) => handle_mouse(mouse, &mut state),
                 // Resize triggers a full redraw on the next iteration naturally.
                 Event::Resize(_, _)
                 | Event::FocusGained
                 | Event::FocusLost
-                | Event::Mouse(_)
                 | Event::Paste(_) => {}
             }
         }
+    }
+}
+
+/// Mouse wheel maps to conversation-pane scroll. The wheel typically emits
+/// one event per detent on macOS / Linux; bumping three rows per detent
+/// matches the cadence of every other terminal app the operator is used to.
+fn handle_mouse(event: MouseEvent, state: &mut AppState) {
+    const ROWS_PER_DETENT: u16 = 3;
+    match event.kind {
+        MouseEventKind::ScrollUp => state.scroll_up(ROWS_PER_DETENT),
+        MouseEventKind::ScrollDown => state.scroll_down(ROWS_PER_DETENT),
+        MouseEventKind::Down(_)
+        | MouseEventKind::Up(_)
+        | MouseEventKind::Drag(_)
+        | MouseEventKind::Moved
+        | MouseEventKind::ScrollLeft
+        | MouseEventKind::ScrollRight => {}
     }
 }
 
@@ -213,6 +240,12 @@ fn handle_key(
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<bool, TuiError> {
+    // Conversation-pane scroll. ROWS_PER_PAGE is intentionally a constant
+    // rather than terminal height so the operator's muscle memory ('PgUp
+    // moves about a screenful') doesn't change with window size.
+    const ROWS_PER_PAGE: u16 = 10;
+    const ROWS_PER_LINE_NUDGE: u16 = 1;
+
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
             return Ok(true);
@@ -231,6 +264,14 @@ fn handle_key(
             }
             state.set_input(s);
         }
+
+        (KeyCode::PageUp, _) => state.scroll_up(ROWS_PER_PAGE),
+        (KeyCode::PageDown, _) => state.scroll_down(ROWS_PER_PAGE),
+        // Shift+Up/Down: fine-grained nudges. Plain arrow keys are reserved
+        // for future input-cursor movement so we don't claim them here.
+        (KeyCode::Up, KeyModifiers::SHIFT) => state.scroll_up(ROWS_PER_LINE_NUDGE),
+        (KeyCode::Down, KeyModifiers::SHIFT) => state.scroll_down(ROWS_PER_LINE_NUDGE),
+        (KeyCode::End, _) => state.scroll_to_bottom(),
 
         (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
             let mut s = state.input.clone();
@@ -261,5 +302,8 @@ fn submit_input(
     }
     submit_message(&payload, dirs, registry, keystore).map_err(TuiError::Submit)?;
     state.set_input(String::new());
+    // Sending a message means the operator wants to see the reply; snap the
+    // view back to the bottom so the response auto-scrolls into focus.
+    state.scroll_to_bottom();
     Ok(())
 }

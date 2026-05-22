@@ -105,6 +105,14 @@ pub struct AppState {
     /// Populated at startup from the identity registry; left `None` until the
     /// registry lookup completes (renderer falls back to a short-id label).
     pub operator_id: Option<IdentityId>,
+    /// Number of rows the operator has scrolled up from the bottom of the
+    /// conversation pane. `0` means the view is anchored to the most recent
+    /// entry (default behaviour: new inbound/outbound entries auto-scroll into
+    /// view). Any positive value pins the view at that distance from the
+    /// bottom; new entries arrive *above* the visible area until the user
+    /// scrolls back down or hits End. The renderer clamps reads against the
+    /// actual visible content, so an over-large value is harmless.
+    pub scroll_offset: u16,
     pub(crate) input: String,
     cursor_pos: usize, // private: always a valid byte boundary in input
 }
@@ -160,9 +168,35 @@ impl Default for AppState {
             persona_name: String::from("lead"),
             model_id: String::from("unknown"),
             operator_id: None,
+            scroll_offset: 0,
             input: String::new(),
             cursor_pos: 0,
         }
+    }
+}
+
+impl AppState {
+    /// Scroll the conversation pane up by `rows`. The new offset is bounded
+    /// only above; if the requested offset is larger than the visible content,
+    /// the renderer clamps it on its side.
+    pub fn scroll_up(&mut self, rows: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_add(rows);
+    }
+
+    /// Scroll the conversation pane down by `rows`. Saturates at 0 (the
+    /// bottom). Once the offset reaches 0 auto-scroll-on-new-entries resumes.
+    pub fn scroll_down(&mut self, rows: u16) {
+        self.scroll_offset = self.scroll_offset.saturating_sub(rows);
+    }
+
+    /// Anchor the view at the most recent entry. Re-enables auto-scroll.
+    pub fn scroll_to_bottom(&mut self) {
+        self.scroll_offset = 0;
+    }
+
+    /// `true` when the conversation view is anchored to the latest entry.
+    pub fn is_at_bottom(&self) -> bool {
+        self.scroll_offset == 0
     }
 }
 
