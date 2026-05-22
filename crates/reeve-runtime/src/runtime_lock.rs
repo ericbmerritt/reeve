@@ -158,6 +158,14 @@ pub fn default_state_dir() -> Result<PathBuf, RuntimeLockError> {
     )
 }
 
+/// Default daemon log path: `<state_dir>/daemon.log`. Operators reach this via
+/// `reeve daemon logs` or by tailing the path directly; the daemon spawner
+/// redirects its child's stderr here so anything from the tracing subscriber
+/// (and any pre-subscriber error returns) lands in one place.
+pub fn default_log_path() -> Result<PathBuf, RuntimeLockError> {
+    Ok(default_state_dir()?.join("daemon.log"))
+}
+
 fn resolve_default_state_dir(
     xdg_state_home: Option<&OsStr>,
     home: Option<&OsStr>,
