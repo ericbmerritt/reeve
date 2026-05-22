@@ -86,9 +86,9 @@ both wirings are removed when `spawn_agent` and `send_message` land in phase 3.
 
 ## Phase 2: Agent identity and runtime registry
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-09 | 2026-05-09 |
 
 Tags: runtime, security, identity
 
@@ -184,9 +184,9 @@ loaded from disk. The lead appears in the registry under name `"lead"`.
 
 ## Phase 3: SpawnCoordinator and spawn\_agent tool
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-09 | 2026-05-10 |
 
 Tags: runtime, agent
 
@@ -245,9 +245,9 @@ exercised by `spawn_agent` in integration tests.
 
 ## Phase 4: MessageDispatcher and send\_message tool
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-10 | 2026-05-22 |
 
 Tags: runtime, transport
 
