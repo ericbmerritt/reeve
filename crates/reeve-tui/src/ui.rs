@@ -278,10 +278,7 @@ fn render_conversation(
     let paragraph = Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false });
     let total = paragraph.line_count(area.width);
     let visible = usize::from(area.height);
-    let bottom_scroll: u16 = total
-        .saturating_sub(visible)
-        .try_into()
-        .unwrap_or(u16::MAX);
+    let bottom_scroll: u16 = total.saturating_sub(visible).try_into().unwrap_or(u16::MAX);
     let effective = bottom_scroll.saturating_sub(user_scroll);
     paragraph.scroll((effective, 0))
 }

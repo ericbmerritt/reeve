@@ -27,9 +27,7 @@ use reeve_types::{Identity, IdentityId, IdentityIdError, KeyRecord};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
 
-use crate::fs_util::{
-    ensure_directory, set_nofollow, sync_directory, FsCheckError, XdgBaseError,
-};
+use crate::fs_util::{ensure_directory, set_nofollow, sync_directory, FsCheckError, XdgBaseError};
 
 /// Maximum size in bytes of any single registry TOML file. Identities and
 /// their key records serialize to well under a kilobyte; the cap guards

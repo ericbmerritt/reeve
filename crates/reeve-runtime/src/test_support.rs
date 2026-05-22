@@ -311,12 +311,7 @@ impl actix::Actor for NullDispatcher {
 impl actix::Handler<crate::dispatcher::SendMessage> for NullDispatcher {
     type Result = ();
 
-    fn handle(
-        &mut self,
-        _msg: crate::dispatcher::SendMessage,
-        _ctx: &mut actix::Context<Self>,
-    ) {
-    }
+    fn handle(&mut self, _msg: crate::dispatcher::SendMessage, _ctx: &mut actix::Context<Self>) {}
 }
 
 // ── Tool result capture helpers ───────────────────────────────────────────────

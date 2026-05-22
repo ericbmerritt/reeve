@@ -70,7 +70,10 @@ impl actix::Handler<SendFailed> for SendRelay {
         if let Some(r) = self.reply_to.take() {
             // Use category(), not Display: the Io and KeypairLoad variants
             // embed filesystem paths in their Display output.
-            tracing::warn!(category = msg.error.category(), "send_message: dispatch failed");
+            tracing::warn!(
+                category = msg.error.category(),
+                "send_message: dispatch failed"
+            );
             r.do_send(ToolResult {
                 tool_use_id: self.tool_use_id.clone(),
                 content: format!("send_message: {}", msg.error.category()),
@@ -103,10 +106,9 @@ impl SendMessageTool {
     pub fn descriptor() -> reeve_adapter::Tool {
         reeve_adapter::Tool {
             name: "send_message".to_owned(),
-            description:
-                "Send a signed message to another agent by name. Returns the \
+            description: "Send a signed message to another agent by name. Returns the \
                  dispatched message ID on success."
-                    .to_owned(),
+                .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
@@ -213,7 +215,9 @@ impl actix::Handler<InvokeTool> for SendMessageTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{tool_result_capture_pair as capture_pair, TOOL_RESULT_TIMEOUT as RESULT_TIMEOUT};
+    use crate::test_support::{
+        tool_result_capture_pair as capture_pair, TOOL_RESULT_TIMEOUT as RESULT_TIMEOUT,
+    };
     use reeve_types::{IdentityId, MessageId};
     use std::sync::Arc;
 
@@ -807,10 +811,8 @@ mod tests {
         let message_id_str = actix::System::new().block_on(async move {
             use actix::Actor as _;
 
-            let dispatcher = MessageDispatcher::new(
-                dispatcher_registry_path,
-                Arc::clone(&identity_registry),
-            );
+            let dispatcher =
+                MessageDispatcher::new(dispatcher_registry_path, Arc::clone(&identity_registry));
             let dispatcher_addr = actix::Supervisor::start(move |_| dispatcher);
 
             let tool_addr = SendMessageTool::new(dispatcher_addr.recipient()).start();
@@ -832,11 +834,7 @@ mod tests {
                 .expect("ToolResult did not arrive within timeout")
                 .expect("sender dropped");
 
-            assert!(
-                !result.is_error,
-                "tool returned error: {}",
-                result.content
-            );
+            assert!(!result.is_error, "tool returned error: {}", result.content);
 
             let captured = result.content.clone();
             actix::System::current().stop();

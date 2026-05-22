@@ -67,8 +67,7 @@ REEVE_LOG="reeve_runtime::dispatcher=debug,reeve_runtime::watcher=debug,warn" \
 `reeve daemon stop && reeve daemon start` to take effect on the running
 process.
 
-[`tracing-subscriber` EnvFilter]:
-  https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
+[`tracing-subscriber` EnvFilter]: https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
 
 ## Architecture
 

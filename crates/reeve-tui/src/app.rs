@@ -206,10 +206,7 @@ pub fn run(
                 }
                 Event::Mouse(mouse) => handle_mouse(mouse, &mut state),
                 // Resize triggers a full redraw on the next iteration naturally.
-                Event::Resize(_, _)
-                | Event::FocusGained
-                | Event::FocusLost
-                | Event::Paste(_) => {}
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
             }
         }
     }

@@ -325,9 +325,15 @@ mod tests {
             sender_id: Some(worker_id),
         };
 
-        assert_eq!(from_operator.speaker_label("lead", Some(operator_id)), "you");
+        assert_eq!(
+            from_operator.speaker_label("lead", Some(operator_id)),
+            "you"
+        );
         let worker_label = from_worker.speaker_label("lead", Some(operator_id));
-        assert_ne!(worker_label, "you", "peer-signed inbound must not say 'you'");
+        assert_ne!(
+            worker_label, "you",
+            "peer-signed inbound must not say 'you'"
+        );
         assert!(
             worker_id.to_string().starts_with(&worker_label),
             "worker label should be the leading UUID segment; got: {worker_label}"

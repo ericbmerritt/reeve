@@ -260,7 +260,10 @@ impl actix::Handler<InvokeTool> for SpawnAgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{tool_result_capture_pair as capture_pair, ToolResultCapture, TOOL_RESULT_TIMEOUT as RESULT_TIMEOUT};
+    use crate::test_support::{
+        tool_result_capture_pair as capture_pair, ToolResultCapture,
+        TOOL_RESULT_TIMEOUT as RESULT_TIMEOUT,
+    };
     use reeve_types::IdentityId;
 
     // T_SA1: SpawnAgentTool descriptor has the expected shape.
@@ -954,5 +957,4 @@ mod tests {
             actix::System::current().stop();
         });
     }
-
 }

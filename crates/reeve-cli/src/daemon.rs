@@ -163,7 +163,11 @@ fn handle_spawn_result(
 /// here must not mask the primary status the caller just printed.
 fn write_log_hint(out: &mut dyn Write) -> io::Result<()> {
     if let Ok(path) = default_log_path() {
-        writeln!(out, "log: {} (run `reeve daemon logs -f` to tail)", path.display())?;
+        writeln!(
+            out,
+            "log: {} (run `reeve daemon logs -f` to tail)",
+            path.display()
+        )?;
     }
     Ok(())
 }
