@@ -217,6 +217,12 @@ pub enum ConversationEntry {
     Inbound {
         /// Stable identifier from the message envelope.
         message_id: String,
+        /// Identity that signed the envelope. `Option` for backward
+        /// compatibility with journals written before sender attribution
+        /// was wired through; legacy entries deserialize with `None` and
+        /// downstream renderers fall back to an "unknown" label.
+        #[serde(default)]
+        sender_id: Option<reeve_types::IdentityId>,
         payload: String,
         #[serde(with = "time::serde::rfc3339")]
         timestamp_utc: OffsetDateTime,
@@ -491,6 +497,7 @@ mod tests {
         thread
             .append(&ConversationEntry::Inbound {
                 message_id: String::from("msg-1"),
+                sender_id: None,
                 payload: String::from("hello"),
                 timestamp_utc: OffsetDateTime::now_utc(),
             })
@@ -579,6 +586,7 @@ mod tests {
                 "inbound",
                 ConversationEntry::Inbound {
                     message_id: String::from("x"),
+                    sender_id: None,
                     payload: String::from("p"),
                     timestamp_utc: now,
                 },
