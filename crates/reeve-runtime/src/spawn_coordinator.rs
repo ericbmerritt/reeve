@@ -253,7 +253,7 @@ impl Supervised for SpawnCoordinator {}
 /// the lead (and to peers) via their own tool loop. Extracted into a free
 /// function so tests can assert the descriptor list without spinning up the
 /// full spawn pipeline.
-fn build_subagent_tools(
+pub(crate) fn build_subagent_tools(
     dispatcher: actix::Recipient<SendMessage>,
 ) -> Vec<(reeve_adapter::Tool, actix::Recipient<InvokeTool>)> {
     use actix::Actor as _;
@@ -403,13 +403,23 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             return;
         }
 
-        let snapshot = match resolve_model(&persona_config, &[self.adapter.as_ref()], agent_id) {
+        let mut snapshot = match resolve_model(&persona_config, &[self.adapter.as_ref()], agent_id)
+        {
             Ok(s) => s,
             Err(err) => {
                 error_reply(&reply_to, format!("failed to resolve model adapter: {err}"));
                 return;
             }
         };
+
+        let final_system_prompt = if system_prompt.is_empty() {
+            persona_config.system_prompt.clone()
+        } else {
+            format!("{}\n\n{}", persona_config.system_prompt, system_prompt)
+        };
+        // Persist the composed prompt so a daemon restart can re-launch this
+        // agent with the same task context, not just the persona's base.
+        snapshot.system_prompt.clone_from(&final_system_prompt);
 
         if let Err(err) = write_spawn_snapshot(&dirs, &snapshot) {
             error_reply(&reply_to, format!("failed to write spawn snapshot: {err}"));
@@ -422,12 +432,6 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             adapter_id = %snapshot.adapter_id,
             "spawn sequence complete; starting agent actor",
         );
-
-        let final_system_prompt = if system_prompt.is_empty() {
-            persona_config.system_prompt.clone()
-        } else {
-            format!("{}\n\n{}", persona_config.system_prompt, system_prompt)
-        };
 
         let tools = build_subagent_tools(self.dispatcher.clone());
 
