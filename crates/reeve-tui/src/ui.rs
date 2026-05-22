@@ -262,75 +262,33 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
 ///   on the render side so over-scrolling is harmless.
 /// - Effective scroll passed to ratatui is `bottom_scroll - clamped_user`.
 ///
-/// Total row count uses [`count_wrapped_rows`]: ratatui's exact
-/// `Paragraph::line_count` API is behind an unstable feature in 0.29, and
-/// we'd rather not opt in to a future-breaking signature for a UI nicety.
-/// The ceiling-divide approximation overcounts by at most one row per logical
-/// line — bias is toward "scroll a hair too far" rather than clipping recent
-/// entries off the bottom.
+/// `Paragraph::line_count` (behind ratatui's `unstable-rendered-line-info`
+/// feature, see this crate's Cargo.toml) reports the exact post-wrap row
+/// count. A prior ceiling-divide approximation undercounted because
+/// `Wrap { trim: false }` preserves leading whitespace on continuation rows
+/// — effectively narrowing the wrap width past column 0 — and the latest
+/// entry ended up below the viewport. We accept the unstable-feature
+/// pin for correctness here; the API surface is small and the build will
+/// loudly fail if ratatui changes it.
 fn render_conversation(
     lines: &[Line<'static>],
     area: ratatui::layout::Rect,
     user_scroll: u16,
 ) -> Paragraph<'static> {
-    let total = count_wrapped_rows(lines, area.width);
+    let paragraph = Paragraph::new(Text::from(lines.to_vec())).wrap(Wrap { trim: false });
+    let total = paragraph.line_count(area.width);
     let visible = usize::from(area.height);
     let bottom_scroll: u16 = total
         .saturating_sub(visible)
         .try_into()
         .unwrap_or(u16::MAX);
     let effective = bottom_scroll.saturating_sub(user_scroll);
-    Paragraph::new(Text::from(lines.to_vec()))
-        .wrap(Wrap { trim: false })
-        .scroll((effective, 0))
-}
-
-/// Approximate the number of terminal rows that `lines` will occupy after
-/// word-wrap at `width` columns. Empty lines count as one row each. The
-/// approximation is the ceiling-divide of each line's visual width by the
-/// render width; it overcounts by at most one row per line versus ratatui's
-/// real wrap implementation (which is word-aware), and never undercounts,
-/// so the auto-scroll target never clips the latest entry off the bottom.
-fn count_wrapped_rows(lines: &[Line<'_>], width: u16) -> usize {
-    let width = usize::from(width.max(1));
-    lines
-        .iter()
-        .map(|line| {
-            let len = line.width();
-            if len == 0 {
-                1
-            } else {
-                len.div_ceil(width)
-            }
-        })
-        .sum()
+    paragraph.scroll((effective, 0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // U1: count_wrapped_rows returns 1 per empty line and ceil-divide for
-    // overflowing lines. Regression guard for the auto-scroll calculation.
-    #[test]
-    fn count_wrapped_rows_handles_empty_and_overflow() {
-        let lines = vec![
-            Line::from(""),                            // 1 row
-            Line::from("short"),                       // 1 row (5 chars)
-            Line::from("x".repeat(80)),                // 4 rows at width=20
-            Line::from("y".repeat(21)),                // 2 rows at width=20
-        ];
-        assert_eq!(count_wrapped_rows(&lines, 20), 1 + 1 + 4 + 2);
-    }
-
-    // U2: zero render width is treated as width=1 so we never divide by zero
-    // and the function still terminates with a sensible upper bound.
-    #[test]
-    fn count_wrapped_rows_zero_width_is_safe() {
-        let lines = vec![Line::from("hello")];
-        // width treated as 1, so 5 chars → 5 rows
-        assert_eq!(count_wrapped_rows(&lines, 0), 5);
-    }
 
     // U3: thinking_indicator is None unless the agent is Working — idle / crashed
     // / unknown agents should not show the spinner.
