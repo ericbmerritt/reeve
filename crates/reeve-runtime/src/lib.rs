@@ -53,7 +53,7 @@ pub use ledger::{
     DeliveryKey, DeliveryLedger, DeliveryRecord, LedgerError, ReplayKey, ReplayLedger, ReplayRecord,
 };
 pub use model_resolution::{resolve_model, write_spawn_snapshot, ModelResolveError, SpawnSnapshot};
-pub use runtime_lock::{default_state_dir, RuntimeLock, RuntimeLockError};
+pub use runtime_lock::{default_log_path, default_state_dir, RuntimeLock, RuntimeLockError};
 pub use spawn_coordinator::{SpawnCoordinator, SpawnRequestError, SpawnResponse};
 pub use supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 pub use tool::{

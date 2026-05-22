@@ -35,10 +35,40 @@ Closing the TUI does not stop the daemon. Run `reeve attach` to reconnect.
 reeve                            first-run setup + attach TUI
 reeve attach                     attach TUI to running daemon
 reeve daemon start|stop|status   daemon lifecycle
+reeve daemon logs [-f] [-n N]    print or follow the daemon log
 reeve identity enroll|list|unenroll
                                  operator identity management
 reeve adapter set-key|test       model adapter configuration
 ```
+
+## Logging
+
+The daemon process writes structured (tracing) output to
+`$XDG_STATE_HOME/reeve/daemon.log` (default `~/.local/state/reeve/daemon.log`).
+The same file is also where pre-subscriber stderr from daemon startup lands,
+so it is the single place to look when a daemon refuses to start or a
+running daemon misbehaves. `reeve daemon status` and `reeve daemon start`
+print the path on every invocation; `reeve daemon logs -f` tails it.
+
+The default filter is `reeve=debug,warn` — `debug` for first-party crates,
+`warn` for everything else. Override with `REEVE_LOG`, which accepts the
+standard [`tracing-subscriber` EnvFilter] syntax:
+
+```bash
+# turn everything in the runtime up to trace
+REEVE_LOG=trace ./target/release/reeve
+
+# debug just the dispatcher and watcher, warn elsewhere
+REEVE_LOG="reeve_runtime::dispatcher=debug,reeve_runtime::watcher=debug,warn" \
+  ./target/release/reeve
+```
+
+`REEVE_LOG` is read at daemon start, so changing it requires
+`reeve daemon stop && reeve daemon start` to take effect on the running
+process.
+
+[`tracing-subscriber` EnvFilter]:
+  https://docs.rs/tracing-subscriber/latest/tracing_subscriber/filter/struct.EnvFilter.html
 
 ## Architecture
 

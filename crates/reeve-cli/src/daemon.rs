@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::sync::Arc;
 
 use clap::Subcommand;
-use reeve_runtime::runtime_lock::default_state_dir;
+use reeve_runtime::runtime_lock::{default_log_path, default_state_dir};
 use reeve_runtime::{
     daemon_run, daemon_spawn, daemon_status, daemon_stop, keychain::labels, DaemonError,
     DaemonStatus, IdentityRegistry, KeychainError, OperatorSecretStore,
@@ -26,6 +26,18 @@ pub(crate) enum DaemonSubcommand {
     Stop,
     /// Print the current daemon status.
     Status,
+    /// Print recent daemon log lines, optionally streaming new lines as they
+    /// arrive. The log lives at `<state_dir>/daemon.log` and captures the
+    /// tracing-subscriber output plus any pre-subscriber stderr from
+    /// daemon startup.
+    Logs {
+        /// Stream new lines as the daemon writes them (like `tail -F`).
+        #[arg(short, long)]
+        follow: bool,
+        /// Number of trailing lines to print before following (default 50).
+        #[arg(short = 'n', long, default_value_t = 50)]
+        lines: usize,
+    },
     /// Run the daemon in the foreground (internal; called by `daemon start`).
     #[command(hide = true, name = "run-internal")]
     RunInternal,
@@ -42,6 +54,7 @@ pub(crate) fn dispatch(cmd: &DaemonSubcommand) -> Result<(), Box<dyn std::error:
         DaemonSubcommand::Start => cmd_start(),
         DaemonSubcommand::Stop => cmd_stop(),
         DaemonSubcommand::Status => cmd_status(),
+        DaemonSubcommand::Logs { follow, lines } => cmd_logs(*follow, *lines),
         DaemonSubcommand::RunInternal => cmd_run_internal(),
     }
 }
@@ -72,6 +85,41 @@ fn cmd_status() -> Result<(), Box<dyn std::error::Error>> {
     format_status(daemon_status(&state_dir), &mut io::stdout().lock())
 }
 
+// ── logs ──────────────────────────────────────────────────────────────────────
+
+/// Print `daemon.log` to stdout. Delegates to `tail(1)` (POSIX) because pure
+/// Rust follow-mode is non-trivial and the operator-facing tool is allowed to
+/// depend on a tool every supported dev OS ships with.
+fn cmd_logs(follow: bool, lines: usize) -> Result<(), Box<dyn std::error::Error>> {
+    let log_path = default_log_path()?;
+    if !log_path.exists() {
+        writeln!(
+            io::stderr().lock(),
+            "log file does not exist yet: {}",
+            log_path.display()
+        )?;
+        writeln!(
+            io::stderr().lock(),
+            "(start the daemon with `reeve daemon start` to create it)"
+        )?;
+        return Ok(());
+    }
+
+    let mut cmd = std::process::Command::new("tail");
+    cmd.arg("-n").arg(lines.to_string());
+    if follow {
+        // -F follows by name; survives the future log-rotation rename.
+        cmd.arg("-F");
+    }
+    cmd.arg(&log_path);
+
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(format!("tail exited non-zero: {status}").into());
+    }
+    Ok(())
+}
+
 // ── routing helpers (pure, testable) ─────────────────────────────────────────
 
 fn handle_spawn_result(
@@ -81,14 +129,17 @@ fn handle_spawn_result(
     match result {
         Ok(()) => {
             writeln!(out, "daemon started")?;
+            write_log_hint(out)?;
             Ok(())
         }
         Err(DaemonError::AlreadyRunning { pid: Some(pid) }) => {
             writeln!(out, "already running, PID {pid}")?;
+            write_log_hint(out)?;
             Ok(())
         }
         Err(DaemonError::AlreadyRunning { pid: None }) => {
             writeln!(out, "already running")?;
+            write_log_hint(out)?;
             Ok(())
         }
         Err(
@@ -98,8 +149,23 @@ fn handle_spawn_result(
             | DaemonError::Timeout { .. }
             | DaemonError::Signal { .. }
             | DaemonError::NoRuntime),
-        ) => Err(err.into()),
+        ) => {
+            // Timeout and Resource errors during startup almost always have a
+            // root cause in the daemon log; surface the path even on the error
+            // path so operators do not need to remember where it lives.
+            let _ = write_log_hint(&mut io::stderr().lock());
+            Err(err.into())
+        }
     }
+}
+
+/// Emit a `log: <path>` hint line. Best-effort: a path-resolution failure
+/// here must not mask the primary status the caller just printed.
+fn write_log_hint(out: &mut dyn Write) -> io::Result<()> {
+    if let Ok(path) = default_log_path() {
+        writeln!(out, "log: {} (run `reeve daemon logs -f` to tail)", path.display())?;
+    }
+    Ok(())
 }
 
 fn handle_stop_result(
@@ -134,12 +200,16 @@ fn format_status(
         DaemonStatus::Alive { pid, heartbeat_age } => {
             let age = heartbeat_age.as_secs_f64();
             writeln!(out, "alive, PID {pid}, heartbeat {age:.1}s ago")?;
+            write_log_hint(out)?;
         }
         DaemonStatus::Stale { pid } => {
             writeln!(
                 out,
                 "stale, PID {pid} (process alive but heartbeat stopped — run: daemon stop)"
             )?;
+            // Heartbeat-stopped daemons almost always tell you *why* in their
+            // log; surface the path so the operator doesn't have to remember.
+            write_log_hint(out)?;
         }
         DaemonStatus::NotRunning => {
             writeln!(out, "not running")?;
