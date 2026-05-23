@@ -102,24 +102,55 @@ impl SpawnAgentTool {
     pub fn descriptor() -> reeve_adapter::Tool {
         reeve_adapter::Tool {
             name: "spawn_agent".to_owned(),
-            description:
-                "Provision and start a new subordinate agent with a given persona and task. \
-                 Returns the agent's assigned name on success."
-                    .to_owned(),
+            description: "Provision and start a new subordinate agent with a given \
+                persona and task. Returns the agent's assigned name on success \
+                (the persona name with a short hex suffix if the name is taken, \
+                e.g. `worker-a1b2c3d4`). Use that exact name with send_message \
+                or list_agents thereafter. \
+                \n\nLimits: persona name at most 256 bytes; the composed \
+                system prompt (task + optional context, joined with a blank \
+                line) at most 65,536 bytes. The persona's base system prompt \
+                is appended by the coordinator from admin-controlled config \
+                and does not count toward that cap. \
+                \n\nFailure modes (tool result is `spawn_agent: <detail>` \
+                with is_error=true):\n\
+                - missing or non-string `persona` or `task` argument\n\
+                - persona must not be empty\n\
+                - persona exceeds 256-byte limit\n\
+                - task must not be empty\n\
+                - task+context exceeds 65536-byte limit\n\
+                - validation errors from SpawnRequest::validate (invalid \
+                  persona name shape, etc.)\n\
+                - `spawn_agent: coordinator failed to provision agent` — the \
+                  coordinator could not load the persona, mint an identity, \
+                  or start the actor; the underlying detail is logged but \
+                  scrubbed from the result\n\
+                - `spawn_agent: coordinator did not reply within timeout` \
+                  (30s default; almost always indicates a runtime fault, \
+                  not a slow persona)"
+                .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "persona": {
                         "type": "string",
-                        "description": "Name of the persona config to load for the new agent."
+                        "description": "Name of the persona config to load for the new \
+                            agent. Must match a directory under \
+                            `<data_dir>/personas/<persona>/config.toml`. \
+                            Trimmed; at most 256 bytes."
                     },
                     "task": {
                         "type": "string",
-                        "description": "Initial task instruction; becomes the agent's system prompt."
+                        "description": "Initial task instruction; appended to the persona's \
+                            base system prompt before the agent starts. Trimmed; \
+                            non-empty. task + context must total at most 65,536 bytes."
                     },
                     "context": {
                         "type": "string",
-                        "description": "Optional additional context appended to the system prompt."
+                        "description": "Optional additional context appended to the system \
+                            prompt after task, separated by a blank line. Trimmed; \
+                            whitespace-only is treated as absent. Counts toward the \
+                            65,536-byte cap with task."
                     }
                 },
                 "required": ["persona", "task"]
