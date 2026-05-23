@@ -26,11 +26,17 @@
 use actix::Recipient;
 use reeve_types::IdentityId;
 
+pub mod list_agents;
 pub mod send_message;
 pub mod spawn_agent;
+pub mod whoami;
+pub mod whois;
 
+pub use list_agents::ListAgentsTool;
 pub use send_message::SendMessageTool;
 pub use spawn_agent::SpawnAgentTool;
+pub use whoami::WhoamiTool;
+pub use whois::WhoisTool;
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 

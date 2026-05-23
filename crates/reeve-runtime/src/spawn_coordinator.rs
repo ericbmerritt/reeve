@@ -248,20 +248,49 @@ impl Supervised for SpawnCoordinator {}
 
 // ── Subagent tool wiring ──────────────────────────────────────────────────────
 
-/// Build the tool set every spawned subagent gets. Currently just
-/// `send_message`, wired to the shared dispatcher so subordinates can reply to
-/// the lead (and to peers) via their own tool loop. Extracted into a free
-/// function so tests can assert the descriptor list without spinning up the
-/// full spawn pipeline.
+/// Build the tool set every spawned subagent gets:
+/// - `send_message` — wired to the shared dispatcher so subordinates can
+///   reply to the lead (and to peers) via their own tool loop.
+/// - `list_agents` — read-only directory of the agent registry so subagents
+///   can discover peers spawned alongside them.
+/// - `whoami` — self-identification, useful for self-aware operations and
+///   for confirming the subagent is correctly registered.
+///
+/// Notably *not* included: `spawn_agent`. The ladder reserves subordinate
+/// spawning to the lead in this phase; granting it to subagents would
+/// introduce a spawn graph the operator can't currently observe through
+/// the panopticon.
+///
+/// Extracted into a free function so tests can assert the descriptor list
+/// without spinning up the full spawn pipeline.
 pub(crate) fn build_subagent_tools(
     dispatcher: actix::Recipient<SendMessage>,
+    agent_registry_path: PathBuf,
+    data_dir: PathBuf,
 ) -> Vec<(reeve_adapter::Tool, actix::Recipient<InvokeTool>)> {
     use actix::Actor as _;
     let send_message_tool = SendMessageTool::new(dispatcher);
-    vec![(
-        SendMessageTool::descriptor(),
-        send_message_tool.start().recipient(),
-    )]
+    let list_agents_tool = crate::tool::ListAgentsTool::new(agent_registry_path.clone());
+    let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path);
+    let whois_tool = crate::tool::WhoisTool::new(data_dir);
+    vec![
+        (
+            SendMessageTool::descriptor(),
+            send_message_tool.start().recipient(),
+        ),
+        (
+            crate::tool::ListAgentsTool::descriptor(),
+            list_agents_tool.start().recipient(),
+        ),
+        (
+            crate::tool::WhoamiTool::descriptor(),
+            whoami_tool.start().recipient(),
+        ),
+        (
+            crate::tool::WhoisTool::descriptor(),
+            whois_tool.start().recipient(),
+        ),
+    ]
 }
 
 // ── SpawnRequest handler ──────────────────────────────────────────────────────
@@ -433,7 +462,11 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             "spawn sequence complete; starting agent actor",
         );
 
-        let tools = build_subagent_tools(self.dispatcher.clone());
+        let tools = build_subagent_tools(
+            self.dispatcher.clone(),
+            self.agent_registry_path.clone(),
+            self.data_dir.clone(),
+        );
 
         let new_agent = match Agent::new(
             Arc::clone(&self.adapter),
@@ -553,14 +586,29 @@ mod tests {
     /// the cross-agent reply path.
     #[test]
     fn subagent_tools_include_send_message() {
+        let tmp = secure_dir();
+        let registry_path = tmp.path().join("registry.toml");
+        let data_dir = tmp.path().to_path_buf();
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let dispatcher = NullDispatcher.start().recipient();
-            let tools = build_subagent_tools(dispatcher);
+            let tools = build_subagent_tools(dispatcher, registry_path, data_dir);
             let names: Vec<String> = tools.iter().map(|(t, _)| t.name.clone()).collect();
             assert!(
                 names.iter().any(|n| n == "send_message"),
                 "subagent tools missing send_message; got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "list_agents"),
+                "subagent tools missing list_agents; got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "whoami"),
+                "subagent tools missing whoami; got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "whois"),
+                "subagent tools missing whois; got: {names:?}"
             );
             actix::System::current().stop();
         });
