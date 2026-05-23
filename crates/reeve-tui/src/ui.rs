@@ -16,7 +16,13 @@
 //! - `AgentStatus::Crashed` → Red fg on title sigil.
 //! - `AgentStatus::Idle` → no color.
 //! - `AgentStatus::Unknown` → no color.
-//! - `NO_COLOR=1` → all color styling suppressed; sigils carry full meaning.
+//! - Conversation roles: operator (you) → Yellow; lead persona → Cyan; other
+//!   agents → Magenta; system → `DarkGray`. The three speaker hues sit on
+//!   different points of the color wheel so adjacent entries from different
+//!   speakers are scannable at a glance. Body rows use the same hue with the
+//!   `DIM` modifier so the role color does not dominate the pane.
+//! - `NO_COLOR=1` → all color styling suppressed; sigils and speaker labels
+//!   carry full meaning.
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Style};
@@ -24,7 +30,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::state::{AgentStatus, AppState};
+use crate::state::{AgentStatus, AppState, ConversationEntry, EntryKind};
 
 /// Return true when `NO_COLOR` is set in the environment (any value).
 ///
@@ -118,11 +124,45 @@ fn format_timestamp(ts: Option<time::OffsetDateTime>) -> String {
         .unwrap_or_default()
 }
 
+/// Color used for the speaker tag and body indent of a conversation entry.
+///
+/// - Operator (you) → yellow; the warmest hue, so operator input pops against
+///   the agent palette.
+/// - Lead persona (Outbound) → cyan.
+/// - Other agents (Inbound from non-operator) → magenta.
+/// - System annotations → dim gray.
+///
+/// Yellow / Cyan / Magenta sit at ~120° apart on the color wheel, so adjacent
+/// entries from different speakers stay visually separable. Yellow also
+/// double-duties as the `Working` status sigil in the title bar — different
+/// region, so the reuse is intentional rather than confusing.
+///
+/// `NO_COLOR=1` collapses every role to default style; the textual speaker
+/// label still distinguishes them.
+fn role_style(entry: &ConversationEntry, operator_id: Option<reeve_types::IdentityId>) -> Style {
+    if no_color() {
+        return Style::default();
+    }
+    match entry.kind {
+        EntryKind::Outbound => Style::default().fg(Color::Cyan),
+        EntryKind::System => Style::default().fg(Color::DarkGray),
+        EntryKind::Inbound => match entry.sender_id {
+            Some(id) if Some(id) == operator_id => Style::default().fg(Color::Yellow),
+            _ => Style::default().fg(Color::Magenta),
+        },
+    }
+}
+
 /// Build the conversation lines from all entries in state.
 ///
 /// Each entry renders as two parts:
 /// 1. Speaker line: `{label} · {timestamp_or_blank}`
 /// 2. Text line:   `  {text}` (possibly multiple visual rows after wrapping)
+///
+/// Both parts are colored by the entry's role (see `role_style`) so the
+/// operator can scan who said what without reading the speaker tag. Body
+/// rows are dimmed relative to the speaker tag to keep the role color from
+/// dominating the pane.
 ///
 /// When the agent is in `Working` status, appends a "thinking" indicator
 /// with a clock-driven spinner so a long model call does not look like the
@@ -133,18 +173,24 @@ fn build_conversation_lines(state: &AppState) -> Vec<Line<'static>> {
     for entry in &state.conversation {
         let label = entry.speaker_label(&state.persona_name, state.operator_id);
         let ts = format_timestamp(entry.timestamp);
-
-        let speaker_line = if ts.is_empty() {
-            Line::from(label)
+        let style = role_style(entry, state.operator_id);
+        let body_style = if no_color() {
+            Style::default()
         } else {
-            Line::from(format!("{label} \u{00B7} {ts}"))
+            style.add_modifier(ratatui::style::Modifier::DIM)
         };
-        lines.push(speaker_line);
+
+        let speaker_text = if ts.is_empty() {
+            label
+        } else {
+            format!("{label} \u{00B7} {ts}")
+        };
+        lines.push(Line::from(Span::styled(speaker_text, style)));
 
         // Preserve text line-breaks the agent put in the payload; wrapping is
         // handled by the Paragraph widget at render time.
         for line in entry.text.lines() {
-            lines.push(Line::from(format!("  {line}")));
+            lines.push(Line::from(Span::styled(format!("  {line}"), body_style)));
         }
         if entry.text.is_empty() {
             lines.push(Line::from("  "));
@@ -210,18 +256,38 @@ fn build_footer(state: &AppState) -> Line<'static> {
 
 /// Render the lead chat screen into `frame`.
 ///
-/// Layout: title (1) | conversation (flex) | separator (1) | input (1) | footer (1).
+/// Layout: title (1) | conversation (flex) | separator (1) | input (variable) | footer (1).
+///
+/// The input chunk grows to fit wrapped text up to half the screen height,
+/// then stops growing (the conversation keeps at least half the area). The
+/// height is computed by asking the same wrapped `Paragraph` we render how
+/// many rows it would occupy at the current frame width — the only API
+/// that accounts for `Wrap { trim: false }` and grapheme widths exactly.
 pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
+
+    let input_line = build_input_line(state);
+    let input_widget = Paragraph::new(Text::from(vec![input_line])).wrap(Wrap { trim: false });
+    // Cap the input chunk at half the screen so the conversation keeps the
+    // other half, but never go below 1 row — on a degenerate `area.height`
+    // (1) the half-screen cap would round to 0, producing a zero-height
+    // `Constraint::Length(0)` chunk and hiding the input entirely.
+    let input_height_cap = (area.height / 2).max(1);
+    let input_height = input_widget
+        .line_count(area.width)
+        .try_into()
+        .unwrap_or(u16::MAX)
+        .max(1)
+        .min(input_height_cap);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title bar
-            Constraint::Min(0),    // conversation (flex)
-            Constraint::Length(1), // separator
-            Constraint::Length(1), // input
-            Constraint::Length(1), // footer
+            Constraint::Length(1),            // title bar
+            Constraint::Min(0),               // conversation (flex)
+            Constraint::Length(1),            // separator
+            Constraint::Length(input_height), // input
+            Constraint::Length(1),            // footer
         ])
         .split(area);
 
@@ -237,8 +303,6 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     let sep_widget = Paragraph::new(Text::from(vec![sep_line]));
     frame.render_widget(sep_widget, chunks[2]);
 
-    let input_line = build_input_line(state);
-    let input_widget = Paragraph::new(Text::from(vec![input_line]));
     frame.render_widget(input_widget, chunks[3]);
 
     let footer_line = build_footer(state);
@@ -286,6 +350,101 @@ fn render_conversation(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // U_ROLE_STYLE: each role resolves to its documented color so the operator
+    // can tell their own input apart from the lead, peers, and system at a
+    // glance. NO_COLOR is honored elsewhere (no test here because it sets a
+    // process-wide env var and would race with parallel tests).
+    #[test]
+    fn role_style_distinguishes_each_speaker() {
+        let operator_id = reeve_types::IdentityId::new().unwrap();
+        let other_agent_id = reeve_types::IdentityId::new().unwrap();
+
+        let operator_entry = ConversationEntry {
+            kind: EntryKind::Inbound,
+            text: String::new(),
+            timestamp: None,
+            sender_id: Some(operator_id),
+        };
+        let lead_entry = ConversationEntry {
+            kind: EntryKind::Outbound,
+            text: String::new(),
+            timestamp: None,
+            sender_id: None,
+        };
+        let peer_entry = ConversationEntry {
+            kind: EntryKind::Inbound,
+            text: String::new(),
+            timestamp: None,
+            sender_id: Some(other_agent_id),
+        };
+        let system_entry = ConversationEntry {
+            kind: EntryKind::System,
+            text: String::new(),
+            timestamp: None,
+            sender_id: None,
+        };
+
+        let op = Some(operator_id);
+        assert_eq!(role_style(&operator_entry, op).fg, Some(Color::Yellow));
+        assert_eq!(role_style(&lead_entry, op).fg, Some(Color::Cyan));
+        assert_eq!(role_style(&peer_entry, op).fg, Some(Color::Magenta));
+        assert_eq!(role_style(&system_entry, op).fg, Some(Color::DarkGray));
+    }
+
+    // U_INPUT_WRAP: a long input string produces a multi-row wrapped paragraph,
+    // and line_count() reflects that — so the layout constraint can grow the
+    // input chunk.
+    #[test]
+    fn input_widget_line_count_grows_with_long_input() {
+        let mut state = AppState::default();
+        state.input = "abcdefghij ".repeat(20) + &"abcdefghij".repeat(5); // mix of spaces and a long run
+        let line = build_input_line(&state);
+        let paragraph = Paragraph::new(Text::from(vec![line])).wrap(Wrap { trim: false });
+        // At width=40 a >250-char input must wrap to more than one row.
+        let count_40 = paragraph.line_count(40);
+        assert!(
+            count_40 > 1,
+            "expected >1 wrapped rows at width=40, got {count_40}"
+        );
+        // At width=1000 the same input fits on a single row.
+        let count_1000 = paragraph.line_count(1000);
+        assert_eq!(
+            count_1000, 1,
+            "expected 1 row at width=1000, got {count_1000}"
+        );
+    }
+
+    // U_INPUT_WRAP_NO_SPACES: a no-space input (long path, URL, dense text) must
+    // still wrap — ratatui's Wrap word-breaks on whitespace, so if it doesn't
+    // also break mid-word the input would run off-screen even with our growing
+    // chunk. This is the case the operator hit.
+    #[test]
+    fn input_widget_wraps_input_without_spaces() {
+        let mut state = AppState::default();
+        state.input = "a".repeat(300);
+        let line = build_input_line(&state);
+        let paragraph = Paragraph::new(Text::from(vec![line])).wrap(Wrap { trim: false });
+        let count = paragraph.line_count(40);
+        assert!(
+            count > 1,
+            "no-space input must wrap to multiple rows; got {count} rows at width=40"
+        );
+    }
+
+    // U_INPUT_HEIGHT_TINY: on a degenerate terminal height (1 row) the
+    // input chunk's half-screen cap would round to 0; the renderer must
+    // floor the result at 1 so the input is never hidden.
+    #[test]
+    fn input_height_floors_at_one_on_tiny_terminals() {
+        for area_height in [0_u16, 1, 2, 3] {
+            let cap = (area_height / 2).max(1);
+            assert!(
+                cap >= 1,
+                "input height cap must never be zero (area_height={area_height})"
+            );
+        }
+    }
 
     // U3: thinking_indicator is None unless the agent is Working — idle / crashed
     // / unknown agents should not show the spinner.
