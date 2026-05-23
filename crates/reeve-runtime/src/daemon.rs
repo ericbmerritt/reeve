@@ -911,6 +911,8 @@ fn launch_actors(
 
     let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord_addr.recipient());
     let send_message_tool = crate::tool::SendMessageTool::new(dispatcher_addr.clone().recipient());
+    let list_agents_tool = crate::tool::ListAgentsTool::new(agent_registry_path_for_resume.clone());
+    let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone());
     let tools: Vec<(
         reeve_adapter::Tool,
         actix::Recipient<crate::tool::InvokeTool>,
@@ -922,6 +924,14 @@ fn launch_actors(
         (
             crate::tool::SendMessageTool::descriptor(),
             send_message_tool.start().recipient(),
+        ),
+        (
+            crate::tool::ListAgentsTool::descriptor(),
+            list_agents_tool.start().recipient(),
+        ),
+        (
+            crate::tool::WhoamiTool::descriptor(),
+            whoami_tool.start().recipient(),
         ),
     ];
 
@@ -1009,6 +1019,7 @@ fn resume_persisted_subagents(
         }
         if let Err(err) = resume_one_subagent(
             data_dir,
+            agent_registry_path,
             identity_registry,
             adapter,
             watcher,
@@ -1038,6 +1049,7 @@ fn resume_persisted_subagents(
 )]
 fn resume_one_subagent(
     data_dir: &Path,
+    agent_registry_path: &Path,
     identity_registry: &Arc<IdentityRegistry>,
     adapter: &Arc<dyn reeve_adapter::Adapter>,
     watcher: &Arc<Watcher>,
@@ -1106,7 +1118,7 @@ fn resume_one_subagent(
         snapshot.system_prompt.clone()
     };
 
-    let tools = build_subagent_tools(dispatcher.clone());
+    let tools = build_subagent_tools(dispatcher.clone(), agent_registry_path.to_path_buf());
     let new_agent = Agent::new(
         Arc::clone(adapter),
         &dirs,
