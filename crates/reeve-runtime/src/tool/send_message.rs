@@ -106,19 +106,45 @@ impl SendMessageTool {
     pub fn descriptor() -> reeve_adapter::Tool {
         reeve_adapter::Tool {
             name: "send_message".to_owned(),
-            description: "Send a signed message to another agent by name. Returns the \
-                 dispatched message ID on success."
+            description: "Send a signed message to another agent by name. \
+                Returns the dispatched message ID (UUIDv7) on success. \
+                Delivery is asynchronous: the recipient's reply, if any, \
+                arrives on a later turn as a normal inbound message — there \
+                is no built-in await primitive. Use list_agents to discover \
+                recipient names. \
+                \n\nLimits: body and the resulting signed envelope must each \
+                be at most 1 MiB; the dispatcher enforces this pre- and \
+                post-serialization. \
+                \n\nFailure mode: on error the tool result content is \
+                `send_message: <Category>` (is_error=true) where <Category> \
+                is one of:\n\
+                - RecipientNotFound — the `to` name is not registered\n\
+                - SenderNotFound — the calling agent is not in the registry\n\
+                - KeyNotFound — the sender has no active key (revoked?)\n\
+                - IdentityLookupFailed — identity registry I/O error\n\
+                - KeypairLoad — could not load the sender's keypair\n\
+                - SigningFailed — envelope signing failed\n\
+                - Io — filesystem write to the recipient's inbox failed\n\
+                - BodyTooLarge — body or envelope exceeded the 1 MiB cap\n\
+                - MessageIdFailed — clock skew prevented minting a UUIDv7\n\
+                - SymlinkRejected — recipient inbox path is a symlink\n\
+                - AgentRegistryOpen — registry file could not be re-opened\n\
+                These categories are stable identifiers; the exact path or \
+                detail behind them is logged but not returned to the model."
                 .to_owned(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "to": {
                         "type": "string",
-                        "description": "Recipient agent name as registered in the agent registry."
+                        "description": "Recipient agent name as registered in the agent registry. \
+                            Whitespace is trimmed. Use list_agents to discover live names."
                     },
                     "body": {
                         "type": "string",
-                        "description": "Message body to deliver. The runtime enforces a size cap."
+                        "description": "Message body to deliver, byte-for-byte (no trim). \
+                            Body + envelope overhead must fit in 1 MiB; whitespace-only \
+                            bodies are rejected as empty."
                     }
                 },
                 "required": ["to", "body"]
