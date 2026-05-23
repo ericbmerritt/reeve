@@ -266,11 +266,13 @@ impl Supervised for SpawnCoordinator {}
 pub(crate) fn build_subagent_tools(
     dispatcher: actix::Recipient<SendMessage>,
     agent_registry_path: PathBuf,
+    data_dir: PathBuf,
 ) -> Vec<(reeve_adapter::Tool, actix::Recipient<InvokeTool>)> {
     use actix::Actor as _;
     let send_message_tool = SendMessageTool::new(dispatcher);
     let list_agents_tool = crate::tool::ListAgentsTool::new(agent_registry_path.clone());
     let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path);
+    let whois_tool = crate::tool::WhoisTool::new(data_dir);
     vec![
         (
             SendMessageTool::descriptor(),
@@ -283,6 +285,10 @@ pub(crate) fn build_subagent_tools(
         (
             crate::tool::WhoamiTool::descriptor(),
             whoami_tool.start().recipient(),
+        ),
+        (
+            crate::tool::WhoisTool::descriptor(),
+            whois_tool.start().recipient(),
         ),
     ]
 }
@@ -456,7 +462,11 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             "spawn sequence complete; starting agent actor",
         );
 
-        let tools = build_subagent_tools(self.dispatcher.clone(), self.agent_registry_path.clone());
+        let tools = build_subagent_tools(
+            self.dispatcher.clone(),
+            self.agent_registry_path.clone(),
+            self.data_dir.clone(),
+        );
 
         let new_agent = match Agent::new(
             Arc::clone(&self.adapter),
@@ -578,10 +588,11 @@ mod tests {
     fn subagent_tools_include_send_message() {
         let tmp = secure_dir();
         let registry_path = tmp.path().join("registry.toml");
+        let data_dir = tmp.path().to_path_buf();
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let dispatcher = NullDispatcher.start().recipient();
-            let tools = build_subagent_tools(dispatcher, registry_path);
+            let tools = build_subagent_tools(dispatcher, registry_path, data_dir);
             let names: Vec<String> = tools.iter().map(|(t, _)| t.name.clone()).collect();
             assert!(
                 names.iter().any(|n| n == "send_message"),
@@ -594,6 +605,10 @@ mod tests {
             assert!(
                 names.iter().any(|n| n == "whoami"),
                 "subagent tools missing whoami; got: {names:?}"
+            );
+            assert!(
+                names.iter().any(|n| n == "whois"),
+                "subagent tools missing whois; got: {names:?}"
             );
             actix::System::current().stop();
         });
