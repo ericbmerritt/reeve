@@ -9,6 +9,8 @@
 use reeve_types::IdentityId;
 use time::OffsetDateTime;
 
+use crate::panopticon::PanopticonSnapshot;
+
 // ── EntryKind ─────────────────────────────────────────────────────────────────
 
 /// Directionality and role of a conversation entry.
@@ -87,6 +89,25 @@ pub enum AgentStatus {
     Unknown,
 }
 
+// ── Screen ────────────────────────────────────────────────────────────────────
+
+/// Which screen the operator is currently looking at.
+///
+/// The TUI is multi-screen as of Phase 6: the chat screen is the per-agent
+/// conversation pane; the panopticon is the global overview. `Tab` cycles
+/// between them. Future phases add Per-Agent Inspect (Phase 7) and
+/// Quarantine Review (Phase 8) as additional variants.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Screen {
+    /// Lead-chat conversation pane — the existing screen prior to Phase 6.
+    /// Default so a fresh `AppState` continues to behave like the
+    /// single-screen TUI did before the panopticon landed.
+    #[default]
+    Chat,
+    /// Global panopticon: agent table, recent events, queue counts.
+    Panopticon,
+}
+
 // ── AppState ──────────────────────────────────────────────────────────────────
 
 /// Full application state, refreshed by the filesystem watcher.
@@ -115,6 +136,15 @@ pub struct AppState {
     pub scroll_offset: u16,
     pub(crate) input: String,
     cursor_pos: usize, // private: always a valid byte boundary in input
+    /// Which screen the renderer should draw on the next frame.
+    pub screen: Screen,
+    /// Panopticon view-model, refreshed from disk by the watcher loop.
+    /// Renders empty when not yet read.
+    pub panopticon: PanopticonSnapshot,
+    /// Cursor position in the panopticon's agent table. `j`/`k` adjust it;
+    /// the renderer clamps against the actual agent count, so any value is
+    /// safe.
+    pub panopticon_focus: usize,
 }
 
 impl AppState {
@@ -171,6 +201,9 @@ impl Default for AppState {
             scroll_offset: 0,
             input: String::new(),
             cursor_pos: 0,
+            screen: Screen::Chat,
+            panopticon: PanopticonSnapshot::default(),
+            panopticon_focus: 0,
         }
     }
 }
@@ -197,6 +230,38 @@ impl AppState {
     /// `true` when the conversation view is anchored to the latest entry.
     pub fn is_at_bottom(&self) -> bool {
         self.scroll_offset == 0
+    }
+
+    /// Flip between [`Screen::Chat`] and [`Screen::Panopticon`]. Resets the
+    /// panopticon focus to the top row whenever the operator enters the
+    /// panopticon so the cursor never lands on a row that has since
+    /// scrolled out of view.
+    pub fn toggle_screen(&mut self) {
+        self.screen = match self.screen {
+            Screen::Chat => {
+                self.panopticon_focus = 0;
+                Screen::Panopticon
+            }
+            Screen::Panopticon => Screen::Chat,
+        };
+    }
+
+    /// Move the panopticon focus up one row, clamped at zero.
+    pub fn panopticon_focus_up(&mut self) {
+        self.panopticon_focus = self.panopticon_focus.saturating_sub(1);
+    }
+
+    /// Move the panopticon focus down one row, clamped against the agent
+    /// table's length. Safe at empty tables (does nothing).
+    pub fn panopticon_focus_down(&mut self) {
+        let len = self.panopticon.agents.len();
+        if len == 0 {
+            return;
+        }
+        let max = len.saturating_sub(1);
+        if self.panopticon_focus < max {
+            self.panopticon_focus += 1;
+        }
     }
 }
 
