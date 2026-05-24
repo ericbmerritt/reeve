@@ -168,7 +168,7 @@ pub struct QueueCounts {
 }
 
 /// Everything the panopticon renderer needs in a single snapshot.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PanopticonSnapshot {
     pub agents: Vec<AgentRow>,
     pub recent_events: Vec<RecentEvent>,

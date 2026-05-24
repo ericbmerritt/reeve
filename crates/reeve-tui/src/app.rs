@@ -16,6 +16,7 @@
 //! returns (normal exit or error), via an RAII-style cleanup guard.
 
 use std::io::{self, Stdout};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -35,8 +36,9 @@ use ratatui::Terminal;
 
 use reeve_runtime::AgentDirs;
 
+use crate::panopticon::read_snapshot as read_panopticon_snapshot;
 use crate::reader::{read_conversation, read_cost, read_status};
-use crate::state::AppState;
+use crate::state::{AppState, Screen};
 use crate::submit::submit_message;
 use crate::watcher::watch_agent_dir;
 
@@ -139,10 +141,23 @@ fn first_operator_id(registry: &IdentityRegistry) -> Option<reeve_types::Identit
 ///
 /// Called on every watcher callback. Individual reads return safe defaults on
 /// any filesystem error (see `crate::reader`).
-fn reload_state(state: &mut AppState, dirs: &AgentDirs) {
+///
+/// `data_dir` and `agent_registry_path` drive the panopticon snapshot read.
+/// The lead-chat reload and the panopticon refresh share a trigger right
+/// now: any change in the lead's directory re-renders both screens. A
+/// future commit can extend the watcher to cover every registered agent's
+/// state dir so a worker's transition refreshes the panopticon without
+/// waiting on the lead.
+fn reload_state(
+    state: &mut AppState,
+    dirs: &AgentDirs,
+    data_dir: &Path,
+    agent_registry_path: &Path,
+) {
     state.status = read_status(&dirs.status_path());
     state.conversation = read_conversation(&dirs.conversation_path());
     state.cost_usd = read_cost(&dirs.cost_path());
+    state.panopticon = read_panopticon_snapshot(data_dir, agent_registry_path, state.operator_id);
 }
 
 // ── Event loop ────────────────────────────────────────────────────────────────
@@ -166,6 +181,8 @@ fn reload_state(state: &mut AppState, dirs: &AgentDirs) {
 /// user — future iterations should show an inline error).
 pub fn run(
     dirs: &AgentDirs,
+    data_dir: &Path,
+    agent_registry_path: &Path,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<(), TuiError> {
@@ -189,19 +206,38 @@ pub fn run(
 
     loop {
         if needs_reload.swap(false, Ordering::Acquire) {
-            reload_state(&mut state, dirs);
+            reload_state(&mut state, dirs, data_dir, agent_registry_path);
         }
 
         terminal
-            .draw(|frame| crate::ui::draw(frame, &state))
+            .draw(|frame| match state.screen {
+                Screen::Chat => crate::ui::draw(frame, &state),
+                Screen::Panopticon => {
+                    crate::ui_panopticon::draw(frame, &state.panopticon, state.panopticon_focus);
+                }
+            })
             .map_err(TuiError::Terminal)?;
 
         // Short timeout keeps watcher latency bounded.
         if event::poll(POLL_TIMEOUT).map_err(TuiError::Terminal)? {
             match event::read().map_err(TuiError::Terminal)? {
                 Event::Key(key) => {
+                    let prev_screen = state.screen;
                     if handle_key(key, &mut state, dirs, registry, keystore)? {
                         return Ok(());
+                    }
+                    // Force a fresh panopticon read only on the *transition*
+                    // into the panopticon screen, so the operator's first
+                    // frame shows current state. Refreshing on every
+                    // keystroke while already in the panopticon walks every
+                    // agent's status / cost / conversation files per j/k
+                    // press — pointless IO at typing cadence.
+                    if state.screen == Screen::Panopticon && prev_screen != Screen::Panopticon {
+                        state.panopticon = read_panopticon_snapshot(
+                            data_dir,
+                            agent_registry_path,
+                            state.operator_id,
+                        );
                     }
                 }
                 Event::Mouse(mouse) => handle_mouse(mouse, &mut state),
@@ -230,7 +266,48 @@ fn handle_mouse(event: MouseEvent, state: &mut AppState) {
 }
 
 /// Handle one keyboard event. Returns `true` when the TUI should exit.
+///
+/// Dispatch is screen-aware: chat keys (input typing, scrolling, submit)
+/// only fire on [`Screen::Chat`]; panopticon keys (`j`/`k` navigate,
+/// `Enter` open focused agent) only fire on [`Screen::Panopticon`].
+///
+/// `q` (no modifier) quits from either screen; `Tab` toggles. `Esc` is
+/// screen-aware: from chat it quits (consistent with prior behavior); from
+/// the panopticon it pops back to chat — the vim / k9s / lazygit
+/// convention of "Esc = back" that the operator brings with them. Without
+/// the screen-aware behavior, an operator who hits Esc expecting to leave
+/// the panopticon exits the whole TUI instead.
 fn handle_key(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    dirs: &AgentDirs,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<bool, TuiError> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(true),
+        (KeyCode::Tab, _) => {
+            state.toggle_screen();
+            return Ok(false);
+        }
+        (KeyCode::Esc, _) => match state.screen {
+            Screen::Chat => return Ok(true),
+            Screen::Panopticon => {
+                state.screen = Screen::Chat;
+                return Ok(false);
+            }
+        },
+        _ => {}
+    }
+
+    match state.screen {
+        Screen::Chat => handle_key_chat(key, state, dirs, registry, keystore),
+        Screen::Panopticon => Ok(handle_key_panopticon(key, state)),
+    }
+}
+
+/// Chat-screen key bindings: typing, scrolling, submit on Enter.
+fn handle_key_chat(
     key: event::KeyEvent,
     state: &mut AppState,
     dirs: &AgentDirs,
@@ -244,10 +321,6 @@ fn handle_key(
     const ROWS_PER_LINE_NUDGE: u16 = 1;
 
     match (key.code, key.modifiers) {
-        (KeyCode::Char('q'), KeyModifiers::NONE) | (KeyCode::Esc, _) => {
-            return Ok(true);
-        }
-
         (KeyCode::Enter, KeyModifiers::NONE) => {
             submit_input(state, dirs, registry, keystore)?;
         }
@@ -280,6 +353,28 @@ fn handle_key(
     }
 
     Ok(false)
+}
+
+/// Panopticon-screen key bindings. `j`/`k` (and arrow keys) navigate the
+/// agent table; `Enter` switches back to the chat for now — Phase 6 only
+/// hosts the lead's chat, so Enter on a non-lead row currently closes the
+/// panopticon without opening a different chat. Phase 7 wires per-agent
+/// chat.
+fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+            state.panopticon_focus_down();
+        }
+        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+            state.panopticon_focus_up();
+        }
+        // Single-chat universe (Phase 6): close the panopticon and return
+        // to the existing chat regardless of which row was focused. Phase
+        // 7 will branch on the focused agent here.
+        (KeyCode::Enter, _) => state.screen = Screen::Chat,
+        _ => {}
+    }
+    false
 }
 
 /// Submit the current input buffer and clear it.
