@@ -16,6 +16,7 @@ mod identity;
 mod keychain;
 mod output;
 mod prompt;
+mod send;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -52,6 +53,21 @@ enum Commands {
     },
     /// Attach the TUI to the running daemon.
     Attach,
+    /// Send a signed message to a running agent by name, without attaching the
+    /// TUI. The operator key signs the envelope; delivery uses the same
+    /// `inbox/tmp` → `inbox/new` atomic-rename path the in-process dispatcher
+    /// uses, so the watcher verifies and routes it identically.
+    Send {
+        /// Agent name from the registry (e.g. `lead`, `worker-abc12345`).
+        /// Use `reeve identity list` for IDs; the agent registry maps these
+        /// names to identity IDs.
+        #[arg(long)]
+        to: String,
+        /// UTF-8 text to use as the envelope payload. Note: this value is
+        /// visible in process listings on Unix.
+        #[arg(long)]
+        body: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -117,6 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(Commands::Adapter { command }) => adapter::dispatch(command),
         Some(Commands::Daemon { command }) => daemon::dispatch(&command),
         Some(Commands::Attach) => cmd_attach(),
+        Some(Commands::Send { to, body }) => cmd_send(&to, &body),
     }
 }
 
@@ -277,6 +294,22 @@ fn cmd_envelope_verify(file: &Path) -> Result<(), Box<dyn std::error::Error>> {
 fn parse_identity_id(s: &str) -> Result<IdentityId, Box<dyn std::error::Error>> {
     let uuid: uuid::Uuid = s.parse()?;
     Ok(IdentityId::try_from(uuid)?)
+}
+
+fn cmd_send(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let data_dir = IdentityRegistry::default_data_dir()?;
+    let id_registry = IdentityRegistry::open(data_dir.clone())?;
+    let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
+    let keychain = keychain::open_platform_keystore()?;
+    send::send(
+        &id_registry,
+        &agent_registry_path,
+        &keychain,
+        to,
+        body.as_bytes(),
+        &mut io::stdout().lock(),
+    )?;
+    Ok(())
 }
 
 fn cmd_attach() -> Result<(), Box<dyn std::error::Error>> {
