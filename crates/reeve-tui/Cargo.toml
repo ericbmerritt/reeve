@@ -35,3 +35,4 @@ toml = { workspace = true }
 tokio = { workspace = true }
 
 [dev-dependencies]
+ratatui = { workspace = true, features = ["unstable-rendered-line-info"] }
