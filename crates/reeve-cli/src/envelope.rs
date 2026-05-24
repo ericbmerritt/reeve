@@ -177,12 +177,9 @@ impl From<std::io::Error> for EnvelopeCliError {
     }
 }
 
-/// Sign a fresh envelope addressed to `recipient_id` with `body` as the
-/// payload, and write the signed JSON to `out`.
-///
-/// The `--body` value is visible in process listings on Unix; agents operating
-/// in production should prefer passing payloads via stdin or a file rather
-/// than the `--body` flag.
+/// Build and sign a fresh envelope addressed to `recipient_id` with `body`
+/// as the payload, returning the signed [`Envelope`] for the caller to
+/// serialize / deposit / re-sign.
 ///
 /// Sequence:
 ///   1. List the registry and locate the operator identity.
@@ -191,14 +188,17 @@ impl From<std::io::Error> for EnvelopeCliError {
 ///   4. Build the envelope with a fresh `MessageId`, nonce, and SHA-256
 ///      payload hash.
 ///   5. Sign and embed the signature.
-///   6. Serialize to pretty JSON and write to `out`.
-pub(crate) fn sign(
+///
+/// Shared by `reeve envelope sign` (writes JSON to stdout) and `reeve send`
+/// (writes JSON into the recipient's inbox). Keeping one builder means both
+/// commands stay in lockstep on key-state checks, nonce minting, and the
+/// canonical-bytes signing flow.
+pub(crate) fn build_signed_envelope(
     registry: &IdentityRegistry,
     keychain: &dyn OperatorKeyStore,
     recipient_id: IdentityId,
     body: &[u8],
-    out: &mut impl Write,
-) -> Result<(), EnvelopeCliError> {
+) -> Result<Envelope, EnvelopeCliError> {
     let stored = registry.list()?;
 
     let operator = find_existing_operator(&stored).ok_or(EnvelopeCliError::NoOperatorEnrolled)?;
@@ -256,6 +256,23 @@ pub(crate) fn sign(
     let sig = sign_envelope(&envelope, &private_key)?;
     envelope.signature = sig;
 
+    Ok(envelope)
+}
+
+/// Sign a fresh envelope addressed to `recipient_id` with `body` as the
+/// payload, and write the signed JSON to `out`.
+///
+/// The `--body` value is visible in process listings on Unix; agents operating
+/// in production should prefer passing payloads via stdin or a file rather
+/// than the `--body` flag.
+pub(crate) fn sign(
+    registry: &IdentityRegistry,
+    keychain: &dyn OperatorKeyStore,
+    recipient_id: IdentityId,
+    body: &[u8],
+    out: &mut impl Write,
+) -> Result<(), EnvelopeCliError> {
+    let envelope = build_signed_envelope(registry, keychain, recipient_id, body)?;
     let json = serde_json::to_string_pretty(&envelope).map_err(EnvelopeCliError::Serialize)?;
     writeln!(out, "{json}")?;
     Ok(())
