@@ -45,11 +45,45 @@ use crate::panopticon::{
     AgentRow, EventKind, PanopticonSnapshot, QueueCounts, RecentEvent, Source,
 };
 use crate::state::AgentStatus;
+use crate::ui_common::{format_time_hhmm, no_color};
 
-/// Return true when `NO_COLOR` is set in the environment.
-fn no_color() -> bool {
-    std::env::var("NO_COLOR").is_ok()
-}
+// ── Layout constants ────────────────────────────────────────────────────────
+//
+// All in display-cell units (columns for widths, rows for the row constants).
+// Sized for an 80-column terminal at four agents + six event rows + the
+// pending-decisions / queues / footer chrome — the wireframe budget. Tuning
+// notes inline.
+
+/// AGENT column width. Long enough for `worker-<8-hex>` (15 chars) plus two
+/// chars of headroom before truncation kicks in.
+const AGENT_COL_WIDTH: usize = 18;
+/// PERSONA column width. Personas are short names (`lead`, `worker`,
+/// `reviewer`, …); 10 chars covers every persona shipped so far.
+const PERSONA_COL_WIDTH: usize = 10;
+/// ELAPSED column width. Covers `2h 04m` (6 chars) with one char of
+/// breathing room.
+const ELAPSED_COL_WIDTH: usize = 8;
+/// Status cell width. Working agents render as `● 0:12` (six display
+/// chars at minute scale, seven at `● 12:30`); idle/stopped agents
+/// render as a single sigil. Pad to 7 so ELAPSED and COST stay aligned
+/// across mixed running/idle/stopped rows. `pad_right` truncates beyond
+/// this, but the suffix format caps below the bound by construction.
+const STATUS_COL_WIDTH: usize = 7;
+/// Event-kind column width. Covers the longest kind currently shipped
+/// (`system`, 6 chars) without truncating; future taxonomy additions
+/// (`tool`, `flag`, `model`, `spawn`, `exit`) all fit.
+const EVENT_KIND_COL_WIDTH: usize = 6;
+
+/// Minimum row budget the events panel insists on, no matter how few events
+/// exist. Six is Saskia's floor: "events at 3 rows is broken — you can't
+/// scan history at three rows."
+const EVENT_PANEL_MIN_ROWS: u16 = 6;
+
+/// Rows the layout consumes outside the agents and events panels (title bar,
+/// pending-decisions header, agents header, events header, queues strip,
+/// footer — six fixed-length-1 chunks). Used to compute the agents-region
+/// cap so a long agent list cannot starve the events panel.
+const NON_AGENT_FIXED_ROWS: u16 = 6;
 
 // ── Title bar ────────────────────────────────────────────────────────────────
 
@@ -206,12 +240,6 @@ fn format_elapsed_table(d: Duration) -> String {
     }
 }
 
-/// Format a timestamp as `HH:MM` for the events stream. The events stream
-/// is dense; seconds add noise without information at glance density.
-fn format_time_hhmm(ts: OffsetDateTime) -> String {
-    format!("{:02}:{:02}", ts.hour(), ts.minute())
-}
-
 // ── Agent table ─────────────────────────────────────────────────────────────
 
 /// Build the agent table rows. Lead pinned at row one (with the focus
@@ -225,12 +253,19 @@ fn build_agent_rows(
     now: OffsetDateTime,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let lead_idx = snap.agents.iter().position(|a| a.name == "lead");
+    // `sort_key` pins lead at index 0 when present; the renderer relies on
+    // that invariant here. If the sort ever changes, this condition needs
+    // to find the lead by name instead.
+    let has_lead = snap.agents.first().is_some_and(|a| a.name == "lead");
     let has_non_lead = snap.agents.iter().any(|a| a.name != "lead");
+    let separator_idx = if has_lead && has_non_lead {
+        Some(1)
+    } else {
+        None
+    };
 
     for (idx, agent) in snap.agents.iter().enumerate() {
-        if Some(idx - lead_idx.unwrap_or(idx)) == Some(1) && lead_idx.is_some() && has_non_lead {
-            // After the lead row, insert the workers separator exactly once.
+        if Some(idx) == separator_idx {
             lines.push(build_workers_separator(width));
         }
         lines.push(build_agent_row(agent, focus == idx, now));
@@ -298,16 +333,6 @@ fn build_agent_row(agent: &AgentRow, focused: bool, now: OffsetDateTime) -> Line
     Line::from(spans)
 }
 
-const AGENT_COL_WIDTH: usize = 18;
-const PERSONA_COL_WIDTH: usize = 10;
-const ELAPSED_COL_WIDTH: usize = 8;
-/// Status cell width. Working agents render as `● 0:12` (six display
-/// chars at minute scale, seven at `● 12:30`); idle/stopped agents
-/// render as a single sigil. Pad to 7 so ELAPSED and COST stay aligned
-/// across mixed running/idle/stopped rows. `pad_right` truncates beyond
-/// this, but the suffix format caps below the bound by construction.
-const STATUS_COL_WIDTH: usize = 7;
-
 /// Truncate or right-pad a column value to `width` display chars. Naive on
 /// graphemes — agent names and persona names are ASCII-ish in practice; if
 /// that changes the renderer needs `unicode-width`.
@@ -352,19 +377,6 @@ fn build_event_row(event: &RecentEvent, width: u16) -> Line<'static> {
         Span::styled(summary, summary_style),
     ])
 }
-
-const EVENT_KIND_COL_WIDTH: usize = 6;
-
-/// Minimum row budget the events panel insists on, no matter how few events
-/// exist. Six is Saskia's floor: "events at 3 rows is broken — you can't
-/// scan history at three rows."
-const EVENT_PANEL_MIN_ROWS: u16 = 6;
-
-/// Rows the layout consumes outside the agents and events panels (title bar,
-/// pending-decisions header, agents header, events header, queues strip,
-/// footer — six fixed-length-1 chunks). Used to compute the agents-region
-/// cap so a long agent list cannot starve the events panel.
-const NON_AGENT_FIXED_ROWS: u16 = 6;
 
 /// Pick a fg colour for the event source: `Yellow` for the operator
 /// (matches the operator's speaker hue in the chat screen), `Cyan` for the

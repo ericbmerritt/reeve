@@ -399,3 +399,99 @@ fn submit_input(
     state.scroll_to_bottom();
     Ok(())
 }
+
+// ── Tests ───────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::panopticon::{AgentRow, PanopticonSnapshot};
+    use crate::state::AgentStatus;
+    use time::Duration;
+
+    fn key(code: KeyCode) -> event::KeyEvent {
+        event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn state_with_agents(count: usize) -> AppState {
+        let mut state = AppState::default();
+        state.screen = Screen::Panopticon;
+        state.panopticon = PanopticonSnapshot {
+            agents: (0..count)
+                .map(|i| AgentRow {
+                    name: format!("agent-{i}"),
+                    persona_name: None,
+                    status: AgentStatus::Idle,
+                    is_running: true,
+                    cost_usd: 0.0,
+                    elapsed: Duration::seconds(0),
+                    state_changed_at: None,
+                })
+                .collect(),
+            recent_events: Vec::new(),
+            queue_counts: crate::panopticon::QueueCounts::default(),
+            total_cost_usd: 0.0,
+            session_elapsed: Some(Duration::seconds(0)),
+        };
+        state
+    }
+
+    // A1: `j` and Down both move focus down by one row; the helper clamps
+    // at the last agent so spamming `j` cannot run off the end.
+    #[test]
+    fn handle_key_panopticon_j_and_down_move_focus_down_with_clamp() {
+        let mut state = state_with_agents(3);
+        assert!(!handle_key_panopticon(key(KeyCode::Char('j')), &mut state));
+        assert_eq!(state.panopticon_focus, 1);
+        assert!(!handle_key_panopticon(key(KeyCode::Down), &mut state));
+        assert_eq!(state.panopticon_focus, 2);
+        // Already at last agent; further presses clamp.
+        assert!(!handle_key_panopticon(key(KeyCode::Down), &mut state));
+        assert_eq!(state.panopticon_focus, 2);
+    }
+
+    // A2: `k` and Up both move focus up by one; saturate at zero.
+    #[test]
+    fn handle_key_panopticon_k_and_up_move_focus_up_with_clamp() {
+        let mut state = state_with_agents(3);
+        state.panopticon_focus = 2;
+        assert!(!handle_key_panopticon(key(KeyCode::Char('k')), &mut state));
+        assert_eq!(state.panopticon_focus, 1);
+        assert!(!handle_key_panopticon(key(KeyCode::Up), &mut state));
+        assert_eq!(state.panopticon_focus, 0);
+        // Saturate at 0.
+        assert!(!handle_key_panopticon(key(KeyCode::Up), &mut state));
+        assert_eq!(state.panopticon_focus, 0);
+    }
+
+    // A3: Enter on the panopticon pops back to the chat screen — Phase 6
+    // collapses every Enter to "return to lead chat" since only the lead's
+    // chat is wired. Phase 7 will branch on the focused agent.
+    #[test]
+    fn handle_key_panopticon_enter_switches_to_chat() {
+        let mut state = state_with_agents(2);
+        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert_eq!(state.screen, Screen::Chat);
+    }
+
+    // A4: unrelated keys are no-ops; focus and screen stay put.
+    #[test]
+    fn handle_key_panopticon_ignores_unrelated_keys() {
+        let mut state = state_with_agents(3);
+        state.panopticon_focus = 1;
+        let before = state.panopticon_focus;
+        assert!(!handle_key_panopticon(key(KeyCode::Char('x')), &mut state));
+        assert_eq!(state.panopticon_focus, before);
+        assert_eq!(state.screen, Screen::Panopticon);
+    }
+
+    // A5: focus-down on an empty agent table is a no-op rather than an
+    // overflow. Real users hit this transiently at startup (registry
+    // empty, snapshot still rendering).
+    #[test]
+    fn handle_key_panopticon_focus_down_is_noop_on_empty_table() {
+        let mut state = state_with_agents(0);
+        assert!(!handle_key_panopticon(key(KeyCode::Char('j')), &mut state));
+        assert_eq!(state.panopticon_focus, 0);
+    }
+}
