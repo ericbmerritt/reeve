@@ -34,12 +34,9 @@ use tracing::warn;
 use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, ValidatedAgentName,
 };
-use crate::fs_util::atomic_write_file;
+use crate::delivery::{deposit_envelope as deposit_envelope_fn, DepositError};
 use crate::identity_registry::{IdentityRegistry, RegistryError};
 use crate::verify::MAX_ENVELOPE_BYTES;
-
-/// Mode for envelope files deposited in `inbox/new/`.
-const ENVELOPE_FILE_MODE: u32 = 0o600;
 
 // ── Error type ─────────────────────────────────────────────────────────────────
 
@@ -416,7 +413,7 @@ fn dispatch(
         });
     }
 
-    deposit_envelope(recipient_record, &message_id.to_string(), &envelope_bytes)?;
+    deposit_envelope(recipient_record, message_id, &envelope_bytes)?;
 
     Ok(message_id)
 }
@@ -444,43 +441,19 @@ fn load_keypair(sender: &AgentRecord) -> Result<Keypair, SendError> {
 
 fn deposit_envelope(
     recipient: &AgentRecord,
-    message_id: &str,
+    message_id: MessageId,
     bytes: &[u8],
 ) -> Result<(), SendError> {
-    let inbox_root = &recipient.inbox_dir;
+    deposit_envelope_fn(&recipient.inbox_dir, message_id, bytes).map_err(SendError::from)
+}
 
-    // Check inbox_root itself before constructing subpaths — a symlinked
-    // inbox_root would cause the subpath checks to follow through the symlink.
-    let root_meta = std::fs::symlink_metadata(inbox_root).map_err(|source| SendError::Io {
-        path: inbox_root.clone(),
-        source,
-    })?;
-    if root_meta.file_type().is_symlink() {
-        return Err(SendError::SymlinkRejected {
-            path: inbox_root.clone(),
-        });
-    }
-
-    let tmp_dir = inbox_root.join("tmp");
-    let new_dir = inbox_root.join("new");
-    let new_path = new_dir.join(message_id);
-
-    for dir in [&tmp_dir, &new_dir] {
-        let meta = std::fs::symlink_metadata(dir).map_err(|source| SendError::Io {
-            path: dir.clone(),
-            source,
-        })?;
-        if meta.file_type().is_symlink() {
-            return Err(SendError::SymlinkRejected { path: dir.clone() });
+impl From<DepositError> for SendError {
+    fn from(err: DepositError) -> Self {
+        match err {
+            DepositError::SymlinkRejected { path } => Self::SymlinkRejected { path },
+            DepositError::Io { path, source } => Self::Io { path, source },
         }
     }
-
-    atomic_write_file(&new_path, &tmp_dir, bytes, ENVELOPE_FILE_MODE).map_err(|source| {
-        SendError::Io {
-            path: new_path,
-            source,
-        }
-    })
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

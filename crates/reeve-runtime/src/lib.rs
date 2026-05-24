@@ -10,6 +10,7 @@ pub mod agent_registry;
 pub mod audit;
 pub mod config;
 pub mod daemon;
+pub mod delivery;
 pub mod dispatcher;
 pub(crate) mod fs_util;
 pub mod identity_registry;
@@ -43,6 +44,7 @@ pub use daemon::{
     daemon_run, daemon_spawn, daemon_status, daemon_stop, heartbeat_fresh, DaemonError,
     DaemonStatus,
 };
+pub use delivery::{deposit_envelope, DepositError};
 pub use dispatcher::{MessageDispatcher, SendError, SendFailed, SendMessage, SendResult};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
