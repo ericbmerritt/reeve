@@ -6,11 +6,17 @@
 //! design and layout.
 
 pub mod app;
+pub mod panopticon;
 pub mod reader;
 pub mod state;
 pub mod submit;
 pub mod ui;
+pub mod ui_panopticon;
 pub mod watcher;
 
+pub use panopticon::{
+    read_snapshot as read_panopticon_snapshot, AgentRow, EventKind, PanopticonSnapshot,
+    QueueCounts, RecentEvent, Source, OPERATOR_LABEL,
+};
 pub use reader::{heartbeat_fresh, read_conversation, read_cost, read_status};
 pub use state::{AgentStatus, AppState, ConversationEntry, EntryKind};
