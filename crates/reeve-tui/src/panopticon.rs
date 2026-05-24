@@ -702,4 +702,99 @@ mod tests {
         };
         assert!(build_event("lead", &e, None).is_none());
     }
+
+    // P11: integration coverage for the IO orchestrator. Builds a real
+    // on-disk fixture (agent registry + two agent dirs with status, cost,
+    // and quarantine files) and asserts `read_snapshot` walks it end-to-
+    // end. The pure builder (P1–P10) covers merge/rank logic; this proves
+    // the file paths and error-absorption wiring line up.
+    #[test]
+    #[cfg(unix)]
+    fn read_snapshot_walks_registry_and_returns_per_agent_data() {
+        use reeve_runtime::{
+            AgentRecord, AgentRegistry, AgentStatus as RuntimeAgentStatus, ValidatedAgentName,
+        };
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        // The on-disk runtime layout uses 0o700 on every directory it owns;
+        // tempdir() returns 0o755, which the AgentRegistry opener rejects.
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Provision two agent trees with realistic content the readers will
+        // see: a lead with one conversation line and an idle status, and a
+        // worker with a non-empty quarantine folder so the queue counter
+        // can be asserted.
+        let agents_dir = data_dir.join("agents");
+        for (name, status_text, conversation, quarantine_count) in [
+            (
+                "lead",
+                "idle",
+                "{\"type\":\"outbound\",\"payload\":\"hi\"}\n",
+                0,
+            ),
+            ("worker-test", "working", "", 2),
+        ] {
+            let dir = agents_dir.join(name);
+            for sub in ["inbox/tmp", "inbox/new", "inbox/quarantine", "log"] {
+                fs::create_dir_all(dir.join(sub)).unwrap();
+                fs::set_permissions(dir.join(sub), fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(dir.join("status"), status_text).unwrap();
+            fs::write(dir.join("cost"), "0.0").unwrap();
+            fs::write(dir.join("log").join("conversation.jsonl"), conversation).unwrap();
+            for q in 0..quarantine_count {
+                fs::write(dir.join("inbox/quarantine").join(format!("env-{q}")), b"x").unwrap();
+            }
+        }
+        fs::set_permissions(&agents_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let registry_path = agents_dir.join("registry.toml");
+        let mut registry = AgentRegistry::open(registry_path.clone()).unwrap();
+        for name in ["lead", "worker-test"] {
+            registry
+                .register(AgentRecord {
+                    name: ValidatedAgentName::new(name).unwrap(),
+                    identity_id: IdentityId::new().unwrap(),
+                    inbox_dir: agents_dir.join(name).join("inbox"),
+                    persona_name: Some(name.to_owned()),
+                    spawned_at: OffsetDateTime::now_utc(),
+                    status: RuntimeAgentStatus::Running,
+                })
+                .unwrap();
+        }
+
+        let snap = read_snapshot(&data_dir, &registry_path, None);
+
+        let names: Vec<&str> = snap.agents.iter().map(|a| a.name.as_str()).collect();
+        assert!(names.contains(&"lead"), "lead must appear in snapshot");
+        assert!(
+            names.contains(&"worker-test"),
+            "worker must appear in snapshot"
+        );
+        assert_eq!(snap.queue_counts.quarantine, 2, "quarantine files counted");
+        let worker = snap
+            .agents
+            .iter()
+            .find(|a| a.name == "worker-test")
+            .unwrap();
+        assert_eq!(
+            worker.status,
+            AgentStatus::Working,
+            "worker status reflects on-disk file"
+        );
+    }
+
+    // P12: a registry path that doesn't exist surfaces as an empty
+    // snapshot rather than a panic — the "always renderable" contract.
+    #[test]
+    fn read_snapshot_returns_empty_when_registry_unreadable() {
+        let snap = read_snapshot(Path::new("/nonexistent"), Path::new("/nonexistent"), None);
+        assert!(snap.agents.is_empty());
+        assert_eq!(snap.queue_counts.quarantine, 0);
+    }
 }

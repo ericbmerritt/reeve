@@ -1,0 +1,27 @@
+//! Helpers shared between the chat ([`crate::ui`]) and panopticon
+//! ([`crate::ui_panopticon`]) renderers.
+//!
+//! Anything that both screens compute the same way and that has nothing
+//! screen-specific to say lives here. Today: the `NO_COLOR` predicate and a
+//! `HH:MM` timestamp formatter — both copied verbatim before this extract
+//! and a CLAUDE.md design-defaults violation (the rule: "Search adjacent
+//! files in the same crate before writing helpers"). New shared helpers
+//! land here rather than being inlined a third time.
+
+use time::OffsetDateTime;
+
+/// Return true when `NO_COLOR` is set in the environment (any value).
+///
+/// Called once per draw pass. The `std::env` call is cheap at this cadence.
+#[must_use]
+pub fn no_color() -> bool {
+    std::env::var("NO_COLOR").is_ok()
+}
+
+/// Format a timestamp as `HH:MM`. Used by both screens' dense-row contexts
+/// (chat speaker tags, panopticon events stream) where seconds add noise
+/// without information.
+#[must_use]
+pub fn format_time_hhmm(ts: OffsetDateTime) -> String {
+    format!("{:02}:{:02}", ts.hour(), ts.minute())
+}

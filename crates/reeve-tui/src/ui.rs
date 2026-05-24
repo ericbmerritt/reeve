@@ -32,12 +32,7 @@ use ratatui::Frame;
 
 use crate::state::{AgentStatus, AppState, ConversationEntry, EntryKind};
 
-/// Return true when `NO_COLOR` is set in the environment (any value).
-///
-/// Called once per draw pass. The `std::env` call is cheap at this cadence.
-fn no_color() -> bool {
-    std::env::var("NO_COLOR").is_ok()
-}
+use crate::ui_common::no_color;
 
 /// Status sigil for a given [`AgentStatus`].
 ///
@@ -120,7 +115,7 @@ fn build_title_bar(state: &AppState) -> Line<'static> {
 
 /// Format an optional timestamp as `HH:MM`, or return an empty string.
 fn format_timestamp(ts: Option<time::OffsetDateTime>) -> String {
-    ts.map(|t| format!("{:02}:{:02}", t.hour(), t.minute()))
+    ts.map(crate::ui_common::format_time_hhmm)
         .unwrap_or_default()
 }
 
