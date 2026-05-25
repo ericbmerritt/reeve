@@ -123,6 +123,12 @@ pub enum Screen {
 /// this struct in the draw pass; it never touches the filesystem directly.
 #[derive(Debug, Clone)]
 pub struct AppState {
+    /// Role name (from the agent registry) of the agent currently shown in
+    /// the chat screen. Drives which `AgentDirs` the chat reload reads,
+    /// which inbox `submit_message` writes to, and what's recorded in
+    /// `session.toml` on exit. Defaults to `"lead"` for backward
+    /// compatibility with the single-screen TUI.
+    pub chat_agent_name: String,
     pub conversation: Vec<ConversationEntry>,
     pub status: AgentStatus,
     pub cost_usd: f64,
@@ -198,6 +204,7 @@ impl AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            chat_agent_name: String::from("lead"),
             conversation: Vec::new(),
             status: AgentStatus::Unknown,
             cost_usd: 0.0,
