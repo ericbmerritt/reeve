@@ -148,21 +148,35 @@ fn role_style(entry: &ConversationEntry, operator_id: Option<reeve_types::Identi
     }
 }
 
+/// Two-space indent prepended to each body row of a conversation entry,
+/// hanging under the speaker tag. The renderer also pre-wraps long body
+/// lines so continuation rows keep this indent — ratatui's
+/// `Wrap { trim: false }` preserves it on the first row but drops it on
+/// continuations.
+const BODY_INDENT: &str = "  ";
+
 /// Build the conversation lines from all entries in state.
 ///
 /// Each entry renders as two parts:
 /// 1. Speaker line: `{label} · {timestamp_or_blank}`
-/// 2. Text line:   `  {text}` (possibly multiple visual rows after wrapping)
+/// 2. Text line:   `  {text}` (pre-wrapped against `width` so continuation
+///    rows keep the two-space hang indent)
 ///
 /// Both parts are colored by the entry's role (see `role_style`) so the
 /// operator can scan who said what without reading the speaker tag. Body
 /// rows are dimmed relative to the speaker tag to keep the role color from
 /// dominating the pane.
 ///
+/// Body wrapping happens here rather than via ratatui's `Wrap { trim: false }`
+/// because that wrap mode preserves leading whitespace only on a line's
+/// first visual row; continuation rows start at column 0 and lose the
+/// indent. Pre-wrapping with explicit indent on every row keeps the
+/// hang-indent stable through any number of wrap continuations.
+///
 /// When the agent is in `Working` status, appends a "thinking" indicator
 /// with a clock-driven spinner so a long model call does not look like the
 /// TUI is frozen.
-fn build_conversation_lines(state: &AppState) -> Vec<Line<'static>> {
+fn build_conversation_lines(state: &AppState, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     for entry in &state.conversation {
@@ -182,13 +196,15 @@ fn build_conversation_lines(state: &AppState) -> Vec<Line<'static>> {
         };
         lines.push(Line::from(Span::styled(speaker_text, style)));
 
-        // Preserve text line-breaks the agent put in the payload; wrapping is
-        // handled by the Paragraph widget at render time.
+        // Preserve text line-breaks the agent put in the payload, then
+        // pre-wrap each one against the chunk width with the body indent.
         for line in entry.text.lines() {
-            lines.push(Line::from(Span::styled(format!("  {line}"), body_style)));
+            for visual_row in wrap_body_line(line, width) {
+                lines.push(Line::from(Span::styled(visual_row, body_style)));
+            }
         }
         if entry.text.is_empty() {
-            lines.push(Line::from("  "));
+            lines.push(Line::from(BODY_INDENT));
         }
 
         lines.push(Line::from(""));
@@ -199,6 +215,48 @@ fn build_conversation_lines(state: &AppState) -> Vec<Line<'static>> {
     }
 
     lines
+}
+
+/// Word-wrap `text` against `width`, prepending [`BODY_INDENT`] to each
+/// visual row. Naive word-boundary wrap; words longer than the content
+/// width fall onto a single row without splitting (rare in chat prose
+/// and visually less harmful than mid-word splits in monospace).
+fn wrap_body_line(text: &str, width: u16) -> Vec<String> {
+    let indent_chars = BODY_INDENT.chars().count();
+    // Clamp the content budget. At very narrow widths there's nothing
+    // sensible to do; emit the text without wrapping rather than producing
+    // an empty-content cascade.
+    let content_width = usize::from(width).saturating_sub(indent_chars).max(1);
+
+    let trimmed = text.trim_end();
+    if trimmed.is_empty() {
+        return vec![BODY_INDENT.to_owned()];
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut current = String::new();
+    for word in trimmed.split_whitespace() {
+        let word_chars = word.chars().count();
+        let projected = if current.is_empty() {
+            word_chars
+        } else {
+            current.chars().count() + 1 + word_chars
+        };
+        if projected > content_width && !current.is_empty() {
+            rows.push(format!("{BODY_INDENT}{current}"));
+            current.clear();
+            current.push_str(word);
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        rows.push(format!("{BODY_INDENT}{current}"));
+    }
+    rows
 }
 
 /// 10-phase Braille dot spinner. Phase advances ~8 frames per second based on
@@ -242,10 +300,15 @@ fn build_input_line(state: &AppState) -> Line<'static> {
     Line::from(format!("> {}_", state.input))
 }
 
-/// Format: `PgUp/PgDn scroll · End bottom · q quit ─── ${cost:.4} USD`
+/// Format: `PgUp/PgDn scroll · End bottom · q quit ─── ${cost:.2}`.
+///
+/// Cost format matches the panopticon's title-bar `${:.2}` — the screens
+/// share a glance-level view of session spend, so the format follows. The
+/// old `${:.4} USD` (four decimal places, with currency suffix) was an
+/// outlier inherited from the walking-skeleton stub.
 fn build_footer(state: &AppState) -> Line<'static> {
     let nav = "PgUp/PgDn scroll \u{00B7} End bottom \u{00B7} q quit \u{2500}\u{2500}\u{2500} ";
-    let cost = format!("${:.4} USD", state.cost_usd);
+    let cost = format!("${:.2}", state.cost_usd);
     Line::from(format!("{nav}{cost}"))
 }
 
@@ -290,7 +353,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     let title_widget = Paragraph::new(Text::from(vec![title_line]));
     frame.render_widget(title_widget, chunks[0]);
 
-    let conv_lines = build_conversation_lines(state);
+    let conv_lines = build_conversation_lines(state, chunks[1].width);
     let conv_widget = render_conversation(&conv_lines, chunks[1], state.scroll_offset);
     frame.render_widget(conv_widget, chunks[1]);
 
@@ -439,6 +502,66 @@ mod tests {
                 "input height cap must never be zero (area_height={area_height})"
             );
         }
+    }
+
+    // U_BODY_WRAP: a long body line wraps with the BODY_INDENT on every
+    // visual row. The smoke at 80×24 caught the prior bug where the
+    // second row of a wrapped Outbound entry started at column 1.
+    #[test]
+    fn wrap_body_line_keeps_indent_on_every_visual_row() {
+        let text = "I'll start by reading the current shape. \
+                    Two passes: list the shared fields, then plan the trait.";
+        let rows = wrap_body_line(text, 40);
+        assert!(rows.len() >= 2, "long line should wrap; got {rows:?}");
+        for (i, row) in rows.iter().enumerate() {
+            assert!(
+                row.starts_with(BODY_INDENT),
+                "row {i} missing body indent: {row:?}"
+            );
+            assert!(
+                row.chars().count() <= 40,
+                "row {i} exceeds width=40: {row:?}"
+            );
+        }
+    }
+
+    // U_BODY_WRAP_SHORT: short text fits in one visual row, still
+    // carries the indent.
+    #[test]
+    fn wrap_body_line_short_text_is_single_row_with_indent() {
+        let rows = wrap_body_line("ok", 80);
+        assert_eq!(rows, vec!["  ok".to_owned()]);
+    }
+
+    // U_BODY_WRAP_EMPTY: empty text produces one indent-only row (so the
+    // surrounding entry still occupies vertical space for the speaker
+    // tag).
+    #[test]
+    fn wrap_body_line_empty_text_produces_indent_only_row() {
+        assert_eq!(wrap_body_line("", 80), vec!["  ".to_owned()]);
+        assert_eq!(wrap_body_line("   ", 80), vec!["  ".to_owned()]);
+    }
+
+    // U_FOOTER_COST: the chat footer uses the same `${:.2}` format the
+    // panopticon title bar does — no four-decimal `$0.3100 USD` outlier.
+    #[test]
+    fn build_footer_uses_two_decimal_cost_no_currency_suffix() {
+        let mut state = AppState::default();
+        state.cost_usd = 0.31;
+        let line = build_footer(&state);
+        let rendered: String = line.spans.iter().map(|s| s.content.clone()).collect();
+        assert!(
+            rendered.contains("$0.31"),
+            "footer should show $0.31 (2dp); got {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("$0.3100"),
+            "footer should not show 4dp cost: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("USD"),
+            "footer should not include USD suffix: {rendered:?}"
+        );
     }
 
     // U3: thinking_indicator is None unless the agent is Working — idle / crashed
