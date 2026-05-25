@@ -1781,6 +1781,7 @@ dependencies = [
  "reeve-runtime",
  "reeve-transport",
  "reeve-types",
+ "serde",
  "serde_json",
  "tempfile",
  "time",

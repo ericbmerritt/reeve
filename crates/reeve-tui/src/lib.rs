@@ -8,6 +8,7 @@
 pub mod app;
 pub mod panopticon;
 pub mod reader;
+pub mod session;
 pub mod state;
 pub mod submit;
 pub mod ui;

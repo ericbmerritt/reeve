@@ -193,11 +193,13 @@ fn cmd_reeve() -> Result<(), Box<dyn std::error::Error>> {
 
     let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
+    let session_path = reeve_tui::session::default_path(&state_dir);
     let keystore = Arc::new(keychain::open_platform_keystore()?);
     reeve_tui::app::run(
         &dirs,
         &data_dir,
         &agent_registry_path,
+        &session_path,
         &registry,
         keystore.as_ref(),
     )
@@ -333,11 +335,13 @@ fn cmd_attach() -> Result<(), Box<dyn std::error::Error>> {
     let registry = IdentityRegistry::open(data_dir.clone())?;
     let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
+    let session_path = reeve_tui::session::default_path(&state_dir);
     let keystore = Arc::new(keychain::open_platform_keystore()?);
     reeve_tui::app::run(
         &dirs,
         &data_dir,
         &agent_registry_path,
+        &session_path,
         &registry,
         keystore.as_ref(),
     )
