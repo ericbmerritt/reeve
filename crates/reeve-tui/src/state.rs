@@ -106,6 +106,12 @@ pub enum Screen {
     Chat,
     /// Global panopticon: agent table, recent events, queue counts.
     Panopticon,
+    /// Quarantine review. Phase 6 ships a stub renderer that surfaces the
+    /// per-agent quarantine count from the panopticon snapshot and a note
+    /// that the full review UI lands in Phase 8. The Screen variant exists
+    /// so the panopticon's `Q` keybinding has a real target and Phase 8
+    /// can fill in the renderer without touching the dispatch path.
+    Quarantine,
 }
 
 // ── AppState ──────────────────────────────────────────────────────────────────
@@ -236,13 +242,19 @@ impl AppState {
     /// panopticon focus to the top row whenever the operator enters the
     /// panopticon so the cursor never lands on a row that has since
     /// scrolled out of view.
+    ///
+    /// `Screen::Quarantine` is treated as a peer of `Panopticon` for the
+    /// purposes of this toggle — calling `toggle_screen` from quarantine
+    /// returns to chat. The app-level keymap routes `Tab` from quarantine
+    /// to panopticon directly rather than calling this helper, so this
+    /// fallback is only reached if a new caller appears later.
     pub fn toggle_screen(&mut self) {
         self.screen = match self.screen {
             Screen::Chat => {
                 self.panopticon_focus = 0;
                 Screen::Panopticon
             }
-            Screen::Panopticon => Screen::Chat,
+            Screen::Panopticon | Screen::Quarantine => Screen::Chat,
         };
     }
 

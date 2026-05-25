@@ -14,6 +14,7 @@ pub mod submit;
 pub mod ui;
 pub mod ui_common;
 pub mod ui_panopticon;
+pub mod ui_quarantine;
 pub mod watcher;
 
 pub use panopticon::{

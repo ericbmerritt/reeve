@@ -298,6 +298,9 @@ pub fn run(
                 Screen::Panopticon => {
                     crate::ui_panopticon::draw(frame, &state.panopticon, state.panopticon_focus);
                 }
+                Screen::Quarantine => {
+                    crate::ui_quarantine::draw(frame, &state.panopticon);
+                }
             })
             .map_err(TuiError::Terminal)?;
 
@@ -375,13 +378,24 @@ fn handle_key(
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(true),
         (KeyCode::Tab, _) => {
-            state.toggle_screen();
+            // Tab toggles Chat ↔ Panopticon. From Quarantine, Tab pops
+            // back to the panopticon (its conceptual parent screen)
+            // rather than entering the chat directly — keeps the
+            // navigation structure shallow.
+            match state.screen {
+                Screen::Chat | Screen::Panopticon => state.toggle_screen(),
+                Screen::Quarantine => state.screen = Screen::Panopticon,
+            }
             return Ok(false);
         }
         (KeyCode::Esc, _) => match state.screen {
             Screen::Chat => return Ok(true),
             Screen::Panopticon => {
                 state.screen = Screen::Chat;
+                return Ok(false);
+            }
+            Screen::Quarantine => {
+                state.screen = Screen::Panopticon;
                 return Ok(false);
             }
         },
@@ -391,6 +405,7 @@ fn handle_key(
     match state.screen {
         Screen::Chat => handle_key_chat(key, state, dirs, registry, keystore),
         Screen::Panopticon => Ok(handle_key_panopticon(key, state)),
+        Screen::Quarantine => Ok(handle_key_quarantine(key, state)),
     }
 }
 
@@ -460,6 +475,32 @@ fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
         // to the existing chat regardless of which row was focused. Phase
         // 7 will branch on the focused agent here.
         (KeyCode::Enter, _) => state.screen = Screen::Chat,
+        // `Q` opens the quarantine review. Phase 6 ships a stub renderer
+        // that surfaces the existing quarantine count; Phase 8 fills in
+        // the real per-message review UI. Crossterm typically delivers
+        // Shift+q as `Char('Q')` (uppercase, modifier-less) on most
+        // terminals, but a `SHIFT`-modifier variant is also possible —
+        // accept both.
+        (KeyCode::Char('Q'), _) => state.screen = Screen::Quarantine,
+        _ => {}
+    }
+    false
+}
+
+/// Quarantine-screen key bindings. Today's stub has nothing screen-local
+/// to do — the global `Esc`/`Tab`/`q` handler already covers back-to-
+/// panopticon and quit. `Q` here is an explicit close-and-return so the
+/// operator can toggle the screen with the same key that opened it.
+/// Phase 8 fills in approve/release/discard actions here.
+#[expect(
+    clippy::single_match,
+    reason = "match shape pre-claimed for Phase 8 approve/release/discard \
+              arms; converting to `if let` now would just have to be \
+              reverted when those land."
+)]
+fn handle_key_quarantine(key: event::KeyEvent, state: &mut AppState) -> bool {
+    match (key.code, key.modifiers) {
+        (KeyCode::Char('Q'), _) => state.screen = Screen::Panopticon,
         _ => {}
     }
     false
@@ -581,6 +622,37 @@ mod tests {
         let mut state = state_with_agents(0);
         assert!(!handle_key_panopticon(key(KeyCode::Char('j')), &mut state));
         assert_eq!(state.panopticon_focus, 0);
+    }
+
+    // A6: `Q` on the panopticon opens the quarantine review stub. This
+    // is the one operator-facing key the queue-strip footer advertises.
+    #[test]
+    fn handle_key_panopticon_q_opens_quarantine() {
+        let mut state = state_with_agents(2);
+        assert!(!handle_key_panopticon(key(KeyCode::Char('Q')), &mut state));
+        assert_eq!(state.screen, Screen::Quarantine);
+    }
+
+    // A7: `Q` on the quarantine screen closes back to the panopticon —
+    // toggle-on / toggle-off with the same key. Matches the operator's
+    // muscle memory for press-the-same-key-to-leave panels.
+    #[test]
+    fn handle_key_quarantine_q_returns_to_panopticon() {
+        let mut state = state_with_agents(2);
+        state.screen = Screen::Quarantine;
+        assert!(!handle_key_quarantine(key(KeyCode::Char('Q')), &mut state,));
+        assert_eq!(state.screen, Screen::Panopticon);
+    }
+
+    // A8: unrelated keys on quarantine are no-ops. The global handler
+    // already covers Esc and Tab; the stub itself has no other actions
+    // until Phase 8 wires approve/release/discard.
+    #[test]
+    fn handle_key_quarantine_ignores_unrelated_keys() {
+        let mut state = state_with_agents(2);
+        state.screen = Screen::Quarantine;
+        assert!(!handle_key_quarantine(key(KeyCode::Char('x')), &mut state,));
+        assert_eq!(state.screen, Screen::Quarantine);
     }
 
     // ── Session-driven startup screen ────────────────────────────────
