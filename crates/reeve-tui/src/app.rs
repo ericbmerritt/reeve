@@ -38,9 +38,18 @@ use reeve_runtime::AgentDirs;
 
 use crate::panopticon::read_snapshot as read_panopticon_snapshot;
 use crate::reader::{read_conversation, read_cost, read_status};
+use crate::session::{self, Session};
 use crate::state::{AppState, Screen};
 use crate::submit::submit_message;
 use crate::watcher::watch_tree;
+
+/// Role name of the only chat the TUI can currently open. Phase 7 will
+/// generalise the chat screen to other agents; until then, session
+/// records that name any other agent are honoured only insofar as the
+/// agent is registered and running — but the chat target falls back to
+/// `LEAD_AGENT_NAME` regardless. Pinned as a const so the startup-flow
+/// logic and the exit-write logic share one source of truth.
+const LEAD_AGENT_NAME: &str = "lead";
 
 /// Poll timeout for crossterm events. The loop also reacts to watcher signals,
 /// so this just sets the maximum latency between a watcher event and a redraw.
@@ -135,6 +144,57 @@ fn first_operator_id(registry: &IdentityRegistry) -> Option<reeve_types::Identit
     })
 }
 
+// ── Session memory ────────────────────────────────────────────────────────────
+
+/// Decide which screen to open on startup, given the session file and the
+/// agent registry.
+///
+/// Returns [`Screen::Chat`] only when **all** of these hold:
+/// - The session file records a `last_agent` value.
+/// - That agent name is present in the agent registry.
+/// - The registry marks the agent as Running (a stopped agent's chat is
+///   not a useful landing place).
+///
+/// Otherwise returns [`Screen::Panopticon`]: no session, missing agent, or
+/// non-running agent all collapse to "open the panopticon instead." This
+/// is the operator-facing behaviour the spec mandates and the only
+/// reasonable fallback when the recorded chat target is unreachable.
+fn initial_screen_for_session(session: &Session, agent_registry_path: &Path) -> Screen {
+    let Some(name) = session.last_agent.as_deref() else {
+        return Screen::Panopticon;
+    };
+    let Ok(registry) = reeve_runtime::AgentRegistry::open(agent_registry_path.to_path_buf()) else {
+        return Screen::Panopticon;
+    };
+    match registry.lookup(name) {
+        Some(record) if matches!(record.status, reeve_runtime::AgentStatus::Running) => {
+            Screen::Chat
+        }
+        _ => Screen::Panopticon,
+    }
+}
+
+/// Write the session record on clean TUI exit. Per the spec, only chat-screen
+/// exits should record `last_agent`; an exit from the panopticon must not
+/// overwrite a valid prior chat record.
+///
+/// Errors are deliberately swallowed: the operator should never see a TUI
+/// quit fail because of a session-file write hiccup. The worst-case
+/// presentation is "next launch lands on the panopticon" — the same
+/// fallback as a missing session file.
+fn record_exit_to_session(session_path: &Path, state: &AppState) {
+    if state.screen != Screen::Chat {
+        return;
+    }
+    let session = Session {
+        // Phase 6 only opens the lead chat, so the agent name we record is
+        // always `LEAD_AGENT_NAME`. Phase 7 will replace this with the
+        // actual focused agent.
+        last_agent: Some(LEAD_AGENT_NAME.to_owned()),
+    };
+    let _ = session::write(session_path, &session);
+}
+
 // ── State loading ─────────────────────────────────────────────────────────────
 
 /// Reload all agent state from disk into `state`.
@@ -179,10 +239,20 @@ fn reload_state(
 /// [`TuiError::Watcher`] if the filesystem watcher cannot start, or
 /// [`TuiError::Submit`] if a message write fails (not currently surfaced to the
 /// user — future iterations should show an inline error).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "run is the multi-screen TUI entry point and now also threads \
+              session-memory state (session_path) on top of the lead-chat \
+              data sources, panopticon data sources, and operator credentials. \
+              Bundling these into a context struct trades clarity for \
+              indirection at the only non-test call sites (cmd_attach and \
+              cmd_reeve in reeve-cli)."
+)]
 pub fn run(
     dirs: &AgentDirs,
     data_dir: &Path,
     agent_registry_path: &Path,
+    session_path: &Path,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<(), TuiError> {
@@ -209,6 +279,13 @@ pub fn run(
     // worker/peer replies. If lookup fails the label falls back to a short
     // id, which is still better than the pre-attribution "you for everyone".
     state.operator_id = first_operator_id(registry);
+    // Pick the starting screen from session memory: chat when the last
+    // agent the operator was talking to is still running, panopticon
+    // otherwise (no session, agent gone, agent stopped). The default
+    // `Screen::Chat` on `AppState` is overridden here because the
+    // panopticon-as-home story applies at startup; the field's default
+    // exists for tests and constructed-in-place states.
+    state.screen = initial_screen_for_session(&session::read(session_path), agent_registry_path);
 
     loop {
         if needs_reload.swap(false, Ordering::Acquire) {
@@ -230,6 +307,11 @@ pub fn run(
                 Event::Key(key) => {
                     let prev_screen = state.screen;
                     if handle_key(key, &mut state, dirs, registry, keystore)? {
+                        // Record the chat target the operator was on when
+                        // they quit, so the next launch can resume it.
+                        // Quitting from the panopticon does not write
+                        // (would overwrite a valid prior chat record).
+                        record_exit_to_session(session_path, &state);
                         return Ok(());
                     }
                     // Force a fresh panopticon read only on the *transition*
@@ -413,7 +495,7 @@ mod tests {
     use super::*;
     use crate::panopticon::{AgentRow, PanopticonSnapshot};
     use crate::state::AgentStatus;
-    use time::Duration;
+    use time::{Duration, OffsetDateTime};
 
     fn key(code: KeyCode) -> event::KeyEvent {
         event::KeyEvent::new(code, KeyModifiers::NONE)
@@ -499,5 +581,131 @@ mod tests {
         let mut state = state_with_agents(0);
         assert!(!handle_key_panopticon(key(KeyCode::Char('j')), &mut state));
         assert_eq!(state.panopticon_focus, 0);
+    }
+
+    // ── Session-driven startup screen ────────────────────────────────
+
+    /// `AgentRegistry::open` enforces `0o700` on its parent directory;
+    /// `tempdir()` creates with `0o755`. Apply the expected mode before
+    /// opening so the registry doesn't reject the directory as
+    /// misconfigured.
+    #[cfg(unix)]
+    fn chmod_700(path: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// Register `name` as a running agent in a fresh on-disk registry at
+    /// `path` so `initial_screen_for_session` can find it.
+    fn register_running_agent(path: &Path, name: &str) {
+        use reeve_runtime::{
+            AgentRecord, AgentRegistry, AgentStatus as RuntimeAgentStatus, ValidatedAgentName,
+        };
+        #[cfg(unix)]
+        chmod_700(path.parent().unwrap());
+        let mut registry = AgentRegistry::open(path.to_path_buf()).unwrap();
+        registry
+            .register(AgentRecord {
+                name: ValidatedAgentName::new(name).unwrap(),
+                identity_id: reeve_types::IdentityId::new().unwrap(),
+                inbox_dir: path.parent().unwrap().join(name).join("inbox"),
+                persona_name: Some(name.to_owned()),
+                spawned_at: OffsetDateTime::now_utc(),
+                status: RuntimeAgentStatus::Running,
+            })
+            .unwrap();
+    }
+
+    // SA1: no session → panopticon. The "first launch" path: the operator
+    // has never quit a chat, so there's nothing to resume.
+    #[test]
+    fn initial_screen_with_no_session_is_panopticon() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Build a registry path inside tmp but never write one — open will
+        // succeed against the empty directory.
+        let registry_path = tmp.path().join("registry.toml");
+        let screen = initial_screen_for_session(&Session::default(), &registry_path);
+        assert_eq!(screen, Screen::Panopticon);
+    }
+
+    // SA2: session names a running agent → that agent's chat. The "resume"
+    // path the spec's done-when criterion calls out.
+    #[test]
+    fn initial_screen_with_running_agent_in_session_is_chat() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry_path = tmp.path().join("registry.toml");
+        register_running_agent(&registry_path, "lead");
+
+        let screen = initial_screen_for_session(
+            &Session {
+                last_agent: Some("lead".to_owned()),
+            },
+            &registry_path,
+        );
+        assert_eq!(screen, Screen::Chat);
+    }
+
+    // SA3: session names an agent that is no longer in the registry →
+    // panopticon. The registry was rebuilt, or the agent was unregistered;
+    // we fall back to the global view rather than landing on a stale chat.
+    #[test]
+    fn initial_screen_with_unknown_agent_in_session_is_panopticon() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry_path = tmp.path().join("registry.toml");
+        register_running_agent(&registry_path, "lead");
+
+        let screen = initial_screen_for_session(
+            &Session {
+                last_agent: Some("worker-gone".to_owned()),
+            },
+            &registry_path,
+        );
+        assert_eq!(screen, Screen::Panopticon);
+    }
+
+    // SA4: session names a stopped agent → panopticon. A stopped agent's
+    // chat is not a useful landing place; the spec specifies the fallback.
+    #[test]
+    fn initial_screen_with_stopped_agent_in_session_is_panopticon() {
+        use reeve_runtime::{
+            AgentRecord, AgentRegistry, AgentStatus as RuntimeAgentStatus, ValidatedAgentName,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        chmod_700(tmp.path());
+        let registry_path = tmp.path().join("registry.toml");
+        let mut registry = AgentRegistry::open(registry_path.clone()).unwrap();
+        registry
+            .register(AgentRecord {
+                name: ValidatedAgentName::new("lead").unwrap(),
+                identity_id: reeve_types::IdentityId::new().unwrap(),
+                inbox_dir: tmp.path().join("lead").join("inbox"),
+                persona_name: Some("lead".to_owned()),
+                spawned_at: OffsetDateTime::now_utc(),
+                status: RuntimeAgentStatus::Stopped,
+            })
+            .unwrap();
+
+        let screen = initial_screen_for_session(
+            &Session {
+                last_agent: Some("lead".to_owned()),
+            },
+            &registry_path,
+        );
+        assert_eq!(screen, Screen::Panopticon);
+    }
+
+    // SA5: unreadable registry path → panopticon. Best-effort: if the
+    // registry can't be opened for any reason, fall back rather than
+    // panic.
+    #[test]
+    fn initial_screen_with_unreadable_registry_is_panopticon() {
+        let screen = initial_screen_for_session(
+            &Session {
+                last_agent: Some("lead".to_owned()),
+            },
+            Path::new("/nonexistent/no-such-registry.toml"),
+        );
+        assert_eq!(screen, Screen::Panopticon);
     }
 }
