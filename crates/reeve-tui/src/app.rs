@@ -43,14 +43,6 @@ use crate::state::{AppState, Screen};
 use crate::submit::submit_message;
 use crate::watcher::watch_tree;
 
-/// Role name of the only chat the TUI can currently open. Phase 7 will
-/// generalise the chat screen to other agents; until then, session
-/// records that name any other agent are honoured only insofar as the
-/// agent is registered and running — but the chat target falls back to
-/// `LEAD_AGENT_NAME` regardless. Pinned as a const so the startup-flow
-/// logic and the exit-write logic share one source of truth.
-const LEAD_AGENT_NAME: &str = "lead";
-
 /// Poll timeout for crossterm events. The loop also reacts to watcher signals,
 /// so this just sets the maximum latency between a watcher event and a redraw.
 const POLL_TIMEOUT: Duration = Duration::from_millis(100);
@@ -187,37 +179,45 @@ fn record_exit_to_session(session_path: &Path, state: &AppState) {
         return;
     }
     let session = Session {
-        // Phase 6 only opens the lead chat, so the agent name we record is
-        // always `LEAD_AGENT_NAME`. Phase 7 will replace this with the
-        // actual focused agent.
-        last_agent: Some(LEAD_AGENT_NAME.to_owned()),
+        last_agent: Some(state.chat_agent_name.clone()),
     };
     let _ = session::write(session_path, &session);
 }
 
 // ── State loading ─────────────────────────────────────────────────────────────
 
-/// Reload all agent state from disk into `state`.
+/// Reload all on-disk state into `state`.
 ///
-/// Called on every watcher callback. Individual reads return safe defaults on
-/// any filesystem error (see `crate::reader`).
+/// Called on every watcher callback. Reads chat-screen data from the
+/// currently selected chat agent (`state.chat_agent_name`) and refreshes
+/// the panopticon snapshot from the agent registry. Individual reads
+/// return safe defaults on any filesystem error (see `crate::reader`).
 ///
-/// `data_dir` and `agent_registry_path` drive the panopticon snapshot read.
-/// The lead-chat reload and the panopticon refresh share a trigger right
-/// now: any change in the lead's directory re-renders both screens. A
-/// future commit can extend the watcher to cover every registered agent's
-/// state dir so a worker's transition refreshes the panopticon without
-/// waiting on the lead.
-fn reload_state(
-    state: &mut AppState,
-    dirs: &AgentDirs,
-    data_dir: &Path,
-    agent_registry_path: &Path,
-) {
-    state.status = read_status(&dirs.status_path());
-    state.conversation = read_conversation(&dirs.conversation_path());
-    state.cost_usd = read_cost(&dirs.cost_path());
+/// `data_dir` is the runtime data root; per-agent dirs are derived from
+/// it plus the chat-agent name on every reload, so switching the
+/// chat-agent (e.g., Enter on a panopticon row) requires only a state
+/// mutation followed by a reload trigger — no signature changes
+/// downstream.
+fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Path) {
+    if let Ok(dirs) = AgentDirs::open(data_dir, &state.chat_agent_name) {
+        state.status = read_status(&dirs.status_path());
+        state.conversation = read_conversation(&dirs.conversation_path());
+        state.cost_usd = read_cost(&dirs.cost_path());
+        if let Some(snapshot) = read_spawn_snapshot(&dirs) {
+            state.model_id.clear();
+            state.model_id.push_str(snapshot.model());
+            state.persona_name = snapshot.persona_name;
+        }
+    }
     state.panopticon = read_panopticon_snapshot(data_dir, agent_registry_path, state.operator_id);
+}
+
+/// Read the spawn snapshot for the agent at `dirs.agent_toml_path()`.
+/// Returns `None` on any filesystem or parse error — the chat title bar
+/// keeps its previous persona/model labels rather than going blank.
+fn read_spawn_snapshot(dirs: &AgentDirs) -> Option<reeve_runtime::SpawnSnapshot> {
+    let body = std::fs::read_to_string(dirs.agent_toml_path()).ok()?;
+    toml::from_str(&body).ok()
 }
 
 // ── Event loop ────────────────────────────────────────────────────────────────
@@ -229,9 +229,17 @@ fn reload_state(
 ///
 /// # Parameters
 ///
-/// - `dirs`: the lead agent's filesystem layout; used for status / cost / conversation reads and inbox writes.
-/// - `registry`: the identity registry, used by [`submit_message`] to locate the operator identity.
-/// - `keystore`: the platform keystore, used by [`submit_message`] to retrieve the operator signing key.
+/// - `data_dir`: runtime data root. Per-agent `AgentDirs` are derived from
+///   here and the currently focused chat agent on every reload — switching
+///   the chat target is a state mutation, not a signature change.
+/// - `agent_registry_path`: agent registry TOML; drives the panopticon
+///   snapshot and resolves chat-resume targets at startup.
+/// - `session_path`: per-operator session memory file
+///   (`<state_dir>/session.toml`).
+/// - `registry`: the identity registry, used by [`submit_message`] to
+///   locate the operator identity.
+/// - `keystore`: the platform keystore, used by [`submit_message`] to
+///   retrieve the operator signing key.
 ///
 /// # Errors
 ///
@@ -241,18 +249,17 @@ fn reload_state(
 /// user — future iterations should show an inline error).
 #[expect(
     clippy::too_many_arguments,
-    reason = "run is the multi-screen TUI entry point and now also threads \
-              session-memory state (session_path) on top of the lead-chat \
-              data sources, panopticon data sources, and operator credentials. \
-              Bundling these into a context struct trades clarity for \
-              indirection at the only non-test call sites (cmd_attach and \
-              cmd_reeve in reeve-cli)."
+    reason = "run is the multi-screen TUI entry point and threads four \
+              filesystem roots, the operator credentials, plus an optional \
+              CLI-supplied chat target. Bundling into a context struct \
+              trades clarity for indirection at the only non-test call \
+              sites (cmd_reeve and cmd_attach in reeve-cli)."
 )]
 pub fn run(
-    dirs: &AgentDirs,
     data_dir: &Path,
     agent_registry_path: &Path,
     session_path: &Path,
+    initial_chat_agent: Option<&str>,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<(), TuiError> {
@@ -279,17 +286,35 @@ pub fn run(
     // worker/peer replies. If lookup fails the label falls back to a short
     // id, which is still better than the pre-attribution "you for everyone".
     state.operator_id = first_operator_id(registry);
-    // Pick the starting screen from session memory: chat when the last
-    // agent the operator was talking to is still running, panopticon
-    // otherwise (no session, agent gone, agent stopped). The default
-    // `Screen::Chat` on `AppState` is overridden here because the
-    // panopticon-as-home story applies at startup; the field's default
-    // exists for tests and constructed-in-place states.
-    state.screen = initial_screen_for_session(&session::read(session_path), agent_registry_path);
+    // Pick the starting screen + chat target from session memory: chat
+    // when the last agent the operator was talking to is still running,
+    // panopticon otherwise (no session, agent gone, agent stopped). The
+    // default `Screen::Chat` + `chat_agent_name = "lead"` on `AppState`
+    // are overridden here because the panopticon-as-home story applies
+    // at startup; the defaults exist for tests and constructed-in-place
+    // states.
+    if let Some(name) = initial_chat_agent {
+        // `reeve attach <name>` — explicit override; open that agent's
+        // chat unconditionally. Skips the session-memory consultation:
+        // the operator told us which chat they want, that's the chat
+        // they get.
+        state.chat_agent_name.clear();
+        state.chat_agent_name.push_str(name);
+        state.screen = Screen::Chat;
+    } else {
+        let session = session::read(session_path);
+        state.screen = initial_screen_for_session(&session, agent_registry_path);
+        if state.screen == Screen::Chat {
+            if let Some(name) = session.last_agent.as_deref() {
+                state.chat_agent_name.clear();
+                state.chat_agent_name.push_str(name);
+            }
+        }
+    }
 
     loop {
         if needs_reload.swap(false, Ordering::Acquire) {
-            reload_state(&mut state, dirs, data_dir, agent_registry_path);
+            reload_state(&mut state, data_dir, agent_registry_path);
         }
 
         terminal
@@ -309,7 +334,8 @@ pub fn run(
             match event::read().map_err(TuiError::Terminal)? {
                 Event::Key(key) => {
                     let prev_screen = state.screen;
-                    if handle_key(key, &mut state, dirs, registry, keystore)? {
+                    let prev_chat_agent = state.chat_agent_name.clone();
+                    if handle_key(key, &mut state, data_dir, registry, keystore)? {
                         // Record the chat target the operator was on when
                         // they quit, so the next launch can resume it.
                         // Quitting from the panopticon does not write
@@ -329,6 +355,13 @@ pub fn run(
                             agent_registry_path,
                             state.operator_id,
                         );
+                    }
+                    // Enter on a panopticon row may have swapped the chat
+                    // target. Trigger a reload so the next frame shows
+                    // the new agent's conversation/status/cost rather
+                    // than the previous one's.
+                    if state.chat_agent_name != prev_chat_agent {
+                        needs_reload.store(true, Ordering::Release);
                     }
                 }
                 Event::Mouse(mouse) => handle_mouse(mouse, &mut state),
@@ -371,7 +404,7 @@ fn handle_mouse(event: MouseEvent, state: &mut AppState) {
 fn handle_key(
     key: event::KeyEvent,
     state: &mut AppState,
-    dirs: &AgentDirs,
+    data_dir: &Path,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<bool, TuiError> {
@@ -403,7 +436,7 @@ fn handle_key(
     }
 
     match state.screen {
-        Screen::Chat => handle_key_chat(key, state, dirs, registry, keystore),
+        Screen::Chat => handle_key_chat(key, state, data_dir, registry, keystore),
         Screen::Panopticon => Ok(handle_key_panopticon(key, state)),
         Screen::Quarantine => Ok(handle_key_quarantine(key, state)),
     }
@@ -413,7 +446,7 @@ fn handle_key(
 fn handle_key_chat(
     key: event::KeyEvent,
     state: &mut AppState,
-    dirs: &AgentDirs,
+    data_dir: &Path,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<bool, TuiError> {
@@ -425,7 +458,7 @@ fn handle_key_chat(
 
     match (key.code, key.modifiers) {
         (KeyCode::Enter, KeyModifiers::NONE) => {
-            submit_input(state, dirs, registry, keystore)?;
+            submit_input(state, data_dir, registry, keystore)?;
         }
 
         (KeyCode::Backspace, _) => {
@@ -471,10 +504,25 @@ fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
         (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
             state.panopticon_focus_up();
         }
-        // Single-chat universe (Phase 6): close the panopticon and return
-        // to the existing chat regardless of which row was focused. Phase
-        // 7 will branch on the focused agent here.
-        (KeyCode::Enter, _) => state.screen = Screen::Chat,
+        // Open the focused agent's chat. Sets the chat target on `state`;
+        // the event loop notices the agent changed and triggers a reload
+        // so the chat shows the new agent's conversation rather than the
+        // previous one's. Defensive: if the focus index is out of range
+        // (empty registry, snapshot mid-refresh), leave the chat target
+        // alone and just switch screens — the chat keeps showing
+        // whatever was there before.
+        (KeyCode::Enter, _) => {
+            if let Some(agent) = state.panopticon.agents.get(state.panopticon_focus) {
+                state.chat_agent_name = agent.name.clone();
+                // Reset the input buffer + scroll so the operator does
+                // not accidentally send a message typed for one agent to
+                // a different one, and so the new agent's history opens
+                // at the latest entry.
+                state.set_input(String::new());
+                state.scroll_to_bottom();
+            }
+            state.screen = Screen::Chat;
+        }
         // `Q` opens the quarantine review. Phase 6 ships a stub renderer
         // that surfaces the existing quarantine count; Phase 8 fills in
         // the real per-message review UI. Crossterm typically delivers
@@ -506,14 +554,18 @@ fn handle_key_quarantine(key: event::KeyEvent, state: &mut AppState) -> bool {
     false
 }
 
-/// Submit the current input buffer and clear it.
+/// Submit the current input buffer to the active chat agent and clear it.
 ///
-/// If the buffer is empty or all-whitespace, does nothing.
-/// On submission error, the error propagates to the caller; future iterations
-/// could catch it and display an inline error message.
+/// `data_dir` + `state.chat_agent_name` resolve to the recipient's
+/// `AgentDirs`. Messages typed in the lead's chat go to the lead; messages
+/// typed after Enter-ing a worker row in the panopticon go to that worker.
+///
+/// If the buffer is empty or all-whitespace, does nothing. On submission
+/// error, the error propagates to the caller; future iterations could
+/// catch it and display an inline error message.
 fn submit_input(
     state: &mut AppState,
-    dirs: &AgentDirs,
+    data_dir: &Path,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<(), TuiError> {
@@ -521,7 +573,19 @@ fn submit_input(
     if payload.is_empty() {
         return Ok(());
     }
-    submit_message(&payload, dirs, registry, keystore).map_err(TuiError::Submit)?;
+    // AgentDirs::open is a path-construction call only — no I/O — so
+    // opening per submit is cheap. The agent name was validated when it
+    // was registered, so the only realistic failure mode is the agent
+    // being unregistered between Enter-ing the panopticon row and
+    // hitting Enter in chat; in that case the submit's inner reads
+    // (spawn snapshot, inbox path) surface a typed error.
+    let dirs = AgentDirs::open(data_dir, &state.chat_agent_name).map_err(|err| {
+        TuiError::Submit(crate::submit::SubmitError::Io {
+            path: data_dir.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, err.to_string()),
+        })
+    })?;
+    submit_message(&payload, &dirs, registry, keystore).map_err(TuiError::Submit)?;
     state.set_input(String::new());
     // Sending a message means the operator wants to see the reply; snap the
     // view back to the bottom so the response auto-scrolls into focus.
@@ -601,6 +665,50 @@ mod tests {
         let mut state = state_with_agents(2);
         assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
         assert_eq!(state.screen, Screen::Chat);
+    }
+
+    // A3b: Enter on a non-zero panopticon row sets `chat_agent_name` to
+    // that row's agent, so the chat opens for that agent rather than the
+    // lead. This is the Phase 6 done-when criterion "Enter on an agent
+    // row opens that agent's chat".
+    #[test]
+    fn handle_key_panopticon_enter_targets_focused_agent() {
+        let mut state = state_with_agents(3);
+        state.chat_agent_name = "lead".to_owned();
+        state.panopticon_focus = 2;
+        let expected = state.panopticon.agents[2].name.clone();
+        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert_eq!(state.screen, Screen::Chat);
+        assert_eq!(state.chat_agent_name, expected);
+    }
+
+    // A3c: Enter resets the input buffer and scroll on agent switch.
+    // Prevents the surprising case of typing a draft for one agent then
+    // accidentally sending it to a different one after navigating away.
+    #[test]
+    fn handle_key_panopticon_enter_resets_input_and_scroll() {
+        let mut state = state_with_agents(2);
+        state.set_input("half-typed message for agent-0".to_owned());
+        state.scroll_up(20);
+        state.panopticon_focus = 1;
+        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert!(state.input.is_empty(), "input should clear on switch");
+        assert!(
+            state.is_at_bottom(),
+            "scroll should snap to bottom on switch"
+        );
+    }
+
+    // A3d: Enter with an out-of-range focus index (transient empty
+    // snapshot) is defensive: switches screens but leaves the chat
+    // target unchanged.
+    #[test]
+    fn handle_key_panopticon_enter_with_empty_table_leaves_chat_target() {
+        let mut state = state_with_agents(0);
+        state.chat_agent_name = "lead".to_owned();
+        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert_eq!(state.screen, Screen::Chat);
+        assert_eq!(state.chat_agent_name, "lead");
     }
 
     // A4: unrelated keys are no-ops; focus and screen stay put.

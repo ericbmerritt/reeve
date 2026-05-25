@@ -51,8 +51,16 @@ enum Commands {
         #[command(subcommand)]
         command: daemon::DaemonSubcommand,
     },
-    /// Attach the TUI to the running daemon.
-    Attach,
+    /// Attach the TUI to the running daemon. With no agent name, follows
+    /// the session-memory logic (resumes the last-chatted agent, or
+    /// lands on the panopticon). With a name, opens that agent's chat
+    /// directly.
+    Attach {
+        /// Agent name from the registry (e.g. `lead`, `worker-abc12345`).
+        /// Use `reeve identity list` to inspect registered identities.
+        #[arg(value_name = "NAME")]
+        name: Option<String>,
+    },
     /// Send a signed message to a running agent by name, without attaching the
     /// TUI. The operator key signs the envelope; delivery uses the same
     /// `inbox/tmp` → `inbox/new` atomic-rename path the in-process dispatcher
@@ -132,7 +140,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) => cmd_envelope_verify(&file),
         Some(Commands::Adapter { command }) => adapter::dispatch(command),
         Some(Commands::Daemon { command }) => daemon::dispatch(&command),
-        Some(Commands::Attach) => cmd_attach(),
+        Some(Commands::Attach { name }) => cmd_attach(name.as_deref()),
         Some(Commands::Send { to, body }) => cmd_send(&to, &body),
     }
 }
@@ -191,15 +199,14 @@ fn cmd_reeve() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
     let session_path = reeve_tui::session::default_path(&state_dir);
     let keystore = Arc::new(keychain::open_platform_keystore()?);
     reeve_tui::app::run(
-        &dirs,
         &data_dir,
         &agent_registry_path,
         &session_path,
+        None,
         &registry,
         keystore.as_ref(),
     )
@@ -322,7 +329,7 @@ fn cmd_send(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn cmd_attach() -> Result<(), Box<dyn std::error::Error>> {
+fn cmd_attach(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
     let state_dir = reeve_runtime::runtime_lock::default_state_dir()?;
     if !reeve_tui::heartbeat_fresh(&state_dir) {
         writeln!(
@@ -333,15 +340,14 @@ fn cmd_attach() -> Result<(), Box<dyn std::error::Error>> {
     }
     let data_dir = IdentityRegistry::default_data_dir()?;
     let registry = IdentityRegistry::open(data_dir.clone())?;
-    let dirs = reeve_runtime::AgentDirs::open(&data_dir, "lead")?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
     let session_path = reeve_tui::session::default_path(&state_dir);
     let keystore = Arc::new(keychain::open_platform_keystore()?);
     reeve_tui::app::run(
-        &dirs,
         &data_dir,
         &agent_registry_path,
         &session_path,
+        name,
         &registry,
         keystore.as_ref(),
     )
