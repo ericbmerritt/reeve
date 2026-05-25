@@ -60,6 +60,60 @@ pub fn read_conversation(conv_path: &Path) -> Vec<ConversationEntry> {
         .collect()
 }
 
+/// Read at most the last `tail_bytes` of `conv_path` and parse the
+/// complete JSONL lines found there.
+///
+/// Cost-bounded variant of [`read_conversation`] for callers that only
+/// need a small tail (the panopticon shows ~16 events per agent). With N
+/// agents this caps per-tick IO at `N × tail_bytes` regardless of how
+/// chatty an individual conversation gets, so the snapshot reader does
+/// not regress to O(total-history) IO as the runtime grows.
+///
+/// If the file is smaller than `tail_bytes`, reads the whole file. If the
+/// requested tail straddles a line boundary, the first (likely partial)
+/// line is discarded — only complete lines after the first newline are
+/// parsed.
+///
+/// File-open or read errors return an empty `Vec` (consistent with
+/// [`read_conversation`]); the screen stays renderable during transient
+/// filesystem hiccups.
+#[must_use]
+pub fn read_conversation_tail(conv_path: &Path, tail_bytes: u64) -> Vec<ConversationEntry> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let Ok(mut file) = std::fs::File::open(conv_path) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Vec::new();
+    };
+    let len = metadata.len();
+    let offset = len.saturating_sub(tail_bytes);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(tail_bytes.min(len)).unwrap_or(0));
+    if file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+
+    // Drop the first (possibly partial) line when we did not start at the
+    // beginning of the file. If the file fit entirely in `tail_bytes`, the
+    // first line is complete and stays.
+    let slice: &[u8] = if offset == 0 {
+        &bytes
+    } else {
+        match bytes.iter().position(|b| *b == b'\n') {
+            Some(i) => &bytes[i + 1..],
+            None => return Vec::new(), // no complete line in the window
+        }
+    };
+    let text = String::from_utf8_lossy(slice);
+    text.lines()
+        .filter_map(|line| parse_conversation_line(line.trim()))
+        .collect()
+}
+
 /// Parse one JSONL line into a [`ConversationEntry`], returning `None` to skip.
 fn parse_conversation_line(line: &str) -> Option<ConversationEntry> {
     if line.is_empty() {
@@ -373,5 +427,69 @@ mod tests {
         let entries = read_conversation(&path);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "ok");
+    }
+
+    // R15: read_conversation_tail returns the last K complete lines from a
+    // long file; the first (partial) line inside the tail window is
+    // discarded. This is the contract the panopticon's per-tick IO budget
+    // depends on.
+    #[test]
+    fn read_conversation_tail_returns_only_lines_after_first_newline() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conversation.jsonl");
+        // Twenty lines, each ~80 bytes. Total ~1.6 KB.
+        let lines: Vec<String> = (0..20)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"system","message":"line {i:02}","timestamp_utc":"2024-01-01T00:00:00Z"}}"#,
+                )
+            })
+            .collect();
+        let mut body = lines.join("\n");
+        body.push('\n');
+        fs::write(&path, &body).unwrap();
+        // Tail window much smaller than the file forces the partial-first-line
+        // drop path.
+        let entries = read_conversation_tail(&path, 200);
+        assert!(!entries.is_empty(), "tail must return at least one line");
+        assert!(
+            entries.len() < 20,
+            "tail must skip lines that fell outside the window; got {}",
+            entries.len()
+        );
+        // The last entry should always be the last full line in the file.
+        assert_eq!(entries.last().unwrap().text, "line 19");
+        // First entry must NOT be `line 00` (that line is outside the tail
+        // window); the partial line at the window's start was discarded.
+        assert_ne!(entries.first().unwrap().text, "line 00");
+    }
+
+    // R16: when the file fits in the tail window, every line is returned.
+    // The partial-first-line discard only fires when the seek was non-zero.
+    #[test]
+    fn read_conversation_tail_returns_everything_when_file_fits() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("conversation.jsonl");
+        let body = concat!(
+            r#"{"type":"system","message":"first","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            "\n",
+            r#"{"type":"system","message":"second","timestamp_utc":"2024-01-01T00:00:00Z"}"#,
+            "\n",
+        );
+        fs::write(&path, body).unwrap();
+        let entries = read_conversation_tail(&path, 8192);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].text, "first");
+        assert_eq!(entries[1].text, "second");
+    }
+
+    // R17: missing file returns empty, matching the safe-default contract
+    // every other reader in this crate honours.
+    #[test]
+    fn read_conversation_tail_missing_file_returns_empty() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("does_not_exist.jsonl");
+        let entries = read_conversation_tail(&path, 8192);
+        assert!(entries.is_empty());
     }
 }

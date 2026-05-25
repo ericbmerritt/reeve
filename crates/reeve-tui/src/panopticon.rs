@@ -36,7 +36,7 @@ use time::OffsetDateTime;
 use reeve_runtime::{AgentDirs, AgentRegistry};
 use reeve_types::IdentityId;
 
-use crate::reader::{read_conversation, read_cost, read_status};
+use crate::reader::{read_conversation_tail, read_cost, read_status};
 use crate::state::{AgentStatus, EntryKind};
 
 /// Display label rendered for [`Source::Operator`] in the events stream.
@@ -52,6 +52,13 @@ const MAX_RECENT_EVENTS: usize = 32;
 /// Capped so a chatty agent does not dominate the merge — the final list is
 /// sorted across all agents and truncated to [`MAX_RECENT_EVENTS`].
 const PER_AGENT_TAIL: usize = 16;
+
+/// Bytes of `conversation.jsonl` to tail-read per agent during a snapshot.
+/// At ~500 bytes per JSONL line that's ~16 entries — enough to fill
+/// [`PER_AGENT_TAIL`] without reading more. The size of an N-agent
+/// snapshot is therefore `O(N × CONVERSATION_TAIL_BYTES)` regardless of
+/// how long any individual conversation has grown.
+const CONVERSATION_TAIL_BYTES: u64 = 8 * 1024;
 
 // ── View-model types ──────────────────────────────────────────────────────────
 
@@ -196,8 +203,10 @@ pub struct AgentInputs {
     /// [`read_snapshot`]. `None` when unavailable.
     pub state_changed_at: Option<OffsetDateTime>,
     /// Already-parsed conversation entries (output of
-    /// [`crate::reader::read_conversation`]) — the builder maps these into
-    /// [`RecentEvent`] values for the merged stream.
+    /// [`crate::reader::read_conversation_tail`]) — the builder maps these
+    /// into [`RecentEvent`] values for the merged stream. Bounded in size
+    /// per agent so an N-agent snapshot stays O(N) in IO regardless of
+    /// individual conversation length.
     pub conversation_tail: Vec<crate::state::ConversationEntry>,
 }
 
@@ -387,7 +396,8 @@ pub fn read_snapshot(
         let status = read_status(&status_path);
         let state_changed_at = read_status_mtime(&status_path);
         let cost_usd = read_cost(&dirs.cost_path());
-        let conversation = read_conversation(&dirs.conversation_path());
+        let conversation =
+            read_conversation_tail(&dirs.conversation_path(), CONVERSATION_TAIL_BYTES);
 
         let is_running = matches!(record.status, reeve_runtime::AgentStatus::Running);
 

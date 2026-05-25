@@ -1,10 +1,15 @@
-//! Notify-based filesystem watcher for the lead agent directory.
+//! Notify-based filesystem watcher.
 //!
-//! `watch_agent_dir` starts a recursive watcher on `agents/lead/` and calls
-//! `on_change` at most once per 250 ms window — a debounce that prevents the
-//! renderer from reloading state on every individual file event during a burst
-//! write (e.g., a model call that updates status, cost, and conversation in
-//! rapid succession).
+//! [`watch_tree`] starts a recursive watcher rooted at the given path and
+//! calls `on_change` at most once per 250 ms window — a debounce that
+//! prevents the renderer from reloading state on every individual file
+//! event during a burst write (e.g., a model call that updates status,
+//! cost, and conversation in rapid succession).
+//!
+//! A single recursive watch on `<data_dir>/agents/` covers every per-agent
+//! directory plus the agent-registry TOML — no per-agent watch bookkeeping,
+//! and `inotify` (or `kqueue` / `FSEvents`) accounting stays at one watch
+//! regardless of how many agents the operator has spawned.
 //!
 //! The watcher is dropped when the returned [`notify::RecommendedWatcher`] is
 //! dropped, which also terminates the debounce thread.
@@ -18,8 +23,8 @@ use notify::{RecursiveMode, Watcher as _};
 /// Debounce window: accumulate events, then fire the callback once.
 const DEBOUNCE_WINDOW: Duration = Duration::from_millis(250);
 
-/// Watch `agent_dir` for any file changes and call `on_change` at most once
-/// per 250 ms.
+/// Watch `root` recursively for any file changes and call `on_change` at
+/// most once per 250 ms.
 ///
 /// Returns the watcher handle. The caller must keep it alive for as long as
 /// watching should continue; dropping it stops the watcher and terminates
@@ -28,9 +33,9 @@ const DEBOUNCE_WINDOW: Duration = Duration::from_millis(250);
 /// # Errors
 ///
 /// Returns a `notify::Error` when the watcher cannot be created or the watch
-/// path cannot be registered (e.g., `agent_dir` does not exist).
-pub fn watch_agent_dir(
-    agent_dir: &Path,
+/// path cannot be registered (e.g., `root` does not exist).
+pub fn watch_tree(
+    root: &Path,
     on_change: impl Fn() + Send + 'static,
 ) -> Result<notify::RecommendedWatcher, notify::Error> {
     let (tx, rx) = mpsc::channel::<()>();
@@ -50,7 +55,7 @@ pub fn watch_agent_dir(
         }
     })?;
 
-    watcher.watch(agent_dir, RecursiveMode::Recursive)?;
+    watcher.watch(root, RecursiveMode::Recursive)?;
     Ok(watcher)
 }
 

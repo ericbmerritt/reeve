@@ -40,7 +40,7 @@ use crate::panopticon::read_snapshot as read_panopticon_snapshot;
 use crate::reader::{read_conversation, read_cost, read_status};
 use crate::state::{AppState, Screen};
 use crate::submit::submit_message;
-use crate::watcher::watch_agent_dir;
+use crate::watcher::watch_tree;
 
 /// Poll timeout for crossterm events. The loop also reacts to watcher signals,
 /// so this just sets the maximum latency between a watcher event and a redraw.
@@ -191,8 +191,14 @@ pub fn run(
     let needs_reload = Arc::new(AtomicBool::new(true)); // true = load immediately on start
     let needs_reload_clone = Arc::clone(&needs_reload);
 
-    // Kept alive until run() returns.
-    let _watcher = watch_agent_dir(dirs.root(), move || {
+    // Watch the full `<data_dir>/agents/` tree so the panopticon sees
+    // worker transitions (status/cost/conversation changes in any agent's
+    // dir) and registry changes (a new spawn rewrites
+    // `agents/registry.toml`). One recursive watch covers every agent
+    // regardless of count — no inotify accounting per agent. Kept alive
+    // until run() returns.
+    let agents_root = data_dir.join("agents");
+    let _watcher = watch_tree(&agents_root, move || {
         needs_reload_clone.store(true, Ordering::Release);
     })
     .map_err(TuiError::Watcher)?;
