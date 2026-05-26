@@ -115,14 +115,12 @@ fn build_title_bar(snap: &PanopticonSnapshot) -> Line<'static> {
 
 // ── Section headers ─────────────────────────────────────────────────────────
 
-/// Build a section header: `─ label ──────────`. Used for `agents`,
-/// `recent events`. The pending-decisions header includes the empty-state
-/// suffix — see [`build_pending_header`].
+/// Local thin wrapper around [`crate::ui_common::build_section_header`]
+/// so existing call sites keep their unqualified name. The shared
+/// helper was lifted to `ui_common` when the quarantine screen needed
+/// the same `─ label ──────────` shape.
 fn build_section_header(label: &str, width: u16) -> Line<'static> {
-    let lead = format!("\u{2500} {label} ");
-    let pad = usize::from(width).saturating_sub(lead.chars().count());
-    let rule: String = "\u{2500}".repeat(pad);
-    Line::from(format!("{lead}{rule}"))
+    crate::ui_common::build_section_header(label, width)
 }
 
 /// Build the pending-decisions header — explicit `── none ──` in Phase 6

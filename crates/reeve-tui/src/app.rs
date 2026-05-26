@@ -211,6 +211,22 @@ fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Pat
         }
     }
     state.panopticon = read_panopticon_snapshot(data_dir, agent_registry_path, state.operator_id);
+    // The quarantine snapshot is rebuilt on every reload so the
+    // panopticon's queue count and the review screen's entry list stay
+    // in sync. The reader walks every agent's `inbox/quarantine/`
+    // directory and tolerates missing/unreadable directories silently
+    // (see `quarantine_view::read_files`), so this is safe to run even
+    // when the operator has never opened the review screen.
+    state.quarantine = crate::quarantine_view::read_snapshot(data_dir);
+    // Discard or watcher activity can shrink the entry list out from
+    // under a stale focus index. Clamp here, in the reload, rather
+    // than at every render-site read.
+    let entry_count = state.quarantine.entries.len();
+    if entry_count == 0 {
+        state.quarantine_focus = 0;
+    } else if state.quarantine_focus >= entry_count {
+        state.quarantine_focus = entry_count - 1;
+    }
 }
 
 /// Resolve the agent whose disk state should populate the per-agent
@@ -344,8 +360,9 @@ pub fn run(
                     crate::ui_panopticon::draw(frame, &state.panopticon, state.panopticon_focus);
                 }
                 Screen::Inspect => crate::ui_inspect::draw(frame, &state),
-                Screen::Quarantine => {
-                    crate::ui_quarantine::draw(frame, &state.panopticon);
+                Screen::Quarantine => crate::ui_quarantine::draw(frame, &state),
+                Screen::QuarantineCompose => {
+                    crate::ui_quarantine::draw_compose(frame, &state);
                 }
             })
             .map_err(TuiError::Terminal)?;
@@ -454,7 +471,14 @@ fn handle_key(
             // the global Tab handler defers to handle_key_inspect.
             match state.screen {
                 Screen::Chat | Screen::Panopticon => state.toggle_screen(),
-                Screen::Quarantine => state.screen = Screen::Panopticon,
+                // Tab from Quarantine/QuarantineCompose pops back to
+                // panopticon. QuarantineCompose is a modal; Tab cancels
+                // the compose and goes to the quarantine list's parent
+                // rather than staying in the review screen.
+                Screen::Quarantine | Screen::QuarantineCompose => {
+                    quarantine_compose_cancel(state);
+                    state.screen = Screen::Panopticon;
+                }
                 Screen::Inspect => return Ok(handle_key_inspect(key, state)),
             }
             return Ok(false);
@@ -464,10 +488,14 @@ fn handle_key(
                 Screen::Chat => return Ok(true),
                 Screen::Panopticon => state.screen = Screen::Chat,
                 // Inspect and Quarantine both pop one level back to the
-                // panopticon (their conceptual parent). Sharing the arm
-                // matches their navigation semantics; if either grows a
-                // distinct Esc behaviour later, split the arm then.
+                // panopticon.
                 Screen::Inspect | Screen::Quarantine => state.screen = Screen::Panopticon,
+                // Esc from the compose surface cancels without sending
+                // and returns to the quarantine review list.
+                Screen::QuarantineCompose => {
+                    quarantine_compose_cancel(state);
+                    state.screen = Screen::Quarantine;
+                }
             }
             return Ok(false);
         }
@@ -479,6 +507,9 @@ fn handle_key(
         Screen::Panopticon => Ok(handle_key_panopticon(key, state)),
         Screen::Inspect => Ok(handle_key_inspect(key, state)),
         Screen::Quarantine => Ok(handle_key_quarantine(key, state)),
+        Screen::QuarantineCompose => {
+            handle_key_quarantine_compose(key, state, data_dir, registry, keystore)
+        }
     }
 }
 
@@ -630,23 +661,162 @@ fn handle_key_inspect(key: event::KeyEvent, state: &mut AppState) -> bool {
     false
 }
 
-/// Quarantine-screen key bindings. Today's stub has nothing screen-local
-/// to do — the global `Esc`/`Tab`/`q` handler already covers back-to-
-/// panopticon and quit. `Q` here is an explicit close-and-return so the
-/// operator can toggle the screen with the same key that opened it.
-/// Phase 8 fills in approve/release/discard actions here.
-#[expect(
-    clippy::single_match,
-    reason = "match shape pre-claimed for Phase 8 approve/release/discard \
-              arms; converting to `if let` now would just have to be \
-              reverted when those land."
-)]
+/// Quarantine-screen key bindings.
+///
+/// - `j`/`k` (and Down/Up arrows) navigate the entry list.
+/// - `d` (first press): enter discard-confirm mode. The renderer
+///   replaces the footer with a prompt so the operator sees the
+///   pending action.
+/// - `d` or `y` (second press, confirm mode): delete the quarantine
+///   file at the focused entry's path. The file removal is fire-and-
+///   forget — the recursive watcher picks up the `inotify`/`FSEvents`
+///   deletion event within the 250 ms debounce window and triggers a
+///   full reload, which clamps the focus index and refreshes the list.
+/// - Any other key while in confirm mode: cancel without deleting.
+/// - `Q`: close quarantine and return to panopticon.
+/// - `o`: begin convert flow (opens the compose sub-surface).
+/// - `Esc`, `Tab`, `q` are handled by the global dispatcher before
+///   this function is called and are never received here.
 fn handle_key_quarantine(key: event::KeyEvent, state: &mut AppState) -> bool {
+    // Confirm-discard mode: the next `d` or `y` executes the delete;
+    // any other key cancels. Clear first so the `d` arm below can
+    // branch on whether it was the FIRST or SECOND `d` press.
+    if state.quarantine_confirm_discard {
+        match (key.code, key.modifiers) {
+            (KeyCode::Char('d' | 'y'), _) => {
+                if let Some(entry) = state.quarantine.entries.get(state.quarantine_focus) {
+                    // Fire-and-forget: watcher drives the list refresh.
+                    let _ = std::fs::remove_file(&entry.path);
+                }
+                state.quarantine_confirm_discard = false;
+            }
+            // `Q` while confirming: cancel the confirm AND leave to the
+            // panopticon, so Q always means "close quarantine" regardless
+            // of pending confirm state.
+            (KeyCode::Char('Q'), _) => {
+                state.quarantine_confirm_discard = false;
+                state.screen = Screen::Panopticon;
+            }
+            _ => {
+                state.quarantine_confirm_discard = false;
+            }
+        }
+        return false;
+    }
+
     match (key.code, key.modifiers) {
-        (KeyCode::Char('Q'), _) => state.screen = Screen::Panopticon,
+        (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+            state.quarantine_focus_down();
+        }
+        (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+            state.quarantine_focus_up();
+        }
+        (KeyCode::Char('d'), _) if !state.quarantine.entries.is_empty() => {
+            state.quarantine_confirm_discard = true;
+        }
+        (KeyCode::Char('o'), _) => {
+            let _ = handle_quarantine_convert(key, state);
+        }
+        (KeyCode::Char('Q'), _) => {
+            state.quarantine_confirm_discard = false;
+            state.screen = Screen::Panopticon;
+        }
         _ => {}
     }
     false
+}
+
+/// Open the quarantine compose surface for the focused entry.
+/// Pre-fills the input buffer with the raw body and records the
+/// recipient so the submit path knows who to address the new envelope
+/// to. `Esc` cancels and returns to the quarantine list; `Tab` cancels
+/// and returns to the panopticon (per the global Tab handler). `Enter`
+/// submits a fresh operator-signed envelope and returns to the quarantine
+/// list.
+fn handle_quarantine_convert(_key: event::KeyEvent, state: &mut AppState) -> bool {
+    let Some(entry) = state.quarantine.entries.get(state.quarantine_focus) else {
+        return false;
+    };
+    let recipient = entry.recipient.clone();
+    let body = entry.raw_body.clone();
+    state.quarantine_compose_recipient = recipient;
+    state.set_input(body);
+    state.quarantine_confirm_discard = false;
+    state.screen = Screen::QuarantineCompose;
+    false
+}
+
+/// Reset compose state without submitting.
+fn quarantine_compose_cancel(state: &mut AppState) {
+    state.set_input(String::new());
+    state.quarantine_compose_recipient.clear();
+}
+
+/// Compose-surface key bindings: typing, backspace, Enter to submit.
+///
+/// `Enter` delivers a new operator-signed envelope to
+/// `state.quarantine_compose_recipient`. The original quarantine file
+/// is NOT deleted — it stays as the audit record. Esc and Tab are
+/// handled by the global dispatcher before reaching here and switch the
+/// screen back to `Screen::Quarantine`.
+fn handle_key_quarantine_compose(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    data_dir: &Path,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<bool, TuiError> {
+    match (key.code, key.modifiers) {
+        (KeyCode::Enter, KeyModifiers::NONE) => {
+            submit_quarantine_compose(state, data_dir, registry, keystore)?;
+            state.screen = Screen::Quarantine;
+        }
+        (KeyCode::Backspace, _) => {
+            let mut s = state.input.clone();
+            if !s.is_empty() {
+                let trim_pos = s.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                s.truncate(trim_pos);
+            }
+            state.set_input(s);
+        }
+        (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            let mut s = state.input.clone();
+            s.push(c);
+            state.set_input(s);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Submit the compose buffer as a new operator-signed envelope to the
+/// quarantine compose recipient. On empty/whitespace input does nothing
+/// (identical to `submit_input` for the chat screen). The original
+/// quarantine file is intentionally not touched — it stays as the
+/// audit record for the blocked message.
+fn submit_quarantine_compose(
+    state: &mut AppState,
+    data_dir: &Path,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<(), TuiError> {
+    let payload = state.input.trim().to_owned();
+    if payload.is_empty() {
+        return Ok(());
+    }
+    let recipient = state.quarantine_compose_recipient.clone();
+    if recipient.is_empty() {
+        return Ok(());
+    }
+    let dirs = AgentDirs::open(data_dir, &recipient).map_err(|err| {
+        TuiError::Submit(crate::submit::SubmitError::Io {
+            path: data_dir.to_path_buf(),
+            source: io::Error::new(io::ErrorKind::InvalidInput, err.to_string()),
+        })
+    })?;
+    submit_message(&payload, &dirs, registry, keystore).map_err(TuiError::Submit)?;
+    quarantine_compose_cancel(state);
+    Ok(())
 }
 
 /// Submit the current input buffer to the active chat agent and clear it.
@@ -1244,5 +1414,229 @@ mod tests {
             registry,
             reeve_runtime::keychain::memory::MemoryKeyStore::new(),
         )
+    }
+
+    // ── Quarantine key bindings ───────────────────────────────────────
+
+    fn quarantine_state(entries: Vec<crate::quarantine_view::QuarantineEntry>) -> AppState {
+        let mut state = AppState::default();
+        state.screen = Screen::Quarantine;
+        state.quarantine = crate::quarantine_view::QuarantineSnapshot {
+            entries,
+            truncated: false,
+        };
+        state
+    }
+
+    fn fake_entry(name: &str, reason: &str) -> crate::quarantine_view::QuarantineEntry {
+        crate::quarantine_view::QuarantineEntry {
+            path: std::path::PathBuf::from(format!("/x/{name}.{reason}")),
+            recipient: name.to_owned(),
+            arrived: None,
+            reason: reason.to_owned(),
+            meta: crate::quarantine_view::EnvelopeMeta::ParseFailure {
+                filename: format!("{name}.{reason}"),
+            },
+            raw_body: format!("body for {name}"),
+            body_lossy: false,
+        }
+    }
+
+    // QK1: j/k and arrow keys navigate with clamping — no underflow
+    // or overflow.
+    #[test]
+    fn quarantine_j_k_navigate_with_clamp() {
+        let mut state = quarantine_state(vec![
+            fake_entry("a", "replay"),
+            fake_entry("b", "clock_skew"),
+        ]);
+        assert!(!handle_key_quarantine(key(KeyCode::Char('j')), &mut state));
+        assert_eq!(state.quarantine_focus, 1);
+        assert!(!handle_key_quarantine(key(KeyCode::Char('j')), &mut state));
+        assert_eq!(state.quarantine_focus, 1, "clamps at last");
+        assert!(!handle_key_quarantine(key(KeyCode::Char('k')), &mut state));
+        assert_eq!(state.quarantine_focus, 0);
+        assert!(!handle_key_quarantine(key(KeyCode::Char('k')), &mut state));
+        assert_eq!(state.quarantine_focus, 0, "clamps at zero");
+    }
+
+    // QK2: first `d` sets confirm_discard; second `d` removes the
+    // quarantine file. Since we use a fake in-memory path, the remove
+    // will Err, which is ignored — what we test is that the state
+    // transitions are correct (confirm cleared, focus unchanged).
+    #[test]
+    fn quarantine_d_first_sets_confirm_second_clears() {
+        let mut state = quarantine_state(vec![fake_entry("lead", "signature_invalid")]);
+        // First d → enter confirm mode.
+        assert!(!handle_key_quarantine(key(KeyCode::Char('d')), &mut state));
+        assert!(
+            state.quarantine_confirm_discard,
+            "confirm not set after first d"
+        );
+        // Second d → attempt delete (ignored) and clear confirm.
+        assert!(!handle_key_quarantine(key(KeyCode::Char('d')), &mut state));
+        assert!(
+            !state.quarantine_confirm_discard,
+            "confirm not cleared after second d"
+        );
+    }
+
+    // QK3: any key other than d/y cancels confirm without deleting.
+    #[test]
+    fn quarantine_non_confirm_key_cancels_discard() {
+        let mut state = quarantine_state(vec![fake_entry("lead", "replay")]);
+        handle_key_quarantine(key(KeyCode::Char('d')), &mut state);
+        assert!(state.quarantine_confirm_discard);
+        handle_key_quarantine(key(KeyCode::Char('k')), &mut state);
+        assert!(!state.quarantine_confirm_discard, "k should cancel confirm");
+        assert_eq!(state.quarantine_focus, 0, "focus unchanged on cancel");
+    }
+
+    // QK4: `d` on an empty list is a no-op — confirm does not arm
+    // when there is nothing to discard.
+    #[test]
+    fn quarantine_d_on_empty_list_is_noop() {
+        let mut state = quarantine_state(Vec::new());
+        handle_key_quarantine(key(KeyCode::Char('d')), &mut state);
+        assert!(!state.quarantine_confirm_discard);
+    }
+
+    // QK5: `Q` returns to the panopticon and clears any pending confirm.
+    #[test]
+    fn quarantine_q_returns_to_panopticon_and_clears_confirm() {
+        let mut state = quarantine_state(vec![fake_entry("lead", "replay")]);
+        state.quarantine_confirm_discard = true;
+        handle_key_quarantine(key(KeyCode::Char('Q')), &mut state);
+        assert_eq!(state.screen, Screen::Panopticon);
+        assert!(!state.quarantine_confirm_discard);
+    }
+
+    // QK6: `o` on a focused entry opens the compose surface and
+    // pre-fills the input buffer with the entry's raw body.
+    #[test]
+    fn quarantine_o_opens_compose_with_prefilled_body() {
+        let mut state = quarantine_state(vec![fake_entry("lead", "signature_invalid")]);
+        handle_key_quarantine(key(KeyCode::Char('o')), &mut state);
+        assert_eq!(state.screen, Screen::QuarantineCompose);
+        assert_eq!(
+            state.quarantine_compose_recipient, "lead",
+            "recipient not set"
+        );
+        assert_eq!(
+            state.input, "body for lead",
+            "input not pre-filled with entry body"
+        );
+    }
+
+    // QK7: Esc from the compose surface cancels without sending —
+    // input is cleared and we return to Screen::Quarantine.
+    #[test]
+    fn quarantine_compose_esc_cancels() {
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = quarantine_state(vec![fake_entry("lead", "replay")]);
+        state.screen = Screen::QuarantineCompose;
+        state.quarantine_compose_recipient = "lead".to_owned();
+        state.set_input("some draft text".to_owned());
+
+        let was_exit = handle_key(
+            key(KeyCode::Esc),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!was_exit);
+        assert_eq!(state.screen, Screen::Quarantine);
+        assert!(state.input.is_empty(), "input must be cleared on cancel");
+        assert!(state.quarantine_compose_recipient.is_empty());
+    }
+
+    // QK8: discard-then-reload path — after a file is deleted the
+    // reload should clamp focus to the new (shorter) list. The
+    // reload_state tests cover this via RS3 (the focus-clamp in
+    // reload_state). This test verifies the full round-trip through
+    // the disk fixture: seed a real file, run handle_key_quarantine
+    // twice (d, d), confirm file is gone.
+    #[test]
+    fn quarantine_discard_deletes_real_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qdir = tmp
+            .path()
+            .join("agents")
+            .join("lead")
+            .join("inbox")
+            .join("quarantine");
+        std::fs::create_dir_all(&qdir).unwrap();
+        let file_path = qdir.join("abc.signature_invalid");
+        std::fs::write(&file_path, b"not json").unwrap();
+
+        let mut state = AppState::default();
+        state.screen = Screen::Quarantine;
+        state.quarantine = crate::quarantine_view::read_snapshot(tmp.path());
+        state.quarantine_focus = 0;
+        assert_eq!(state.quarantine.entries.len(), 1, "seeded one entry");
+
+        // First d: arm confirm.
+        handle_key_quarantine(key(KeyCode::Char('d')), &mut state);
+        assert!(state.quarantine_confirm_discard);
+        // Second d: delete.
+        handle_key_quarantine(key(KeyCode::Char('d')), &mut state);
+        assert!(!state.quarantine_confirm_discard);
+        assert!(!file_path.exists(), "quarantine file should be deleted");
+    }
+
+    // QK9: replay-ledger preservation — the TUI discard must not touch
+    // `replay-ledger.jsonl`. The watcher's verify pipeline writes the
+    // replay entry before making the quarantine decision, so the entry
+    // is already durable when the file lands in quarantine/. Discarding
+    // only removes the quarantine file; the ledger entry stays, blocking
+    // any future re-delivery of the same (sender_id, message_id, nonce).
+    //
+    // This is the Phase 8 done-when integration-test requirement:
+    // "The replay ledger entry for a discarded message prevents re-delivery
+    // if the same message_id is submitted again."
+    //
+    // The full replay-pipeline assertion is in
+    // `reeve-runtime::verify::tests::replay_second_call_yields_quarantine`.
+    // This test covers the TUI side: discard must scope its delete to the
+    // single quarantine file, leaving the ledger untouched.
+    #[test]
+    fn quarantine_discard_preserves_replay_ledger() {
+        let tmp = tempfile::tempdir().unwrap();
+        let qdir = tmp
+            .path()
+            .join("agents")
+            .join("lead")
+            .join("inbox")
+            .join("quarantine");
+        std::fs::create_dir_all(&qdir).unwrap();
+        let qfile = qdir.join("abc.signature_invalid");
+        std::fs::write(&qfile, b"not json").unwrap();
+
+        // Simulate the runtime having written a replay-ledger entry when
+        // the envelope first arrived.
+        let ledger_path = tmp.path().join("replay-ledger.jsonl");
+        let ledger_entry = r#"{"sender_id":"00000000-0000-7000-8000-000000000001","message_id":"00000000-0000-7000-8000-000000000002","nonce":"AAAAAAAAAAAAAAAAAAAAAA==","observed_at":"2026-01-01T00:00:00Z"}"#;
+        std::fs::write(&ledger_path, format!("{ledger_entry}\n")).unwrap();
+
+        let mut state = AppState::default();
+        state.screen = Screen::Quarantine;
+        state.quarantine = crate::quarantine_view::read_snapshot(tmp.path());
+        state.quarantine_focus = 0;
+
+        // Discard the quarantine file.
+        handle_key_quarantine(key(KeyCode::Char('d')), &mut state);
+        handle_key_quarantine(key(KeyCode::Char('d')), &mut state);
+
+        assert!(!qfile.exists(), "quarantine file must be deleted");
+        assert!(ledger_path.exists(), "replay ledger must NOT be deleted");
+        let ledger_after = std::fs::read_to_string(&ledger_path).unwrap();
+        assert_eq!(
+            ledger_after,
+            format!("{ledger_entry}\n"),
+            "replay ledger content must be unchanged after discard"
+        );
     }
 }

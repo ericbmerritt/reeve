@@ -10,6 +10,7 @@ use reeve_types::IdentityId;
 use time::OffsetDateTime;
 
 use crate::panopticon::PanopticonSnapshot;
+use crate::quarantine_view::QuarantineSnapshot;
 
 // ── EntryKind ─────────────────────────────────────────────────────────────────
 
@@ -115,12 +116,16 @@ pub enum Screen {
     /// agent is `AppState::inspect_agent_name`, set by `Enter` on the
     /// focused panopticon row.
     Inspect,
-    /// Quarantine review. Phase 6 ships a stub renderer that surfaces the
-    /// per-agent quarantine count from the panopticon snapshot and a note
-    /// that the full review UI lands in Phase 8. The Screen variant exists
-    /// so the panopticon's `Q` keybinding has a real target and Phase 8
-    /// can fill in the renderer without touching the dispatch path.
+    /// Quarantine review — list of failed envelopes with discard and
+    /// convert actions.
     Quarantine,
+    /// Compose surface for the quarantine `o` (convert) flow. A
+    /// text-editing pane pre-filled with the quarantined body; Enter
+    /// submits a new operator-signed envelope to the same recipient,
+    /// Esc/Tab cancel without sending. The compose buffer lives in
+    /// `AppState::input`/`cursor_pos`; the target recipient is in
+    /// `AppState::quarantine_compose_recipient`.
+    QuarantineCompose,
 }
 
 // ── InspectTab ────────────────────────────────────────────────────────────────
@@ -248,6 +253,24 @@ pub struct AppState {
     /// Active tab on the inspect screen. `Tab`/`Shift+Tab` and `1-5`
     /// cycle this; the renderer dispatches body content based on it.
     pub inspect_tab: InspectTab,
+    /// View-model for the quarantine review screen. Empty until the
+    /// operator opens the screen (`Q` from panopticon) and the reload
+    /// loop populates it from `<data_dir>/agents/*/inbox/quarantine/`.
+    pub quarantine: QuarantineSnapshot,
+    /// Cursor position in the quarantine review's entry list.
+    /// `j`/`k` adjust; clamped against `quarantine.entries.len()` at
+    /// dispatch and at render time.
+    pub quarantine_focus: usize,
+    /// Discard confirmation state. `Some` once the operator hits `d`
+    /// on a focused entry; the next keystroke either confirms
+    /// (`d` again, or `y`) and deletes the file, or cancels (any
+    /// other key). Cleared on confirm or cancel.
+    pub quarantine_confirm_discard: bool,
+    /// Role name of the agent the quarantine compose surface will send to.
+    /// Set when the operator presses `o` on a quarantine entry; the
+    /// compose screen submits to this agent's inbox. Empty string when
+    /// no compose is in progress.
+    pub quarantine_compose_recipient: String,
 }
 
 impl AppState {
@@ -310,6 +333,10 @@ impl Default for AppState {
             panopticon_focus: 0,
             inspect_agent_name: None,
             inspect_tab: InspectTab::Thread,
+            quarantine: QuarantineSnapshot::default(),
+            quarantine_focus: 0,
+            quarantine_confirm_discard: false,
+            quarantine_compose_recipient: String::new(),
         }
     }
 }
@@ -354,7 +381,10 @@ impl AppState {
                 self.panopticon_focus = 0;
                 Screen::Panopticon
             }
-            Screen::Panopticon | Screen::Quarantine | Screen::Inspect => Screen::Chat,
+            Screen::Panopticon
+            | Screen::Quarantine
+            | Screen::Inspect
+            | Screen::QuarantineCompose => Screen::Chat,
         };
     }
 
@@ -373,6 +403,24 @@ impl AppState {
         let max = len.saturating_sub(1);
         if self.panopticon_focus < max {
             self.panopticon_focus += 1;
+        }
+    }
+
+    /// Move the quarantine review focus up one row, clamped at zero.
+    pub fn quarantine_focus_up(&mut self) {
+        self.quarantine_focus = self.quarantine_focus.saturating_sub(1);
+    }
+
+    /// Move the quarantine focus down one row, clamped against the
+    /// entry list length. Safe at empty lists.
+    pub fn quarantine_focus_down(&mut self) {
+        let len = self.quarantine.entries.len();
+        if len == 0 {
+            return;
+        }
+        let max = len.saturating_sub(1);
+        if self.quarantine_focus < max {
+            self.quarantine_focus += 1;
         }
     }
 }
