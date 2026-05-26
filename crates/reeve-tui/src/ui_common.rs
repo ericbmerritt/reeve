@@ -34,3 +34,35 @@ pub fn format_time_hhmm(ts: OffsetDateTime) -> String {
 pub fn format_time_hhmm_opt(ts: Option<OffsetDateTime>) -> String {
     ts.map(format_time_hhmm).unwrap_or_default()
 }
+
+/// Build a section header line: `─ label ──────────` extended to the
+/// renderer's current `width`. Shared by the panopticon and quarantine
+/// screens; the visual rhythm is intentional so the two screens read
+/// alike.
+///
+/// Naive on graphemes — `label` is ASCII in practice. If a future
+/// caller needs wide characters in the label the renderer should pull
+/// in `unicode-width`.
+#[must_use]
+pub fn build_section_header(label: &str, width: u16) -> ratatui::text::Line<'static> {
+    let lead = format!("\u{2500} {label} ");
+    let pad = usize::from(width).saturating_sub(lead.chars().count());
+    let rule: String = "\u{2500}".repeat(pad);
+    ratatui::text::Line::from(format!("{lead}{rule}"))
+}
+
+/// Truncate or right-pad a column value to exactly `width` display
+/// chars. Agent names, persona names, and reason tokens — the only
+/// values this is called with — are ASCII-safe; if a future caller
+/// passes wide characters the renderer needs `unicode-width`.
+#[must_use]
+pub fn pad_right(s: &str, width: usize) -> String {
+    let actual = s.chars().count();
+    if actual >= width {
+        s.chars().take(width).collect()
+    } else {
+        let mut out = s.to_owned();
+        out.extend(std::iter::repeat_n(' ', width - actual));
+        out
+    }
+}

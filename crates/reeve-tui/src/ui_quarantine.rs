@@ -1,16 +1,25 @@
-//! Quarantine review screen — Phase 6 stub.
+//! Quarantine review screen — Phase 8.
 //!
-//! Phase 6 wires the `Q` keybinding from the panopticon to this screen so
-//! the operator's muscle memory has somewhere to land. The full review UI
-//! (per-message inspection, approve/release/discard actions) lands in
-//! Phase 8 alongside the gatekeeper work; until then, this renderer
-//! surfaces the count the panopticon already tracks and tells the operator
-//! the review screen itself is not yet built.
+//! Three vertical regions stacked under a shared title bar:
 //!
-//! Aesthetic continuity with [`crate::ui`] and [`crate::ui_panopticon`] is
-//! intentional — same `reeve · …` title prefix, same `NO_COLOR` fallback
-//! contract, same footer-hint shape. When the Phase 8 renderer arrives it
-//! drops into this module and inherits the chrome.
+//! 1. **List** (top): one row per quarantined envelope across every
+//!    agent's `inbox/quarantine/` directory, with columns ARRIVED,
+//!    RECIPIENT, SENDER, REASON.
+//! 2. **Envelope details** (middle): metadata about the focused row.
+//!    `message_id`, `sender_id`, `created_at`, and the raw reason
+//!    token from the filename suffix.
+//! 3. **Body** (bottom): the envelope's raw body as UTF-8 text. A
+//!    `[non-UTF-8 body]` marker appears when the bytes didn't decode
+//!    cleanly.
+//!
+//! The bottom row is a key-hint footer plus the discard confirmation
+//! prompt when one is open.
+//!
+//! Aesthetic continuity with [`crate::ui`], [`crate::ui_panopticon`],
+//! and [`crate::ui_inspect`] is intentional — same `reeve · …` prefix,
+//! same `NO_COLOR` fallback contract, same footer-hint shape. The
+//! Phase 6 stub used to live here; Phase 8 replaces it with the real
+//! review UI.
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
@@ -18,175 +27,498 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::panopticon::PanopticonSnapshot;
-use crate::ui_common::no_color;
+use crate::quarantine_view::{EnvelopeMeta, QuarantineEntry, QuarantineSnapshot};
+use crate::state::AppState;
+use crate::ui_common::{build_section_header, format_time_hhmm_opt, no_color, pad_right};
 
-/// Render the quarantine review stub into `frame`.
-pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot) {
+/// Column widths for the list section. Sums to 80 minus the
+/// inter-column separators so an 80-wide terminal fits the canonical
+/// layout without truncation. The renderer pads/truncates each cell to
+/// the corresponding width before assembling the row.
+const COL_ARRIVED: usize = 7;
+const COL_RECIPIENT: usize = 16;
+const COL_SENDER: usize = 16;
+// REASON column fills the remainder; no fixed width.
+
+/// Render the quarantine review screen into `frame`.
+pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
     let width = area.width;
+    let snap = &state.quarantine;
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title bar
-            Constraint::Length(1), // section header
-            Constraint::Length(1), // count line
-            Constraint::Min(1),    // placeholder body
+            Constraint::Length(1), // title
+            Constraint::Length(1), // list header
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // envelope header sep
+            Constraint::Length(6), // envelope details
+            Constraint::Length(1), // body header sep
+            Constraint::Min(2),    // body
             Constraint::Length(1), // footer
         ])
         .split(area);
 
-    frame.render_widget(Paragraph::new(build_title_bar(snap)), chunks[0]);
+    frame.render_widget(Paragraph::new(build_title_bar(snap, width)), chunks[0]);
+    frame.render_widget(Paragraph::new(build_list_header(width)), chunks[1]);
     frame.render_widget(
-        Paragraph::new(build_section_header("quarantine", width)),
-        chunks[1],
+        Paragraph::new(build_list_rows(snap, state.quarantine_focus)),
+        chunks[2],
     );
-    frame.render_widget(Paragraph::new(build_count_line(snap)), chunks[2]);
-    frame.render_widget(Paragraph::new(build_placeholder_body()), chunks[3]);
-    frame.render_widget(Paragraph::new(build_footer()), chunks[4]);
+    frame.render_widget(
+        Paragraph::new(build_section_header("envelope", width)),
+        chunks[3],
+    );
+    frame.render_widget(
+        Paragraph::new(build_envelope_details(focused(
+            snap,
+            state.quarantine_focus,
+        ))),
+        chunks[4],
+    );
+    frame.render_widget(
+        Paragraph::new(build_section_header("body", width)),
+        chunks[5],
+    );
+    frame.render_widget(
+        Paragraph::new(build_body_pane(focused(snap, state.quarantine_focus))),
+        chunks[6],
+    );
+    frame.render_widget(
+        Paragraph::new(build_footer(state.quarantine_confirm_discard)),
+        chunks[7],
+    );
 }
 
-/// Title bar matches the panopticon's: `reeve · quarantine ─── $X.XX`.
-fn build_title_bar(snap: &PanopticonSnapshot) -> Line<'static> {
+/// Title bar: `reeve · quarantine ─── N quarantined`.
+fn build_title_bar(snap: &QuarantineSnapshot, width: u16) -> Line<'static> {
     let prefix_style = if no_color() {
         Style::default()
     } else {
         Style::default().fg(Color::Blue)
     };
     let prefix = Span::styled("reeve \u{00B7} quarantine ".to_owned(), prefix_style);
-    let cost = format!("${:.2}", snap.total_cost_usd);
-    let suffix = format!("\u{2500}\u{2500}\u{2500} {cost}");
-    Line::from(vec![prefix, Span::raw(suffix)])
-}
-
-/// Section header `─ quarantine ─────`. Same shape as the panopticon's
-/// section headers; intentionally shared visual rhythm.
-fn build_section_header(label: &str, width: u16) -> Line<'static> {
-    let lead = format!("\u{2500} {label} ");
-    let pad = usize::from(width).saturating_sub(lead.chars().count());
-    let rule: String = "\u{2500}".repeat(pad);
-    Line::from(format!("{lead}{rule}"))
-}
-
-/// Count line — the actionable piece of information this screen can
-/// truthfully show today.
-fn build_count_line(snap: &PanopticonSnapshot) -> Line<'static> {
-    let count = snap.queue_counts.quarantine;
-    let text = match count {
-        0 => "  no quarantined messages".to_owned(),
-        1 => "  1 quarantined message across all agents".to_owned(),
-        n => format!("  {n} quarantined messages across all agents"),
+    let count = snap.entries.len();
+    let suffix_text = if snap.truncated {
+        format!("\u{2500}\u{2500}\u{2500} {count}+ quarantined (truncated)")
+    } else {
+        format!("\u{2500}\u{2500}\u{2500} {count} quarantined")
     };
-    Line::from(text)
+    // Pad to terminal width so the rule extends to the right edge.
+    // Subtract 1 for the separator space printed between suffix_text
+    // and padding in the format string below (`"{suffix_text} {padding}"`).
+    let pad_len = usize::from(width)
+        .saturating_sub("reeve \u{00B7} quarantine ".chars().count())
+        .saturating_sub(suffix_text.chars().count())
+        .saturating_sub(1);
+    let padding = "\u{2500}".repeat(pad_len);
+    Line::from(vec![prefix, Span::raw(format!("{suffix_text} {padding}"))])
 }
 
-/// Placeholder body — explicit about what is and is not built yet so the
-/// operator does not stare at an empty screen wondering what they missed.
-fn build_placeholder_body() -> Vec<Line<'static>> {
+/// Column header line above the list.
+fn build_list_header(width: u16) -> Line<'static> {
+    let header = format!(
+        "  {arrived:<aw$}  {recipient:<rw$}  {sender:<sw$}  REASON",
+        arrived = "ARRIVED",
+        aw = COL_ARRIVED,
+        recipient = "RECIPIENT",
+        rw = COL_RECIPIENT,
+        sender = "SENDER",
+        sw = COL_SENDER,
+    );
+    // Trim or pad to the visible width so the underline-style header
+    // matches the panopticon's column-header treatment.
+    let header = pad_right(&header, usize::from(width));
+    let style = if no_color() {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::DarkGray)
+    };
+    Line::from(Span::styled(header, style))
+}
+
+/// Render the list rows. Each entry gets one line; the focused row is
+/// prefixed with `▶ ` and styled with the active row colour.
+fn build_list_rows(snap: &QuarantineSnapshot, focus: usize) -> Vec<Line<'static>> {
+    if snap.entries.is_empty() {
+        let dim = if no_color() {
+            Style::default()
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        return vec![
+            Line::from(""),
+            Line::from(Span::styled("  no quarantined messages".to_owned(), dim)),
+        ];
+    }
+    snap.entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| build_list_row(entry, i == focus))
+        .collect()
+}
+
+fn build_list_row(entry: &QuarantineEntry, focused: bool) -> Line<'static> {
+    let cursor = if focused { "\u{25B6} " } else { "  " };
+    let arrived = format_time_hhmm_opt(entry.arrived);
+    let arrived_cell = pad_right(&arrived, COL_ARRIVED);
+    let recipient_cell = pad_right(&entry.recipient, COL_RECIPIENT);
+    let sender_cell = pad_right(&sender_label(&entry.meta), COL_SENDER);
+    let text = format!(
+        "{cursor}{arrived_cell}  {recipient_cell}  {sender_cell}  {reason}",
+        reason = entry.reason,
+    );
+    let style = if focused && !no_color() {
+        Style::default()
+            .add_modifier(Modifier::BOLD)
+            .fg(Color::Cyan)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(text, style))
+}
+
+/// Sender label for the list row. Truncates the full `UUIDv7` to its
+/// leading 8 hex characters so the column stays scannable; the full
+/// id is shown in the envelope details pane below. `"unknown"` is
+/// reserved for parse-failure entries where no `sender_id` was
+/// extractable.
+fn sender_label(meta: &EnvelopeMeta) -> String {
+    match meta {
+        EnvelopeMeta::Parsed { sender_id, .. } => short_id(*sender_id),
+        EnvelopeMeta::ParseFailure { .. } => "unknown".to_owned(),
+    }
+}
+
+fn short_id(id: reeve_types::IdentityId) -> String {
+    let s = id.to_string();
+    s.split('-').next().unwrap_or(&s).to_owned()
+}
+
+/// Envelope-details body. Six lines: blank, `message_id`, `sender_id`,
+/// `recipient_id`, `created_at`, verification. Parse-failure entries
+/// surface a single explanatory line so the operator can still
+/// discard the file.
+fn build_envelope_details(entry: Option<&QuarantineEntry>) -> Vec<Line<'static>> {
     let dim = if no_color() {
         Style::default()
     } else {
         Style::default().add_modifier(Modifier::DIM)
     };
-    vec![
-        Line::from(""),
-        Line::from(Span::styled(
-            "  The full quarantine review screen lands in Phase 8 alongside the".to_owned(),
-            dim,
-        )),
-        Line::from(Span::styled(
-            "  gatekeeper work. Each agent's `inbox/quarantine/` directory is".to_owned(),
-            dim,
-        )),
-        Line::from(Span::styled(
-            "  the source of truth in the meantime — `ls` and `cat` work.".to_owned(),
-            dim,
-        )),
-    ]
+    let Some(entry) = entry else {
+        return vec![
+            Line::from(""),
+            Line::from(Span::styled("  (no entry selected)".to_owned(), dim)),
+        ];
+    };
+    match &entry.meta {
+        EnvelopeMeta::Parsed {
+            message_id,
+            sender_id,
+            recipient_id,
+            created_at,
+        } => vec![
+            Line::from(""),
+            Line::from(format!("  message_id    {message_id}")),
+            Line::from(format!("  sender_id     {sender_id}")),
+            Line::from(format!("  recipient_id  {recipient_id}")),
+            Line::from(format!("  created_at    {}", format_rfc_short(*created_at))),
+            Line::from(format!("  reason        {}", entry.reason)),
+        ],
+        EnvelopeMeta::ParseFailure { filename } => vec![
+            Line::from(""),
+            Line::from(format!("  filename      {filename}")),
+            Line::from(format!("  reason        {}", entry.reason)),
+            Line::from(Span::styled(
+                "  parse_failure: the envelope JSON could not be decoded.".to_owned(),
+                dim,
+            )),
+            Line::from(""),
+            Line::from(""),
+        ],
+    }
 }
 
-/// Footer mirrors the panopticon's `·` separators and key hints.
-fn build_footer() -> Line<'static> {
-    Line::from("Esc back \u{00B7} Tab panopticon \u{00B7} Q close \u{00B7} q quit".to_owned())
+/// Format a timestamp as `YYYY-MM-DD HH:MM:SSZ` — enough resolution
+/// for the operator to correlate with logs, no more.
+fn format_rfc_short(ts: time::OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}Z",
+        ts.year(),
+        u8::from(ts.month()),
+        ts.day(),
+        ts.hour(),
+        ts.minute(),
+        ts.second(),
+    )
+}
+
+/// Body pane: raw envelope body as text, plus a `[non-UTF-8 body]`
+/// marker if the original bytes didn't decode cleanly.
+fn build_body_pane(entry: Option<&QuarantineEntry>) -> Vec<Line<'static>> {
+    let Some(entry) = entry else {
+        return vec![Line::from("")];
+    };
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if entry.body_lossy {
+        let warn = if no_color() {
+            Style::default().add_modifier(Modifier::ITALIC)
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        lines.push(Line::from(Span::styled(
+            "  [non-UTF-8 body — lossy conversion]".to_owned(),
+            warn,
+        )));
+    }
+    if entry.raw_body.is_empty() {
+        let dim = if no_color() {
+            Style::default()
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        lines.push(Line::from(Span::styled("  (empty body)".to_owned(), dim)));
+    } else {
+        for line in entry.raw_body.lines() {
+            lines.push(Line::from(format!("  {line}")));
+        }
+    }
+    lines
+}
+
+/// Footer line. When a discard confirmation is open the prompt
+/// replaces the help text so the operator's eye lands on the
+/// pending action.
+fn build_footer(confirm_discard: bool) -> Line<'static> {
+    if confirm_discard {
+        let warn = if no_color() {
+            Style::default().add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD).fg(Color::Red)
+        };
+        Line::from(Span::styled(
+            "discard this entry? press d or y to confirm, any other key to cancel".to_owned(),
+            warn,
+        ))
+    } else {
+        Line::from(
+            "d discard \u{00B7} o convert \u{00B7} j/k navigate \u{00B7} Tab back \u{00B7} q quit"
+                .to_owned(),
+        )
+    }
+}
+
+/// Return the focused entry, or `None` when the focus index is out
+/// of range (empty list, or stale focus during a transient refresh).
+fn focused(snap: &QuarantineSnapshot, focus: usize) -> Option<&QuarantineEntry> {
+    snap.entries.get(focus)
+}
+
+/// Render the quarantine compose surface into `frame`.
+///
+/// Presents a two-row header (title + separator), a single-line input
+/// prompt, an editor area (the compose buffer, pre-filled with the
+/// quarantined body), and a footer with the submit/cancel hints. The
+/// operator can type freely; `Enter` submits, `Esc`/`Tab` cancel.
+pub fn draw_compose(frame: &mut Frame<'_>, state: &AppState) {
+    let area = frame.area();
+    let width = area.width;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1), // title bar
+            Constraint::Length(1), // separator
+            Constraint::Length(1), // prompt label
+            Constraint::Min(3),    // compose body
+            Constraint::Length(1), // footer
+        ])
+        .split(area);
+
+    // Title bar.
+    let prefix_style = if no_color() {
+        Style::default()
+    } else {
+        Style::default().fg(Color::Blue)
+    };
+    let recipient = &state.quarantine_compose_recipient;
+    let title = Line::from(vec![
+        Span::styled(
+            "reeve \u{00B7} quarantine \u{00B7} compose ".to_owned(),
+            prefix_style,
+        ),
+        Span::raw(format!("\u{2500}\u{2500}\u{2500} to: {recipient}")),
+    ]);
+    frame.render_widget(Paragraph::new(title), chunks[0]);
+    frame.render_widget(
+        Paragraph::new(build_section_header("message", width)),
+        chunks[1],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from("  compose new message:")),
+        chunks[2],
+    );
+
+    let body_text = format!("  {}", state.input);
+    frame.render_widget(Paragraph::new(body_text), chunks[3]);
+
+    // Footer.
+    frame.render_widget(
+        Paragraph::new(Line::from(
+            "Enter send \u{00B7} Esc cancel \u{00B7} Backspace delete".to_owned(),
+        )),
+        chunks[4],
+    );
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::panopticon::{PanopticonSnapshot, QueueCounts};
+    use crate::quarantine_view::{EnvelopeMeta, QuarantineEntry, QuarantineSnapshot};
+    use crate::state::{AppState, Screen};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+    use std::path::PathBuf;
+    use time::OffsetDateTime;
 
-    fn snap_with_quarantine(count: usize) -> PanopticonSnapshot {
-        PanopticonSnapshot {
-            queue_counts: QueueCounts {
-                quarantine: count,
-                ..QueueCounts::default()
+    fn entry_for(recipient: &str, reason: &str, body: &str) -> QuarantineEntry {
+        QuarantineEntry {
+            path: PathBuf::from(format!("/x/{recipient}/{reason}")),
+            recipient: recipient.to_owned(),
+            arrived: Some(
+                OffsetDateTime::from_unix_timestamp(1_716_700_000).expect("fixture timestamp"),
+            ),
+            reason: reason.to_owned(),
+            meta: EnvelopeMeta::ParseFailure {
+                filename: format!("{recipient}-stem.{reason}"),
             },
-            ..PanopticonSnapshot::default()
+            raw_body: body.to_owned(),
+            body_lossy: false,
         }
     }
 
-    // Q1: zero quarantined messages renders as the explicit no-messages
-    // line rather than `0`. Empty-state phrasing matters when the count
-    // is the only operational data on the screen.
-    #[test]
-    fn count_line_zero_uses_no_messages_phrasing() {
-        let line = build_count_line(&snap_with_quarantine(0));
-        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(
-            text.contains("no quarantined"),
-            "zero-count line should read 'no quarantined…'; got {text:?}"
-        );
+    fn state_with_entries(entries: Vec<QuarantineEntry>, focus: usize) -> AppState {
+        let mut state = AppState::default();
+        state.screen = Screen::Quarantine;
+        state.quarantine = QuarantineSnapshot {
+            entries,
+            truncated: false,
+        };
+        state.quarantine_focus = focus;
+        state
     }
 
-    // Q2: a positive count is rendered with the number embedded so the
-    // operator does not need to switch screens to know how many entries
-    // are waiting.
-    #[test]
-    fn count_line_positive_count_embeds_number() {
-        let line = build_count_line(&snap_with_quarantine(7));
-        let text: String = line.spans.iter().map(|s| s.content.clone()).collect();
-        assert!(
-            text.contains('7'),
-            "positive-count line must show the count; got {text:?}"
-        );
-    }
-
-    // Q3: full draw at 24-row × 80-col puts the operator-facing message,
-    // the count line, and the footer keymap on-screen. The stub does not
-    // need anything more interactive than this until Phase 8.
-    #[test]
-    fn draw_renders_stub_at_80x24() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-
-        let snap = snap_with_quarantine(3);
-        let backend = TestBackend::new(80, 24);
-        let mut terminal = Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &snap)).unwrap();
-
+    fn render(state: &AppState, width: u16, height: u16) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal.draw(|frame| draw(frame, state)).expect("draw");
         let buffer = terminal.backend().buffer();
-        let rendered: String = (0..buffer.area.height)
+        (0..buffer.area.height)
             .map(|y| {
-                let row: String = (0..buffer.area.width)
+                (0..buffer.area.width)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
-                    .collect();
-                row
+                    .collect::<String>()
             })
             .collect::<Vec<_>>()
-            .join("\n");
+            .join("\n")
+    }
 
+    // Q1: empty list renders the explicit "no quarantined messages"
+    // line rather than an empty pane.
+    #[test]
+    fn empty_list_renders_explicit_message() {
+        std::env::set_var("NO_COLOR", "1");
+        let state = state_with_entries(Vec::new(), 0);
+        let rendered = render(&state, 80, 24);
+        std::env::remove_var("NO_COLOR");
         assert!(
-            rendered.contains("quarantine"),
-            "title or header missing; got:\n{rendered}"
+            rendered.contains("no quarantined messages"),
+            "empty list message missing: {rendered}"
+        );
+    }
+
+    // Q2: a single entry shows up with reason, recipient, body — the
+    // load-bearing review-screen content. Done-when 1.
+    #[test]
+    fn single_entry_shows_metadata_and_body() {
+        std::env::set_var("NO_COLOR", "1");
+        let state = state_with_entries(
+            vec![entry_for(
+                "lead",
+                "signature_invalid",
+                "hello world payload",
+            )],
+            0,
+        );
+        let rendered = render(&state, 80, 24);
+        std::env::remove_var("NO_COLOR");
+        assert!(rendered.contains("lead"), "recipient missing: {rendered}");
+        assert!(
+            rendered.contains("signature_invalid"),
+            "reason missing: {rendered}"
         );
         assert!(
-            rendered.contains("Phase 8"),
-            "operator-facing 'phase 8' note missing; got:\n{rendered}"
+            rendered.contains("hello world payload"),
+            "body missing: {rendered}"
         );
+    }
+
+    // Q3: focused row gets the ▶ cursor; other rows don't.
+    #[test]
+    fn cursor_marks_focused_row_only() {
+        std::env::set_var("NO_COLOR", "1");
+        let state = state_with_entries(
+            vec![
+                entry_for("lead", "replay", "first"),
+                entry_for("worker-x", "clock_skew", "second"),
+            ],
+            1,
+        );
+        let rendered = render(&state, 80, 24);
+        std::env::remove_var("NO_COLOR");
+        // The ▶ should appear once.
+        let cursor_count = rendered.matches('\u{25B6}').count();
+        assert_eq!(
+            cursor_count, 1,
+            "expected exactly one ▶ cursor; got {cursor_count}: {rendered}"
+        );
+    }
+
+    // Q4: discard confirmation replaces the help footer with the
+    // prompt the operator must answer.
+    #[test]
+    fn confirm_discard_replaces_footer_with_prompt() {
+        std::env::set_var("NO_COLOR", "1");
+        let mut state = state_with_entries(vec![entry_for("lead", "replay", "x")], 0);
+        state.quarantine_confirm_discard = true;
+        let rendered = render(&state, 80, 24);
+        std::env::remove_var("NO_COLOR");
         assert!(
-            rendered.contains("Esc back"),
-            "footer key hints missing; got:\n{rendered}"
+            rendered.contains("discard this entry?"),
+            "confirm prompt missing: {rendered}"
         );
+        // The standard footer hint should be hidden while confirming.
+        assert!(
+            !rendered.contains("d discard"),
+            "default footer leaked through confirm: {rendered}"
+        );
+    }
+
+    // Q5: 80x24 NO_COLOR smoke — title, list, body, footer all on
+    // screen. Same shape as the panopticon and inspect smokes.
+    #[test]
+    fn draw_renders_at_80x24() {
+        std::env::set_var("NO_COLOR", "1");
+        let state = state_with_entries(
+            vec![entry_for("lead", "clock_skew", "test message body")],
+            0,
+        );
+        let rendered = render(&state, 80, 24);
+        std::env::remove_var("NO_COLOR");
+        assert!(rendered.contains("quarantine"), "title missing");
+        assert!(rendered.contains("REASON"), "list header missing");
+        assert!(rendered.contains("Tab back"), "footer missing");
     }
 }

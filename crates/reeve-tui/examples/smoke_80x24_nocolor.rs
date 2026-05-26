@@ -55,8 +55,12 @@ fn main() {
     print_screen("Panopticon (80×24, NO_COLOR=1)", |frame| {
         reeve_tui::ui_panopticon::draw(frame, &panopticon_snap, 1);
     });
-    print_screen("Quarantine stub (80×24, NO_COLOR=1)", |frame| {
-        reeve_tui::ui_quarantine::draw(frame, &panopticon_snap);
+    // The quarantine screen now reads the full AppState (entries
+    // list, focused index, confirm state). Use the chat fixture as
+    // a base and graft an empty quarantine snapshot — the smoke just
+    // verifies the layout is renderable on an 80x24 terminal.
+    print_screen("Quarantine (80×24, NO_COLOR=1)", |frame| {
+        reeve_tui::ui_quarantine::draw(frame, &chat_state);
     });
 }
 

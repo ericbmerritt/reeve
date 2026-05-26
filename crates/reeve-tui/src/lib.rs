@@ -7,6 +7,7 @@
 
 pub mod app;
 pub mod panopticon;
+pub mod quarantine_view;
 pub mod reader;
 pub mod session;
 pub mod state;
