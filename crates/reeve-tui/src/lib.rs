@@ -13,6 +13,7 @@ pub mod state;
 pub mod submit;
 pub mod ui;
 pub mod ui_common;
+pub mod ui_inspect;
 pub mod ui_panopticon;
 pub mod ui_quarantine;
 pub mod watcher;

@@ -94,24 +94,100 @@ pub enum AgentStatus {
 /// Which screen the operator is currently looking at.
 ///
 /// The TUI is multi-screen as of Phase 6: the chat screen is the per-agent
-/// conversation pane; the panopticon is the global overview. `Tab` cycles
-/// between them. Future phases add Per-Agent Inspect (Phase 7) and
-/// Quarantine Review (Phase 8) as additional variants.
+/// typing surface; the panopticon is the global overview. Phase 7 adds the
+/// per-agent inspect screen — a read-only drill-in from the panopticon.
+/// `Tab` cycles between chat and panopticon; the inspect screen is entered
+/// by `Enter` on a panopticon row and exited with `h`/`Esc`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Screen {
-    /// Lead-chat conversation pane — the existing screen prior to Phase 6.
-    /// Default so a fresh `AppState` continues to behave like the
-    /// single-screen TUI did before the panopticon landed.
+    /// Chat conversation pane with input — primary work surface. The agent
+    /// targeted by chat is `AppState::chat_agent_name`, set at TUI launch
+    /// from `reeve attach <name>` or session memory. It does not change
+    /// mid-session: per-agent chat for arbitrary agents is intentionally
+    /// only reachable via the CLI escape hatch, per spec.
     #[default]
     Chat,
     /// Global panopticon: agent table, recent events, queue counts.
     Panopticon,
+    /// Per-agent inspect — read-only drill-in from the panopticon.
+    /// Renders five tabs across the top (Thread/Tools/Model/Decisions/
+    /// Memory); only Thread is populated in this ladder. The targeted
+    /// agent is `AppState::inspect_agent_name`, set by `Enter` on the
+    /// focused panopticon row.
+    Inspect,
     /// Quarantine review. Phase 6 ships a stub renderer that surfaces the
     /// per-agent quarantine count from the panopticon snapshot and a note
     /// that the full review UI lands in Phase 8. The Screen variant exists
     /// so the panopticon's `Q` keybinding has a real target and Phase 8
     /// can fill in the renderer without touching the dispatch path.
     Quarantine,
+}
+
+// ── InspectTab ────────────────────────────────────────────────────────────────
+
+/// Which tab is active in the per-agent inspect screen.
+///
+/// Phase 7 ships only the Thread tab as functional content; the other four
+/// render a "not yet available" placeholder. They exist as enum variants
+/// so the keymap, tab-cycling math, and renderer dispatch are shaped for
+/// the full inspect layout from the start — later phases fill in the
+/// stubs without touching the cycle/dispatch logic.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InspectTab {
+    /// Conversation journal with speaker attribution. Default.
+    #[default]
+    Thread,
+    /// Tool invocations log. Stub in ladder 2.
+    Tools,
+    /// Model API calls log. Stub in ladder 2.
+    Model,
+    /// Authority decisions log. Stub in ladder 2.
+    Decisions,
+    /// Memory references log. Stub in ladder 2.
+    Memory,
+}
+
+impl InspectTab {
+    /// All tabs in display order — drives both the tab-bar render and
+    /// numeric `1-5` jump bindings. The ordinal of a variant in this
+    /// array matches its `1-5` shortcut (0-indexed internally).
+    pub const ALL: [Self; 5] = [
+        Self::Thread,
+        Self::Tools,
+        Self::Model,
+        Self::Decisions,
+        Self::Memory,
+    ];
+
+    /// Display label for the tab bar.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Thread => "THREAD",
+            Self::Tools => "TOOLS",
+            Self::Model => "MODEL",
+            Self::Decisions => "DECISIONS",
+            Self::Memory => "MEMORY",
+        }
+    }
+
+    /// Index of this tab in `ALL` — used for both render highlighting
+    /// and cycle arithmetic. Kept as a method rather than a `usize`
+    /// field so adding a tab is one match arm, not a renumbering.
+    pub fn index(self) -> usize {
+        Self::ALL.iter().position(|t| *t == self).unwrap_or(0)
+    }
+
+    /// Next tab in cycle order, wrapping back to Thread after Memory.
+    pub fn next(self) -> Self {
+        let i = self.index();
+        Self::ALL[(i + 1) % Self::ALL.len()]
+    }
+
+    /// Previous tab in cycle order, wrapping from Thread back to Memory.
+    pub fn prev(self) -> Self {
+        let i = self.index();
+        Self::ALL[(i + Self::ALL.len() - 1) % Self::ALL.len()]
+    }
 }
 
 // ── AppState ──────────────────────────────────────────────────────────────────
@@ -157,6 +233,21 @@ pub struct AppState {
     /// the renderer clamps against the actual agent count, so any value is
     /// safe.
     pub panopticon_focus: usize,
+    /// Role name (from the agent registry) of the agent currently being
+    /// drilled into via the per-agent inspect screen. Set when the
+    /// operator presses `Enter` on a panopticon row; `None` until that
+    /// happens and after `h`/`Esc` returns to the panopticon (the value
+    /// is preserved across the return so re-entering inspect for the
+    /// same agent costs no extra disk reads).
+    ///
+    /// Inspect lookups and inspect reloads use this name; chat lookups
+    /// continue to use `chat_agent_name`. The two are independent so the
+    /// operator can chat with one agent and inspect another without
+    /// either screen's data being clobbered.
+    pub inspect_agent_name: Option<String>,
+    /// Active tab on the inspect screen. `Tab`/`Shift+Tab` and `1-5`
+    /// cycle this; the renderer dispatches body content based on it.
+    pub inspect_tab: InspectTab,
 }
 
 impl AppState {
@@ -217,6 +308,8 @@ impl Default for AppState {
             screen: Screen::Chat,
             panopticon: PanopticonSnapshot::default(),
             panopticon_focus: 0,
+            inspect_agent_name: None,
+            inspect_tab: InspectTab::Thread,
         }
     }
 }
@@ -261,7 +354,7 @@ impl AppState {
                 self.panopticon_focus = 0;
                 Screen::Panopticon
             }
-            Screen::Panopticon | Screen::Quarantine => Screen::Chat,
+            Screen::Panopticon | Screen::Quarantine | Screen::Inspect => Screen::Chat,
         };
     }
 

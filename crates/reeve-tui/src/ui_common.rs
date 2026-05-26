@@ -25,3 +25,12 @@ pub fn no_color() -> bool {
 pub fn format_time_hhmm(ts: OffsetDateTime) -> String {
     format!("{:02}:{:02}", ts.hour(), ts.minute())
 }
+
+/// Format an optional timestamp as `HH:MM`, or return an empty string.
+/// Conversation entries from legacy journals (pre-attribution) have no
+/// timestamp; the speaker tag elides the `· HH:MM` suffix entirely
+/// rather than rendering `· `.
+#[must_use]
+pub fn format_time_hhmm_opt(ts: Option<OffsetDateTime>) -> String {
+    ts.map(format_time_hhmm).unwrap_or_default()
+}
