@@ -888,4 +888,54 @@ mod tests {
         );
         assert_eq!(screen, Screen::Panopticon);
     }
+
+    // ── reload_state per-agent dispatch ────────────────────────────────
+
+    /// Provision an agent dir at `<data_dir>/agents/<name>/log/` and seed
+    /// its conversation.jsonl with one inbound entry whose payload is
+    /// `marker`. The marker lets a test distinguish which agent's file
+    /// was read.
+    fn seed_agent_conversation(data_dir: &Path, name: &str, marker: &str) {
+        let log_dir = data_dir.join("agents").join(name).join("log");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let conv_path = log_dir.join("conversation.jsonl");
+        let line = format!(
+            r#"{{"type":"inbound","payload":"{marker}","timestamp_utc":"2026-05-25T20:00:00Z"}}"#
+        );
+        std::fs::write(&conv_path, format!("{line}\n")).unwrap();
+    }
+
+    // RS1: reload_state with chat_agent_name = "lead" reads lead's file;
+    // changing chat_agent_name to "worker" and reloading reads worker's
+    // file. This is the load-bearing invariant behind per-agent chat:
+    // the conversation pane MUST track state.chat_agent_name on every
+    // reload, no caching, no staleness.
+    #[test]
+    fn reload_state_switches_conversation_per_chat_agent_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        seed_agent_conversation(data_dir, "lead", "LEAD-MARKER");
+        seed_agent_conversation(data_dir, "worker-x", "WORKER-MARKER");
+        // Registry path doesn't need to exist for reload_state's
+        // panopticon-snapshot read to succeed defensively (it returns an
+        // empty snapshot on unreadable registries). The per-agent reads
+        // are what we're verifying here.
+        let registry_path = tmp.path().join("nonexistent-registry.toml");
+
+        let mut state = AppState::default();
+        state.chat_agent_name = "lead".to_owned();
+        reload_state(&mut state, data_dir, &registry_path);
+        assert_eq!(state.conversation.len(), 1);
+        assert_eq!(state.conversation[0].text, "LEAD-MARKER");
+
+        state.chat_agent_name = "worker-x".to_owned();
+        reload_state(&mut state, data_dir, &registry_path);
+        assert_eq!(state.conversation.len(), 1);
+        assert_eq!(state.conversation[0].text, "WORKER-MARKER");
+
+        // And switching back picks up lead again — no caching anywhere.
+        state.chat_agent_name = "lead".to_owned();
+        reload_state(&mut state, data_dir, &registry_path);
+        assert_eq!(state.conversation[0].text, "LEAD-MARKER");
+    }
 }
