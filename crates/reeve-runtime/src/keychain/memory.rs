@@ -3,8 +3,8 @@
 //! Used by trait-contract tests in this crate and as a dependency-injection
 //! seam for higher-layer tests. Not suitable for production: seeds are lost
 //! on process exit and never reach durable storage. Production code paths
-//! must use [`crate::keychain::macos::MacOsKeyStore`] on macOS or
-//! [`crate::keychain::linux::SecretServiceKeyStore`] on Linux.
+//! must use `crate::keychain::macos::MacOsKeyStore` on macOS or
+//! `crate::keychain::linux::SecretServiceKeyStore` on Linux.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -25,7 +25,7 @@ use super::{KeychainError, OperatorKeyStore, OperatorSecretStore, SEED_LEN};
 /// they use separate maps and cannot cross-contaminate.
 ///
 /// **Test-only.** `MemoryKeyStore` is intended for unit tests that need
-/// [`OperatorSecretStore`](super::OperatorSecretStore) semantics without
+/// [`OperatorSecretStore`] semantics without
 /// touching the OS credential store. **Do NOT use in any process that holds
 /// real secrets in other stores during the same session** — the intermediate
 /// `String` from `expose_secret().to_owned()` in `retrieve_secret` is not

@@ -316,11 +316,11 @@ pub(crate) fn confirm_started(state_dir: &Path) -> Result<(), DaemonError> {
 
 // ── daemon_stop ───────────────────────────────────────────────────────────────
 
-/// Send SIGTERM to the running daemon and wait up to [`STOP_TIMEOUT`] for it to exit.
+/// Send SIGTERM to the running daemon and wait up to `STOP_TIMEOUT` for it to exit.
 ///
 /// Returns [`DaemonError::NoRuntime`] when no daemon is running. Returns
 /// [`DaemonError::Signal`] when the kill command fails. Returns
-/// [`DaemonError::Timeout`] if the daemon does not exit within [`STOP_TIMEOUT`].
+/// [`DaemonError::Timeout`] if the daemon does not exit within `STOP_TIMEOUT`.
 pub fn daemon_stop(state_dir: &Path) -> Result<(), DaemonError> {
     #[cfg(unix)]
     {

@@ -79,7 +79,7 @@ impl actix::Handler<SpawnResponse> for SpawnRelay {
     }
 }
 
-/// Tool that requests the [`SpawnCoordinator`] to provision and start a new
+/// Tool that requests the `SpawnCoordinator` to provision and start a new
 /// subordinate agent, then delivers the outcome back to the calling agent as a
 /// [`ToolResult`].
 ///

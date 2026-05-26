@@ -122,14 +122,14 @@ reason=<expected>)` assertion. A test that hits the path without observing
   required `SeenIds` in `Agent` as a band-aid — a second in-memory dedup
   source with different restart semantics than the durable ledger.
   **Source:** Design review 2026-05-10; see
-  `docs/decisions/001-single-processInbound-dispatch.md`.
+  `docs/src/decisions/001-single-processInbound-dispatch.md`.
 
 ## Documentation
 
 Specs are build-phase artifacts. Once a ladder is complete they are retired;
 design rationale and operational knowledge live in two durable places instead:
 
-- **`docs/decisions/`** — Architecture Decision Records. One file per
+- **`docs/src/decisions/`** — Architecture Decision Records. One file per
   significant design choice (`001-tool-actor-trust-boundary.md`,
   `002-actor-system-internals.md`, …). Three sections: Context, Decision,
   Consequences. Never edited after the fact; superseded ADRs get a

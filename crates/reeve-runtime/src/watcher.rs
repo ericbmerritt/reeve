@@ -136,7 +136,7 @@ pub enum FilenameError {
     NotUtf8,
     /// The filename is empty, `.`, or `..`.
     Reserved,
-    /// The filename exceeds [`MAX_INBOX_FILENAME_BYTES`].
+    /// The filename exceeds `MAX_INBOX_FILENAME_BYTES`.
     TooLong { len: usize },
     /// The filename contains a null byte (`\0`). Null bytes terminate C strings,
     /// so a filename containing one would be silently truncated by filesystem
@@ -176,8 +176,8 @@ impl FilenameError {
     }
 }
 
-/// Serializes as the stable audit token returned by [`FilenameError::as_token`].
-/// Wire format is part of the audit schema; see [`as_token`] for stability
+/// Serializes as the stable audit token returned by `FilenameError::as_token`.
+/// Wire format is part of the audit schema; see `as_token` for stability
 /// guarantees.
 impl serde::Serialize for FilenameError {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -697,7 +697,7 @@ impl Watcher {
     /// Iterates every entry in `cur/` and, for each regular non-dotfile,
     /// compares the file's mtime against `now`. If `now - mtime >= retention`
     /// the file is atomically moved to `archive/<filename>` via
-    /// [`rename_disambiguating_enoent`]. Files younger than the threshold are
+    /// `rename_disambiguating_enoent`. Files younger than the threshold are
     /// left in place. If a file vanishes between enumeration and rename
     /// (concurrent mover), it is silently not counted in archived.
     ///

@@ -49,8 +49,10 @@ pub(crate) enum AdapterSubcommand {
     /// `tmux` logging, recorded SSH sessions), or screen recording software.
     /// Pipe from a file or password manager for echo-free input:
     ///
-    ///     printf '%s' "$ANTHROPIC_KEY" | reeve adapter set-key
-    ///     pass anthropic/key | reeve adapter set-key
+    /// ```text
+    /// printf '%s' "$ANTHROPIC_KEY" | reeve adapter set-key
+    /// pass anthropic/key | reeve adapter set-key
+    /// ```
     #[command(name = "set-key")]
     SetKey,
 

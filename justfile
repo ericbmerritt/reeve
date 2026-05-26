@@ -1,7 +1,11 @@
 default:
     @just --list
 
-validate: build check-format lint test
+validate: build check-format lint test check-docs
+
+check-docs:
+    mdbook build docs
+    RUSTDOCFLAGS='-D warnings' cargo doc --no-deps --quiet
 
 build:
     cargo build --workspace
@@ -48,6 +52,10 @@ format-nix:
 
 format-md:
     prettier --write '**/*.md'
+
+docs:
+    mdbook build docs
+    mdbook open docs
 
 remove-trailing-whitespace:
     files=$(rg -l "\s+$" --glob '!Cargo.lock' --glob '!specs/**' --glob '!target/**' || true); \

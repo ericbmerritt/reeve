@@ -139,9 +139,9 @@ pub struct IdentityRegistry {
 
 impl IdentityRegistry {
     /// Open (or create) a registry rooted at `data_dir`. The directory is
-    /// created with [`REGISTRY_DIR_MODE`] permissions on Unix if it does
+    /// created with `REGISTRY_DIR_MODE` permissions on Unix if it does
     /// not already exist. An existing directory is verified to already
-    /// carry [`REGISTRY_DIR_MODE`] on Unix; mismatches surface as
+    /// carry `REGISTRY_DIR_MODE` on Unix; mismatches surface as
     /// [`RegistryError::WrongDirectoryMode`] rather than being silently
     /// chmodded, so an operator misconfiguration is visible.
     ///
@@ -171,7 +171,7 @@ impl IdentityRegistry {
     /// for the same `identity_id` are replaced; the rename is atomic on the
     /// same filesystem so concurrent readers never observe a torn file.
     ///
-    /// Files are created with [`REGISTRY_FILE_MODE`] on Unix. Non-Unix
+    /// Files are created with `REGISTRY_FILE_MODE` on Unix. Non-Unix
     /// platforms inherit the platform default until the runtime grows a
     /// Windows ACL story.
     pub fn write(&self, stored: &StoredIdentity) -> Result<(), RegistryError> {
@@ -307,12 +307,12 @@ pub enum RegistryError {
     },
 
     /// `<path>` reported a stat-time size larger than
-    /// [`MAX_REGISTRY_FILE_BYTES`]. Likely a torn write, accidental write
+    /// `MAX_REGISTRY_FILE_BYTES`. Likely a torn write, accidental write
     /// of unrelated content, or corruption.
     FileTooLargeStat { path: PathBuf, size: u64 },
 
     /// `<path>` was within the size cap at stat time but produced more
-    /// than [`MAX_REGISTRY_FILE_BYTES`] bytes when read — i.e. the file
+    /// than `MAX_REGISTRY_FILE_BYTES` bytes when read — i.e. the file
     /// grew between stat and open by at least one byte.
     FileTooLargeRead { path: PathBuf, size: u64 },
 
@@ -377,7 +377,7 @@ pub enum RegistryError {
     },
 
     /// The registry data directory exists with permissions other than
-    /// [`REGISTRY_DIR_MODE`]. Surfaced on Unix only.
+    /// `REGISTRY_DIR_MODE`. Surfaced on Unix only.
     WrongDirectoryMode {
         path: PathBuf,
         actual: u32,
