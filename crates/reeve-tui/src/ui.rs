@@ -119,12 +119,6 @@ fn build_title_bar(state: &AppState) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Format an optional timestamp as `HH:MM`, or return an empty string.
-fn format_timestamp(ts: Option<time::OffsetDateTime>) -> String {
-    ts.map(crate::ui_common::format_time_hhmm)
-        .unwrap_or_default()
-}
-
 /// Color used for the speaker tag and body indent of a conversation entry.
 ///
 /// - Operator (you) → yellow; the warmest hue, so operator input pops against
@@ -187,7 +181,7 @@ fn build_conversation_lines(state: &AppState, width: u16) -> Vec<Line<'static>> 
 
     for entry in &state.conversation {
         let label = entry.speaker_label(&state.persona_name, state.operator_id);
-        let ts = format_timestamp(entry.timestamp);
+        let ts = crate::ui_common::format_time_hhmm_opt(entry.timestamp);
         let style = role_style(entry, state.operator_id);
         let body_style = if no_color() {
             Style::default()

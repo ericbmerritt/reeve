@@ -39,7 +39,7 @@ use reeve_runtime::AgentDirs;
 use crate::panopticon::read_snapshot as read_panopticon_snapshot;
 use crate::reader::{read_conversation, read_cost, read_status};
 use crate::session::{self, Session};
-use crate::state::{AppState, Screen};
+use crate::state::{AppState, InspectTab, Screen};
 use crate::submit::submit_message;
 use crate::watcher::watch_tree;
 
@@ -199,7 +199,8 @@ fn record_exit_to_session(session_path: &Path, state: &AppState) {
 /// mutation followed by a reload trigger — no signature changes
 /// downstream.
 fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Path) {
-    if let Ok(dirs) = AgentDirs::open(data_dir, &state.chat_agent_name) {
+    let active = active_agent_name(state).to_owned();
+    if let Ok(dirs) = AgentDirs::open(data_dir, &active) {
         state.status = read_status(&dirs.status_path());
         state.conversation = read_conversation(&dirs.conversation_path());
         state.cost_usd = read_cost(&dirs.cost_path());
@@ -210,6 +211,25 @@ fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Pat
         }
     }
     state.panopticon = read_panopticon_snapshot(data_dir, agent_registry_path, state.operator_id);
+}
+
+/// Resolve the agent whose disk state should populate the per-agent
+/// fields (conversation, status, cost, persona, model) on the next
+/// reload.
+///
+/// On [`Screen::Inspect`] the inspect target wins so the drill-in view
+/// reads the agent the operator just Enter-ed into. Everywhere else
+/// (Chat, Panopticon, Quarantine) the chat target wins so the chat
+/// screen's data is fresh when the operator Tab's back to it. Falling
+/// back to `chat_agent_name` when `inspect_agent_name` is None is
+/// defensive — `Enter` from the panopticon always sets the inspect
+/// target before switching screens, so the None branch is unreachable
+/// under normal flow.
+fn active_agent_name(state: &AppState) -> &str {
+    match (state.screen, state.inspect_agent_name.as_deref()) {
+        (Screen::Inspect, Some(name)) => name,
+        _ => &state.chat_agent_name,
+    }
 }
 
 /// Read the spawn snapshot for the agent at `dirs.agent_toml_path()`.
@@ -323,6 +343,7 @@ pub fn run(
                 Screen::Panopticon => {
                     crate::ui_panopticon::draw(frame, &state.panopticon, state.panopticon_focus);
                 }
+                Screen::Inspect => crate::ui_inspect::draw(frame, &state),
                 Screen::Quarantine => {
                     crate::ui_quarantine::draw(frame, &state.panopticon);
                 }
@@ -335,6 +356,7 @@ pub fn run(
                 Event::Key(key) => {
                     let prev_screen = state.screen;
                     let prev_chat_agent = state.chat_agent_name.clone();
+                    let prev_inspect_agent = state.inspect_agent_name.clone();
                     if handle_key(key, &mut state, data_dir, registry, keystore)? {
                         // Record the chat target the operator was on when
                         // they quit, so the next launch can resume it.
@@ -356,11 +378,25 @@ pub fn run(
                             state.operator_id,
                         );
                     }
-                    // Enter on a panopticon row may have swapped the chat
-                    // target. Trigger a reload so the next frame shows
-                    // the new agent's conversation/status/cost rather
-                    // than the previous one's.
-                    if state.chat_agent_name != prev_chat_agent {
+                    // Trigger a reload whenever the *active* agent (the one
+                    // populating state.conversation/status/cost) could
+                    // have changed:
+                    //
+                    // - `chat_agent_name` differs: only happens at startup
+                    //   today, but defensive in case a future surface
+                    //   introduces mid-session switching.
+                    // - `inspect_agent_name` differs: Enter on a panopticon
+                    //   row picked a new inspect target.
+                    // - the screen transitioned between Chat and Inspect:
+                    //   `active_agent_name` returns a different name
+                    //   depending on which screen is up, so the on-screen
+                    //   data must refresh even if neither name changed.
+                    let active_screen_changed = prev_screen != state.screen
+                        && matches!(state.screen, Screen::Chat | Screen::Inspect);
+                    if state.chat_agent_name != prev_chat_agent
+                        || state.inspect_agent_name != prev_inspect_agent
+                        || active_screen_changed
+                    {
                         needs_reload.store(true, Ordering::Release);
                     }
                 }
@@ -411,33 +447,37 @@ fn handle_key(
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(true),
         (KeyCode::Tab, _) => {
-            // Tab toggles Chat ↔ Panopticon. From Quarantine, Tab pops
-            // back to the panopticon (its conceptual parent screen)
-            // rather than entering the chat directly — keeps the
-            // navigation structure shallow.
+            // Tab toggles Chat ↔ Panopticon for the top-level navigation.
+            // From Quarantine, Tab pops back to the panopticon (its
+            // conceptual parent screen). On Inspect, Tab is screen-local
+            // — it cycles tabs across the top of the inspect view — so
+            // the global Tab handler defers to handle_key_inspect.
             match state.screen {
                 Screen::Chat | Screen::Panopticon => state.toggle_screen(),
                 Screen::Quarantine => state.screen = Screen::Panopticon,
+                Screen::Inspect => return Ok(handle_key_inspect(key, state)),
             }
             return Ok(false);
         }
-        (KeyCode::Esc, _) => match state.screen {
-            Screen::Chat => return Ok(true),
-            Screen::Panopticon => {
-                state.screen = Screen::Chat;
-                return Ok(false);
+        (KeyCode::Esc, _) => {
+            match state.screen {
+                Screen::Chat => return Ok(true),
+                Screen::Panopticon => state.screen = Screen::Chat,
+                // Inspect and Quarantine both pop one level back to the
+                // panopticon (their conceptual parent). Sharing the arm
+                // matches their navigation semantics; if either grows a
+                // distinct Esc behaviour later, split the arm then.
+                Screen::Inspect | Screen::Quarantine => state.screen = Screen::Panopticon,
             }
-            Screen::Quarantine => {
-                state.screen = Screen::Panopticon;
-                return Ok(false);
-            }
-        },
+            return Ok(false);
+        }
         _ => {}
     }
 
     match state.screen {
         Screen::Chat => handle_key_chat(key, state, data_dir, registry, keystore),
         Screen::Panopticon => Ok(handle_key_panopticon(key, state)),
+        Screen::Inspect => Ok(handle_key_inspect(key, state)),
         Screen::Quarantine => Ok(handle_key_quarantine(key, state)),
     }
 }
@@ -492,10 +532,12 @@ fn handle_key_chat(
 }
 
 /// Panopticon-screen key bindings. `j`/`k` (and arrow keys) navigate the
-/// agent table; `Enter` switches back to the chat for now — Phase 6 only
-/// hosts the lead's chat, so Enter on a non-lead row currently closes the
-/// panopticon without opening a different chat. Phase 7 wires per-agent
-/// chat.
+/// agent table; `Enter` opens the focused agent's per-agent inspect
+/// screen (read-only drill-in). `Q` opens the quarantine review stub.
+///
+/// Per-agent *chat* is intentionally not reachable from the panopticon —
+/// the spec routes chat through `reeve attach <name>` from the CLI so
+/// the panopticon stays a watch surface, not a navigation hub.
 fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
     match (key.code, key.modifiers) {
         (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
@@ -504,24 +546,22 @@ fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
         (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
             state.panopticon_focus_up();
         }
-        // Open the focused agent's chat. Sets the chat target on `state`;
-        // the event loop notices the agent changed and triggers a reload
-        // so the chat shows the new agent's conversation rather than the
-        // previous one's. Defensive: if the focus index is out of range
-        // (empty registry, snapshot mid-refresh), leave the chat target
-        // alone and just switch screens — the chat keeps showing
-        // whatever was there before.
+        // Open the focused agent's inspect screen. Sets the inspect
+        // target on `state`; the event loop notices the change and
+        // triggers a reload so the inspect view shows the new agent's
+        // conversation/status/cost rather than whatever was loaded
+        // before. The Thread tab is the spec's default landing tab on
+        // entry. Defensive: if the focus index is out of range (empty
+        // registry, snapshot mid-refresh), leave the inspect target
+        // alone — switching to the inspect screen with a stale (or
+        // None) target would show last-good data rather than crash.
         (KeyCode::Enter, _) => {
             if let Some(agent) = state.panopticon.agents.get(state.panopticon_focus) {
-                state.chat_agent_name = agent.name.clone();
-                // Reset the input buffer + scroll so the operator does
-                // not accidentally send a message typed for one agent to
-                // a different one, and so the new agent's history opens
-                // at the latest entry.
-                state.set_input(String::new());
+                state.inspect_agent_name = Some(agent.name.clone());
+                state.inspect_tab = InspectTab::Thread;
                 state.scroll_to_bottom();
             }
-            state.screen = Screen::Chat;
+            state.screen = Screen::Inspect;
         }
         // `Q` opens the quarantine review. Phase 6 ships a stub renderer
         // that surfaces the existing quarantine count; Phase 8 fills in
@@ -530,6 +570,61 @@ fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
         // terminals, but a `SHIFT`-modifier variant is also possible —
         // accept both.
         (KeyCode::Char('Q'), _) => state.screen = Screen::Quarantine,
+        _ => {}
+    }
+    false
+}
+
+/// Inspect-screen key bindings: tab cycling and back-to-panopticon.
+///
+/// - `Tab` advances to the next tab; `Shift+Tab` to the previous; both
+///   wrap. `1`–`5` jump directly to a tab (matches the wireframe's
+///   `Tabs switched with Tab/Shift+Tab or 1-5`).
+/// - `h` (vim-flavoured back) and `Esc` both return to the panopticon
+///   with `panopticon_focus` preserved so the operator can hop into
+///   another agent without re-navigating.
+/// - PageUp/PageDown/End scroll the Thread tab's body. Scroll keys
+///   are accepted on every tab for keystroke consistency even though
+///   the stub tabs have nothing to scroll — the renderer ignores the
+///   offset on those tabs.
+///
+/// `q` and the global `Esc`/`Tab` cases never reach here: the dispatcher
+/// in `handle_key` consumes them before delegating.
+fn handle_key_inspect(key: event::KeyEvent, state: &mut AppState) -> bool {
+    const ROWS_PER_PAGE: u16 = 10;
+    const ROWS_PER_LINE_NUDGE: u16 = 1;
+
+    match (key.code, key.modifiers) {
+        (KeyCode::Tab, KeyModifiers::NONE) => {
+            state.inspect_tab = state.inspect_tab.next();
+        }
+        (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => {
+            state.inspect_tab = state.inspect_tab.prev();
+        }
+        (KeyCode::Char(c @ '1'..='5'), _) => {
+            // ASCII '1' → 0, '2' → 1, … '5' → 4. Spell out each
+            // mapping rather than reach for `c as usize` (which the
+            // crate's `as_conversions` lint forbids) or a clever
+            // arithmetic shuffle — the match table reads exactly like
+            // the spec's "Tabs switched with 1-5" line.
+            let tab = match c {
+                '1' => InspectTab::Thread,
+                '2' => InspectTab::Tools,
+                '3' => InspectTab::Model,
+                '4' => InspectTab::Decisions,
+                '5' => InspectTab::Memory,
+                _ => return false, // unreachable: bounded by the outer pattern
+            };
+            state.inspect_tab = tab;
+        }
+        (KeyCode::Char('h'), KeyModifiers::NONE) => {
+            state.screen = Screen::Panopticon;
+        }
+        (KeyCode::PageUp, _) => state.scroll_up(ROWS_PER_PAGE),
+        (KeyCode::PageDown, _) => state.scroll_down(ROWS_PER_PAGE),
+        (KeyCode::Up, KeyModifiers::SHIFT) => state.scroll_up(ROWS_PER_LINE_NUDGE),
+        (KeyCode::Down, KeyModifiers::SHIFT) => state.scroll_down(ROWS_PER_LINE_NUDGE),
+        (KeyCode::End, _) => state.scroll_to_bottom(),
         _ => {}
     }
     false
@@ -657,58 +752,66 @@ mod tests {
         assert_eq!(state.panopticon_focus, 0);
     }
 
-    // A3: Enter on the panopticon pops back to the chat screen — Phase 6
-    // collapses every Enter to "return to lead chat" since only the lead's
-    // chat is wired. Phase 7 will branch on the focused agent.
+    // A3: Enter on the panopticon opens the per-agent inspect screen.
+    // Per the Phase 7 done-when: chat is no longer reachable from the
+    // panopticon — only `reeve attach <name>` opens a chat.
     #[test]
-    fn handle_key_panopticon_enter_switches_to_chat() {
+    fn handle_key_panopticon_enter_switches_to_inspect() {
         let mut state = state_with_agents(2);
         assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
-        assert_eq!(state.screen, Screen::Chat);
+        assert_eq!(state.screen, Screen::Inspect);
     }
 
-    // A3b: Enter on a non-zero panopticon row sets `chat_agent_name` to
-    // that row's agent, so the chat opens for that agent rather than the
-    // lead. This is the Phase 6 done-when criterion "Enter on an agent
-    // row opens that agent's chat".
+    // A3b: Enter on a non-zero panopticon row sets `inspect_agent_name`
+    // to that row's agent and lands on the Thread tab. The chat target
+    // is intentionally unchanged — the operator keeps their typing
+    // surface even while drilling into another agent.
     #[test]
-    fn handle_key_panopticon_enter_targets_focused_agent() {
+    fn handle_key_panopticon_enter_targets_focused_agent_for_inspect() {
         let mut state = state_with_agents(3);
         state.chat_agent_name = "lead".to_owned();
         state.panopticon_focus = 2;
         let expected = state.panopticon.agents[2].name.clone();
         assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
-        assert_eq!(state.screen, Screen::Chat);
-        assert_eq!(state.chat_agent_name, expected);
+        assert_eq!(state.screen, Screen::Inspect);
+        assert_eq!(state.inspect_agent_name.as_deref(), Some(expected.as_str()));
+        assert_eq!(state.inspect_tab, InspectTab::Thread);
+        // Chat target left alone: inspect is a drill-in, not a switch.
+        assert_eq!(state.chat_agent_name, "lead");
     }
 
-    // A3c: Enter resets the input buffer and scroll on agent switch.
-    // Prevents the surprising case of typing a draft for one agent then
-    // accidentally sending it to a different one after navigating away.
+    // A3c: Enter snaps scroll to the bottom on inspect entry so the
+    // operator sees the most recent activity for the focused agent.
+    // The input buffer is *not* cleared (inspect has no input pane;
+    // a chat draft survives an inspect detour).
     #[test]
-    fn handle_key_panopticon_enter_resets_input_and_scroll() {
+    fn handle_key_panopticon_enter_scrolls_inspect_to_bottom() {
         let mut state = state_with_agents(2);
-        state.set_input("half-typed message for agent-0".to_owned());
+        state.set_input("draft for chat agent".to_owned());
         state.scroll_up(20);
         state.panopticon_focus = 1;
         assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
-        assert!(state.input.is_empty(), "input should clear on switch");
         assert!(
             state.is_at_bottom(),
-            "scroll should snap to bottom on switch"
+            "scroll should snap to bottom on inspect entry"
+        );
+        assert_eq!(
+            state.input, "draft for chat agent",
+            "input buffer must survive an inspect detour"
         );
     }
 
     // A3d: Enter with an out-of-range focus index (transient empty
-    // snapshot) is defensive: switches screens but leaves the chat
-    // target unchanged.
+    // snapshot) is defensive: switches screens but leaves the inspect
+    // target alone. Showing the previously-inspected agent's data is
+    // less confusing than showing a crash or an empty view.
     #[test]
-    fn handle_key_panopticon_enter_with_empty_table_leaves_chat_target() {
+    fn handle_key_panopticon_enter_with_empty_table_leaves_inspect_target() {
         let mut state = state_with_agents(0);
-        state.chat_agent_name = "lead".to_owned();
+        state.inspect_agent_name = Some("previous-agent".to_owned());
         assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
-        assert_eq!(state.screen, Screen::Chat);
-        assert_eq!(state.chat_agent_name, "lead");
+        assert_eq!(state.screen, Screen::Inspect);
+        assert_eq!(state.inspect_agent_name.as_deref(), Some("previous-agent"));
     }
 
     // A4: unrelated keys are no-ops; focus and screen stay put.
@@ -937,5 +1040,209 @@ mod tests {
         state.chat_agent_name = "lead".to_owned();
         reload_state(&mut state, data_dir, &registry_path);
         assert_eq!(state.conversation[0].text, "LEAD-MARKER");
+    }
+
+    // RS2: reload_state reads the *inspect* agent's file when the
+    // operator is on Screen::Inspect — even if the chat target is a
+    // different agent. This is the load-bearing invariant for the
+    // per-agent inspect drill-in: the screen MUST show the agent the
+    // operator Enter-ed into, not the agent they were chatting with.
+    #[test]
+    fn reload_state_reads_inspect_agent_on_inspect_screen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        seed_agent_conversation(data_dir, "lead", "LEAD-MARKER");
+        seed_agent_conversation(data_dir, "worker-y", "WORKER-Y-MARKER");
+        let registry_path = tmp.path().join("nonexistent-registry.toml");
+
+        let mut state = AppState::default();
+        state.chat_agent_name = "lead".to_owned();
+        // Operator is inspecting worker-y while their chat target is
+        // still lead. reload must read worker-y, not lead.
+        state.screen = Screen::Inspect;
+        state.inspect_agent_name = Some("worker-y".to_owned());
+        reload_state(&mut state, data_dir, &registry_path);
+        assert_eq!(state.conversation[0].text, "WORKER-Y-MARKER");
+
+        // Tab/Esc back to Chat: reload must now read the chat target
+        // again, not whatever inspect was looking at.
+        state.screen = Screen::Chat;
+        reload_state(&mut state, data_dir, &registry_path);
+        assert_eq!(state.conversation[0].text, "LEAD-MARKER");
+    }
+
+    // RS3: defensive — Screen::Inspect with None inspect_agent_name
+    // falls back to the chat target rather than panicking. This branch
+    // is unreachable in normal flow (Enter from panopticon always sets
+    // the inspect target before switching screens), but the fallback
+    // keeps reload_state robust against future call sites that might
+    // construct the state differently.
+    #[test]
+    fn reload_state_inspect_with_none_target_falls_back_to_chat_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+        seed_agent_conversation(data_dir, "lead", "LEAD-MARKER");
+        let registry_path = tmp.path().join("nonexistent-registry.toml");
+
+        let mut state = AppState::default();
+        state.chat_agent_name = "lead".to_owned();
+        state.screen = Screen::Inspect;
+        state.inspect_agent_name = None;
+        reload_state(&mut state, data_dir, &registry_path);
+        assert_eq!(state.conversation[0].text, "LEAD-MARKER");
+    }
+
+    // ── Inspect-screen key bindings ───────────────────────────────────
+
+    fn state_in_inspect() -> AppState {
+        let mut state = AppState::default();
+        state.screen = Screen::Inspect;
+        state.inspect_agent_name = Some("worker-x".to_owned());
+        state.inspect_tab = InspectTab::Thread;
+        state.panopticon_focus = 2; // preserved through the round trip
+        state
+    }
+
+    // IK1: Tab cycles tabs forward through the five-entry list and
+    // wraps from Memory back to Thread. The cycle order matches the
+    // wireframe (Thread → Tools → Model → Decisions → Memory → Thread).
+    #[test]
+    fn handle_key_inspect_tab_cycles_forward_with_wrap() {
+        let mut state = state_in_inspect();
+        let order = [
+            InspectTab::Tools,
+            InspectTab::Model,
+            InspectTab::Decisions,
+            InspectTab::Memory,
+            InspectTab::Thread,
+        ];
+        for expected in order {
+            assert!(!handle_key_inspect(key(KeyCode::Tab), &mut state));
+            assert_eq!(state.inspect_tab, expected);
+        }
+    }
+
+    // IK2: BackTab (Shift+Tab on most terminals) cycles backward and
+    // wraps from Thread back to Memory. Symmetric with IK1.
+    #[test]
+    fn handle_key_inspect_backtab_cycles_backward_with_wrap() {
+        let mut state = state_in_inspect();
+        let order = [
+            InspectTab::Memory,
+            InspectTab::Decisions,
+            InspectTab::Model,
+            InspectTab::Tools,
+            InspectTab::Thread,
+        ];
+        for expected in order {
+            assert!(!handle_key_inspect(key(KeyCode::BackTab), &mut state));
+            assert_eq!(state.inspect_tab, expected);
+        }
+    }
+
+    // IK3: 1-5 jump directly to a specific tab in display order. Any
+    // key outside that range is a no-op (handled by the catch-all `_`
+    // arm).
+    #[test]
+    fn handle_key_inspect_numeric_keys_jump_to_tab() {
+        let mut state = state_in_inspect();
+        let cases = [
+            ('1', InspectTab::Thread),
+            ('2', InspectTab::Tools),
+            ('3', InspectTab::Model),
+            ('4', InspectTab::Decisions),
+            ('5', InspectTab::Memory),
+        ];
+        for (ch, expected) in cases {
+            assert!(!handle_key_inspect(key(KeyCode::Char(ch)), &mut state));
+            assert_eq!(
+                state.inspect_tab, expected,
+                "key '{ch}' should jump to {expected:?}"
+            );
+        }
+        // '6' is out of range; tab stays at the previous setting (Memory).
+        assert!(!handle_key_inspect(key(KeyCode::Char('6')), &mut state));
+        assert_eq!(state.inspect_tab, InspectTab::Memory);
+    }
+
+    // IK4: `h` returns to the panopticon with panopticon_focus preserved
+    // so the operator can hop into another agent without re-navigating.
+    // This is the spec's done-when: "h from inspect returns to the
+    // panopticon with the same agent row focused".
+    #[test]
+    fn handle_key_inspect_h_returns_to_panopticon_with_focus_preserved() {
+        let mut state = state_in_inspect();
+        assert_eq!(state.panopticon_focus, 2);
+        assert!(!handle_key_inspect(key(KeyCode::Char('h')), &mut state));
+        assert_eq!(state.screen, Screen::Panopticon);
+        assert_eq!(state.panopticon_focus, 2);
+    }
+
+    // IK5: Esc behaves the same way as `h` — back to panopticon, focus
+    // preserved. Two key bindings for the same action match the rest
+    // of the TUI (h is vim canon, Esc is general muscle memory).
+    // Routed through the global handle_key dispatcher since Esc is a
+    // global key.
+    #[test]
+    fn handle_key_esc_from_inspect_returns_to_panopticon() {
+        let mut state = state_in_inspect();
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let was_exit = handle_key(
+            key(KeyCode::Esc),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!was_exit, "Esc from inspect must not exit the TUI");
+        assert_eq!(state.screen, Screen::Panopticon);
+        assert_eq!(state.panopticon_focus, 2);
+    }
+
+    // IK6: Tab on the inspect screen is screen-local — it cycles tabs,
+    // not screens. Without this, the global Tab handler would toggle
+    // Chat ↔ Panopticon and drop the operator out of inspect on every
+    // Tab press.
+    #[test]
+    fn handle_key_tab_on_inspect_stays_in_inspect_and_cycles_tab() {
+        let mut state = state_in_inspect();
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let was_exit = handle_key(
+            key(KeyCode::Tab),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!was_exit);
+        assert_eq!(state.screen, Screen::Inspect, "Tab must not leave inspect");
+        assert_eq!(state.inspect_tab, InspectTab::Tools);
+    }
+
+    /// Construct registry + keystore for the few inspect tests that
+    /// route through the global `handle_key`. Neither is exercised by
+    /// inspect dispatch (the global handler returns early on Esc/Tab
+    /// without touching the chat helper) but `handle_key` requires the
+    /// references.
+    ///
+    /// The tempdir's lifetime is leaked into the registry by tying it
+    /// to a `Box::leak`'d path; the test process owns the directory
+    /// until exit.
+    fn test_registry_and_keystore() -> (
+        IdentityRegistry,
+        reeve_runtime::keychain::memory::MemoryKeyStore,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        chmod_700(tmp.path());
+        let path = tmp.keep();
+        let registry = IdentityRegistry::open(path).unwrap();
+        (
+            registry,
+            reeve_runtime::keychain::memory::MemoryKeyStore::new(),
+        )
     }
 }
