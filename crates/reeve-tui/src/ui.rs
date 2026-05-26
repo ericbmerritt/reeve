@@ -68,7 +68,13 @@ fn status_text(status: &AgentStatus) -> &'static str {
     }
 }
 
-/// Format: `reeve · lead ({persona}) ─── {model} · {sigil} {status}`
+/// Format: `reeve · {agent} ({persona}) ─── {model} · {sigil} {status}`
+///
+/// The agent slot is the role name from `state.chat_agent_name` — `"lead"`
+/// for the lead, the worker's registered name (e.g. `"worker-2e28aff5"`)
+/// when the operator is in a worker's chat after Enter-ing its panopticon
+/// row. Hardcoding `"lead"` here would mislabel every non-lead chat: the
+/// body would be the worker's, but the title would still claim lead.
 fn build_title_bar(state: &AppState) -> Line<'static> {
     let sigil = status_sigil(&state.status);
     let status = status_text(&state.status);
@@ -80,9 +86,9 @@ fn build_title_bar(state: &AppState) -> Line<'static> {
     };
     let prefix = Span::styled("reeve · ".to_owned(), prefix_style);
 
-    let lead_part = Span::raw(format!(
-        "lead ({}) \u{2500}\u{2500}\u{2500} {} \u{00B7} ",
-        state.persona_name, state.model_id,
+    let agent_part = Span::raw(format!(
+        "{} ({}) \u{2500}\u{2500}\u{2500} {} \u{00B7} ",
+        state.chat_agent_name, state.persona_name, state.model_id,
     ));
 
     let sigil_style = status_color(&state.status)
@@ -92,7 +98,7 @@ fn build_title_bar(state: &AppState) -> Line<'static> {
 
     let status_span = Span::raw(format!(" {status}"));
 
-    let mut spans = vec![prefix, lead_part, sigil_span, status_span];
+    let mut spans = vec![prefix, agent_part, sigil_span, status_span];
     if !state.is_at_bottom() {
         // Surface scroll position so the operator knows new entries are
         // arriving above their viewport and how to get back. End is the
