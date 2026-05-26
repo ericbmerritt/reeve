@@ -217,7 +217,7 @@ impl AgentInbox {
     }
 
     /// Post-retention archive for `cur/` rotation housekeeping:
-    /// `agents/<id>/inbox/archive/`. Files moved here by [`Watcher::rotate_cur`]
+    /// `agents/<id>/inbox/archive/`. Files moved here by `Watcher::rotate_cur`
     /// have aged past the configured retention threshold and are no longer
     /// needed in the active `cur/` buffer.
     pub fn archive(&self) -> &Path {

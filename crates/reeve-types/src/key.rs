@@ -75,7 +75,7 @@ impl PublicKey {
     }
 
     /// Return the human-readable fingerprint: colon-separated hex pairs of
-    /// the leading [`FINGERPRINT_PREFIX_BYTES`] bytes (e.g.
+    /// the leading `FINGERPRINT_PREFIX_BYTES` bytes (e.g.
     /// `aa:bb:cc:dd:ee:ff:00:11`). Stable across runs for a given key.
     ///
     /// **Display only.** Never use this value for equality checks, key

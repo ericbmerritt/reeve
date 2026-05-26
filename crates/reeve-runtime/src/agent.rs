@@ -7,7 +7,7 @@
 //! the model returns tool calls, the agent dispatches them as [`InvokeTool`]
 //! messages to the registered tool actors, collects [`ToolResult`] replies
 //! into the conversation history, and calls the adapter again. The loop
-//! terminates on `FinishReason::EndTurn` or when [`MAX_TOOL_ITERATIONS`] is
+//! terminates on `FinishReason::EndTurn` or when `MAX_TOOL_ITERATIONS` is
 //! reached (runaway guard).
 //!
 //! Lifecycle:

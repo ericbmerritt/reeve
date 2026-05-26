@@ -65,6 +65,7 @@
           cargo-deny
           cargo-llvm-cov
           cargo-nextest
+          mdbook
           ripgrep
           prettier
         ];

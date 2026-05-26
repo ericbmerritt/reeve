@@ -17,9 +17,9 @@
 //!
 //! Three implementations ship in this crate:
 //!
-//! - [`macos::MacOsKeyStore`] — backed by Apple's Security.framework generic
+//! - `macos::MacOsKeyStore` — backed by Apple's Security.framework generic
 //!   password API. Active on `target_os = "macos"`.
-//! - [`linux::SecretServiceKeyStore`] — backed by the freedesktop Secret
+//! - `linux::SecretServiceKeyStore` — backed by the freedesktop Secret
 //!   Service via `secret-service`'s blocking interface. Active on Unix targets
 //!   other than macOS, and requires a running `gnome-keyring-daemon` or
 //!   `kwallet` providing the Secret Service API on the session bus.

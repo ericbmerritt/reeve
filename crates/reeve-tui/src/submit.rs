@@ -15,7 +15,7 @@
 //! The lead agent's [`reeve_types::IdentityId`] is read from the spawn snapshot
 //! (`agents/lead/agent.toml`). The operator's signing seed is retrieved from
 //! the platform keystore. The envelope is built and signed using the same
-//! pattern as [`reeve_cli::envelope::sign`].
+//! pattern as `reeve_cli::envelope::sign`.
 
 use std::fmt;
 use std::fs;

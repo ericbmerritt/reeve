@@ -7,7 +7,7 @@
 //! placeholder so the operator can see the layout but doesn't mistake
 //! the empty body for a render bug. `Tab`/`Shift+Tab` and `1-5` cycle
 //! tabs; `h`/`Esc` returns to the panopticon (the keymap is in
-//! [`crate::app::handle_key_inspect`]).
+//! `crate::app::handle_key_inspect`).
 //!
 //! Aesthetic continuity with [`crate::ui`], [`crate::ui_panopticon`], and
 //! [`crate::ui_quarantine`] is intentional — same `reeve · …` title

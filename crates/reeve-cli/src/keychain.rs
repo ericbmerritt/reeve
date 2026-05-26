@@ -6,9 +6,9 @@
 
 // ── OperatorKeyStore factory ───────────────────────────────────────────────────
 
-/// Construct the platform keychain backend that implements [`OperatorKeyStore`].
+/// Construct the platform keychain backend that implements `OperatorKeyStore`.
 ///
-/// On macOS this is [`MacOsKeyStore`]; on other Unix systems it opens a
+/// On macOS this is `MacOsKeyStore`; on other Unix systems it opens a
 /// D-Bus connection to the Secret Service daemon. Errors on Linux if the
 /// daemon is unavailable.
 ///
@@ -24,7 +24,7 @@ pub(crate) fn open_platform_keystore(
     Ok(reeve_runtime::keychain::macos::MacOsKeyStore::new())
 }
 
-/// Construct the platform keychain backend that implements [`OperatorKeyStore`].
+/// Construct the platform keychain backend that implements `OperatorKeyStore`.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn open_platform_keystore(
 ) -> Result<reeve_runtime::keychain::linux::SecretServiceKeyStore, Box<dyn std::error::Error>> {
@@ -33,10 +33,10 @@ pub(crate) fn open_platform_keystore(
 
 // ── OperatorSecretStore factory ────────────────────────────────────────────────
 
-/// Construct the platform keychain backend that implements [`OperatorSecretStore`].
+/// Construct the platform keychain backend that implements `OperatorSecretStore`.
 ///
-/// The macOS and Linux backends implement both [`OperatorKeyStore`] and
-/// [`OperatorSecretStore`]; these are separate factory functions because the
+/// The macOS and Linux backends implement both `OperatorKeyStore` and
+/// `OperatorSecretStore`; these are separate factory functions because the
 /// return types differ and Rust does not have existential `impl Trait` in
 /// return position with platform branching.
 ///
@@ -52,7 +52,7 @@ pub(crate) fn open_platform_secretstore(
     Ok(reeve_runtime::keychain::macos::MacOsKeyStore::new())
 }
 
-/// Construct the platform keychain backend that implements [`OperatorSecretStore`].
+/// Construct the platform keychain backend that implements `OperatorSecretStore`.
 #[cfg(all(unix, not(target_os = "macos")))]
 pub(crate) fn open_platform_secretstore(
 ) -> Result<reeve_runtime::keychain::linux::SecretServiceKeyStore, Box<dyn std::error::Error>> {

@@ -27,7 +27,7 @@
 //!   the top with a `─ workers ─` separator before the rest.
 //! - Stopped rows rendered DIM so they recede from glance attention.
 //! - Operator-authored events surface as a single `you` row (the data
-//!   layer's [`Source::Operator`] variant, rendered as [`OPERATOR_LABEL`]);
+//!   layer's [`Source::Operator`] variant, rendered as `OPERATOR_LABEL`);
 //!   coloured Yellow to match the operator's speaker hue in the chat
 //!   screen.
 //! - Pending decisions section is *rendered* even when empty (`── none ──`)

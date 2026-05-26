@@ -1,0 +1,8 @@
+[book]
+title = "Reeve"
+authors = ["Eric Merritt"]
+language = "en"
+src = "src"
+
+[output.html]
+no-section-label = false

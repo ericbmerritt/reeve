@@ -36,7 +36,7 @@ use crate::ValidatedAgentName;
 
 // ── Messages ──────────────────────────────────────────────────────────────────
 
-/// Errors returned by [`SpawnRequest::validate`] when the caller-supplied
+/// Errors returned by `SpawnRequest::validate` when the caller-supplied
 /// fields fail invariant checks before the message is enqueued.
 #[derive(Debug)]
 pub enum SpawnRequestError {
@@ -88,9 +88,9 @@ impl ValidatedSpawnParams {
 ///
 /// Construction is a two-step process:
 ///
-/// 1. [`SpawnRequest::validate`] — checks all fields except `reply_to`; returns
-///    a [`ValidatedSpawnParams`] on success.
-/// 2. [`SpawnRequest::new`] — infallible; attaches a relay recipient to the
+/// 1. `SpawnRequest::validate` — checks all fields except `reply_to`; returns
+///    a `ValidatedSpawnParams` on success.
+/// 2. `SpawnRequest::new` — infallible; attaches a relay recipient to the
 ///    validated params.
 ///
 /// This split ensures the relay actor (which starts a timeout timer) is created
