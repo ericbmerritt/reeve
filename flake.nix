@@ -39,7 +39,17 @@
         version = "0.1.0";
 
         src = self;
-        cargoLock.lockFile = self + "/Cargo.lock";
+
+        # crates.io began rejecting requests with no/generic User-Agent
+        # in late May 2026 (HTTP 403). nixpkgs has two crate-fetching
+        # paths; only `fetchCargoVendor` was patched upstream to send
+        # an identifying UA and use static.crates.io
+        # (NixOS/nixpkgs#512735). `cargoLock.lockFile` routes through
+        # the older `importCargoLock` inline `fetchCrate` which is
+        # still broken at HEAD. Use `cargoHash` + `useFetchCargoVendor`
+        # to take the fixed path.
+        useFetchCargoVendor = true;
+        cargoHash = "sha256-diO7j+Dtzh8PhKMxzTk7pQ+VM7rCeGk29ba1upPyRJg=";
 
         doCheck = false;
 
@@ -57,7 +67,13 @@
 
         packages = with pkgs; [
           toolchain
-          fenix.packages.${system}.rust-analyzer
+          # Use nixpkgs's pre-built rust-analyzer rather than fenix's
+          # nightly. Fenix builds rust-analyzer from source, which
+          # routes through the broken `importCargoLock` crate fetcher
+          # and is currently blocked by crates.io's User-Agent policy
+          # (see the cargoHash comment above). nixpkgs ships a binary
+          # from cache.nixos.org — no crate fetching at build time.
+          rust-analyzer
           jujutsu
           just
           alejandra
