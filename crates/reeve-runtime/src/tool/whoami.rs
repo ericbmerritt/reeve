@@ -10,20 +10,26 @@ use std::path::PathBuf;
 
 use actix::{Actor, Context, Handler};
 
-use super::{check_authority, AuthorityDecision, InvokeTool, ToolResult};
+use super::{check_authority, InvokeTool, ToolResult};
 use crate::agent_registry::AgentRegistry;
+use crate::capability::ToolCategory;
 
 /// Tool that returns the invoking agent's identity. No arguments.
 pub struct WhoamiTool {
     agent_registry_path: PathBuf,
+    profile: Option<std::sync::Arc<crate::capability::CapabilityProfile>>,
 }
 
 impl WhoamiTool {
     /// Construct a [`WhoamiTool`] reading from the given registry file for
     /// name resolution.
-    pub fn new(agent_registry_path: PathBuf) -> Self {
+    pub fn new(
+        agent_registry_path: PathBuf,
+        profile: Option<std::sync::Arc<crate::capability::CapabilityProfile>>,
+    ) -> Self {
         Self {
             agent_registry_path,
+            profile,
         }
     }
 
@@ -70,14 +76,20 @@ impl Handler<InvokeTool> for WhoamiTool {
             reply_to,
         } = msg;
 
-        if let AuthorityDecision::Deny { reason } = check_authority(sender_id, &name) {
+        // whoami is an informational tool; no category-based authority check
+        // in phase 1. Future ladders may assign a category when the full
+        // category set is defined.
+        if let Err(refusal) =
+            check_authority(self.profile.as_deref(), ToolCategory::ReadFiles, sender_id)
+        {
             reply_to.do_send(ToolResult {
                 tool_use_id,
-                content: format!("denied: {reason}"),
+                content: refusal.to_json(),
                 is_error: true,
             });
             return;
         }
+        let _ = name;
 
         // Best-effort name resolution. If the registry is unreachable, return
         // the identity_id alone (still useful) and mark is_error so the agent
@@ -159,7 +171,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = WhoamiTool::new(path).start();
+            let tool = WhoamiTool::new(path, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {
@@ -197,7 +209,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = WhoamiTool::new(path).start();
+            let tool = WhoamiTool::new(path, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {

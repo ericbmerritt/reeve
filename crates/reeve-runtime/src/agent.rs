@@ -1206,7 +1206,7 @@ mod tests {
         SpawnSnapshot {
             persona_name: String::from("lead"),
             persona_version: 1,
-            capability_profile: None,
+
             adapter_id: String::from("mock@test"),
             agent_id: String::new(),
             system_prompt: String::new(),
@@ -2087,7 +2087,7 @@ mod tests {
         actix::System::new().block_on(async move {
             // Start the SpawnAgentTool actor backed by a mock coordinator.
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2255,7 +2255,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2420,7 +2420,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2561,7 +2561,7 @@ mod tests {
         actix::System::new().block_on(async move {
             // Register SpawnAgentTool; the model will call "nonexistent_tool".
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient()).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2641,8 +2641,8 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let mock_coord = MockSpawnCoordinator.start();
-            let a = SpawnAgentTool::new(mock_coord.clone().recipient()).start();
-            let b = SpawnAgentTool::new(mock_coord.recipient()).start();
+            let a = SpawnAgentTool::new(mock_coord.clone().recipient(), None).start();
+            let b = SpawnAgentTool::new(mock_coord.recipient(), None).start();
             // Both bindings declare the same name (SpawnAgentTool::descriptor()
             // returns "spawn_agent").
             let tools = vec![
@@ -2701,6 +2701,7 @@ mod tests {
         let data_dir = tmp.path().to_path_buf();
 
         crate::test_support::write_persona_config(&data_dir, "test-persona", "mock");
+        crate::test_support::write_full_access_persona_profile(&data_dir, "test-persona");
 
         let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
         let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
@@ -2738,7 +2739,7 @@ mod tests {
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
-            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient());
+            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient(), None);
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2895,7 +2896,7 @@ mod tests {
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
-            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient());
+            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient(), None);
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,

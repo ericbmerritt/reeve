@@ -37,7 +37,6 @@ const CONFIG_FILE_MODE: u32 = 0o600;
 const DEFAULT_PERSONA_TOML: &str = r#"name = "lead"
 system_prompt = "You are a helpful AI assistant."
 model_preferences = ["claude-opus-4-7"]
-capability_profile = "default"
 display_name = "Lead"
 "#;
 
@@ -119,9 +118,6 @@ pub struct PersonaConfig {
     pub system_prompt: String,
     /// Ordered list of preferred model IDs (e.g., `["claude-opus-4-7"]`).
     pub model_preferences: Vec<String>,
-    /// Name of the capability profile to reference (parsed but not enforced
-    /// in this ladder).
-    pub capability_profile: Option<String>,
     /// Display name override; falls back to `name` if absent.
     pub display_name: Option<String>,
 }
@@ -429,7 +425,6 @@ mod tests {
 name = "analyst"
 system_prompt = "You are a data analyst."
 model_preferences = ["claude-opus-4-7", "claude-sonnet-3-5"]
-capability_profile = "restricted"
 display_name = "Analyst"
 "#,
         );
@@ -441,7 +436,6 @@ display_name = "Analyst"
             cfg.model_preferences,
             vec!["claude-opus-4-7", "claude-sonnet-3-5"]
         );
-        assert_eq!(cfg.capability_profile.as_deref(), Some("restricted"));
         assert_eq!(cfg.display_name.as_deref(), Some("Analyst"));
     }
 
@@ -554,7 +548,6 @@ model_preferences = ["claude-opus-4-7"]
 
         let cfg = load_persona_config(&path).unwrap();
         assert_eq!(cfg.name, "minimal");
-        assert!(cfg.capability_profile.is_none());
         assert!(cfg.display_name.is_none());
     }
 

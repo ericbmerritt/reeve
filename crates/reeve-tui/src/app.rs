@@ -348,7 +348,18 @@ pub fn run(
         }
     }
 
+    let mut last_forced_reload = std::time::Instant::now();
     loop {
+        // Force a reload every 2 seconds regardless of watcher events.
+        // notify's recommended_watcher on macOS (both kqueue and FSEvents)
+        // silently stops delivering events in certain conditions. Polling
+        // at 2 s is fast enough to feel live and is the pragmatic fix
+        // until the notify reliability issue is resolved upstream.
+        if last_forced_reload.elapsed() >= Duration::from_secs(2) {
+            needs_reload.store(true, Ordering::Release);
+            last_forced_reload = std::time::Instant::now();
+        }
+
         if needs_reload.swap(false, Ordering::Acquire) {
             reload_state(&mut state, data_dir, agent_registry_path);
         }

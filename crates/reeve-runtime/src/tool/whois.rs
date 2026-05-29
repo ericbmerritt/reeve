@@ -16,20 +16,23 @@ use std::path::PathBuf;
 use actix::{Actor, Context, Handler};
 use reeve_types::IdentityId;
 
-use super::{check_authority, AuthorityDecision, InvokeTool, ToolResult};
+use super::{check_authority, InvokeTool, ToolResult};
+use crate::capability::{CapabilityProfile, ToolCategory};
 use crate::identity_registry::IdentityRegistry;
+use std::sync::Arc;
 
 /// Tool that looks up an `identity_id` in the operator-owned identity
 /// registry and returns the matching `{kind, display_name}` record.
 pub struct WhoisTool {
     data_dir: PathBuf,
+    profile: Option<Arc<CapabilityProfile>>,
 }
 
 impl WhoisTool {
     /// Construct a [`WhoisTool`] rooted at the runtime's `data_dir`. The
     /// identity registry directory lives under this path.
-    pub fn new(data_dir: PathBuf) -> Self {
-        Self { data_dir }
+    pub fn new(data_dir: PathBuf, profile: Option<Arc<CapabilityProfile>>) -> Self {
+        Self { data_dir, profile }
     }
 
     /// Adapter-facing tool descriptor for [`WhoisTool`].
@@ -138,14 +141,17 @@ impl Handler<InvokeTool> for WhoisTool {
             reply_to,
         } = msg;
 
-        if let AuthorityDecision::Deny { reason } = check_authority(sender_id, &name) {
+        if let Err(refusal) =
+            check_authority(self.profile.as_deref(), ToolCategory::ReadFiles, sender_id)
+        {
             reply_to.do_send(ToolResult {
                 tool_use_id,
-                content: format!("denied: {reason}"),
+                content: refusal.to_json(),
                 is_error: true,
             });
             return;
         }
+        let _ = name;
 
         let (content, is_error) = match resolve_input(&self.data_dir, &input) {
             Ok(value) => (value.to_string(), false),
@@ -202,7 +208,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = WhoisTool::new(tmp.path().to_path_buf()).start();
+            let tool = WhoisTool::new(tmp.path().to_path_buf(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {
@@ -238,7 +244,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = WhoisTool::new(tmp.path().to_path_buf()).start();
+            let tool = WhoisTool::new(tmp.path().to_path_buf(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {
@@ -272,7 +278,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = WhoisTool::new(tmp.path().to_path_buf()).start();
+            let tool = WhoisTool::new(tmp.path().to_path_buf(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {
@@ -304,7 +310,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = WhoisTool::new(tmp.path().to_path_buf()).start();
+            let tool = WhoisTool::new(tmp.path().to_path_buf(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {

@@ -91,7 +91,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use notify::{RecommendedWatcher, RecursiveMode, Watcher as NotifyWatcher};
+use notify;
 use reeve_types::{Envelope, IdentityId, KeyId, MessageId};
 use time::{Duration, OffsetDateTime};
 
@@ -445,29 +445,20 @@ impl Watcher {
         inbox: &AgentInbox,
         on_quarantine: &(impl Fn(String) + Send),
     ) -> Result<(), WatcherError> {
-        // Subscribe BEFORE scanning so no file is missed in the gap.
-        let (tx, rx) = std::sync::mpsc::channel();
-        let mut fs_watcher =
-            RecommendedWatcher::new(tx, notify::Config::default()).map_err(WatcherError::Notify)?;
-        fs_watcher
-            .watch(inbox.new_dir(), RecursiveMode::NonRecursive)
-            .map_err(WatcherError::Notify)?;
-
         // Crash-recovery scan: picks up files left from a prior run.
         debug!("scanning inbox/new/ for existing files");
         self.scan_new(agent_id, inbox, on_quarantine)?;
 
-        for event_result in &rx {
-            event_result.map_err(WatcherError::Notify)?;
-            // Scan the directory on every event regardless of kind.
-            // Discriminating event types is fragile: on macOS FSEvents, an
-            // atomic rename(2) produces Modify(Name(To)) not Create, and the
-            // mapping varies by platform and filesystem. Scanning on any change
-            // is robust — process_file is idempotent via the delivery and
-            // replay ledgers.
-            self.scan_new(agent_id, inbox, on_quarantine)?;
-        }
-
+        // Primary delivery is handled by the 2-second polling interval in
+        // WatcherActor (supervisor.rs). kqueue/FSEvents is not used here
+        // because the notify kqueue backend on macOS silently dies when a
+        // second concurrent caller (the poll interval) renames files through
+        // `inbox/new/`, and FSEvents does not reliably fire for cross-directory
+        // renames (`inbox/tmp/ → inbox/new/`) regardless. Polling at 2 s is
+        // fast enough for interactive use and avoids all of these failure modes.
+        //
+        // Return immediately so the spawn_blocking thread exits cleanly;
+        // WatcherActor owns the ongoing delivery loop.
         Ok(())
     }
 
@@ -924,6 +915,25 @@ impl Watcher {
                 "cur/ envelope body is not valid UTF-8; skipping crash-recovery dispatch"
             );
             None
+        }
+    }
+
+    /// Periodic fallback scan of `inbox/new/` — called from the housekeeping
+    /// ticker in [`crate::supervisor::WatcherActor`] to recover messages whose
+    /// `FSEvents` notification was dropped by the OS.
+    ///
+    /// Uses a no-op quarantine callback because quarantine events are emitted
+    /// inside `process_file`; this path does not have access to the
+    /// per-agent quarantine channel established at inbox-start time. Messages
+    /// that would be quarantined are still moved to `inbox/quarantine/` by
+    /// the pipeline; the operator learns about them from the audit log and
+    /// the TUI quarantine screen rather than from the per-agent callback.
+    ///
+    /// Errors are swallowed — this is a best-effort background sweep and must
+    /// not bring down the watcher actor.
+    pub(crate) fn scan_new_fallback(&self, inbox: &AgentInbox, agent_id: IdentityId) {
+        if let Err(err) = self.scan_new(agent_id, inbox, &|_| {}) {
+            tracing::debug!(%err, "scan_new_fallback: error during periodic rescan");
         }
     }
 

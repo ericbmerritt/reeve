@@ -69,9 +69,17 @@ use crate::ledger::{DeliveryKey, DeliveryLedger, LedgerError, ReplayKey, ReplayL
 /// into `inbox/new/`. Bounded by spec § Filesystem Safety: "bounded file size".
 pub const MAX_ENVELOPE_BYTES: usize = 1024 * 1024; // 1 MiB
 
-/// Default clock skew tolerance: five minutes in each direction. Matches
-/// common practice for Kerberos and similar time-sensitive protocols.
-pub const DEFAULT_CLOCK_SKEW: Duration = Duration::minutes(5);
+/// Default clock skew tolerance.
+///
+/// Set to one hour. The replay ledger is the primary replay-attack defense;
+/// clock skew is belt-and-suspenders. On this workstation runtime, operator
+/// messages are signed locally and the only relay is the filesystem — replay
+/// attacks require physical access to the data directory. Five minutes was
+/// borrowed from Kerberos, which operates over untrusted networks and has no
+/// replay ledger. One hour lets the `inbox/new/` fallback scan (2 s) and any
+/// `FSEvents` delay (sometimes minutes on macOS) process messages before they
+/// expire.
+pub const DEFAULT_CLOCK_SKEW: Duration = Duration::hours(1);
 
 /// The verdict returned by [`VerificationPipeline::verify`].
 #[derive(Debug)]

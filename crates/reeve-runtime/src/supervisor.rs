@@ -43,6 +43,13 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(1);
 /// How often [`WatcherActor`] runs `cur/` rotation housekeeping.
 const ROTATION_INTERVAL: Duration = Duration::from_mins(5);
 
+/// How often [`WatcherActor`] rescans `inbox/new/` as a fallback for missed
+/// filesystem events. macOS `kqueue`/`FSEvents` does not reliably deliver events
+/// for cross-directory renames (the `inbox/tmp/ → inbox/new/` atomic move the
+/// TUI uses). Two seconds is fast enough to feel responsive without burning
+/// measurable CPU — the typical scan finds zero files.
+const INBOX_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+
 /// Files older than this are moved from `cur/` to `archive/` on each rotation.
 ///
 /// `cur/` is an in-flight buffer; the conversation journal is the durable
@@ -214,8 +221,9 @@ fn touch_heartbeat(path: &std::path::Path) -> io::Result<()> {
 /// [`Watcher::run`]: crate::watcher::Watcher::run
 pub struct WatcherActor {
     watcher: Arc<Watcher>,
-    /// Inboxes registered via [`WatchInbox`]; iterated on each rotation tick.
-    inboxes: Vec<AgentInbox>,
+    /// Inboxes registered via [`WatchInbox`]; iterated on each rotation tick
+    /// and on the `FSEvents` fallback rescan.
+    inboxes: Vec<(AgentInbox, IdentityId)>,
 }
 
 impl WatcherActor {
@@ -242,7 +250,7 @@ impl Actor for WatcherActor {
     fn started(&mut self, ctx: &mut Context<Self>) {
         ctx.run_interval(ROTATION_INTERVAL, |actor, _ctx| {
             let now = time::OffsetDateTime::now_utc();
-            for inbox in &actor.inboxes {
+            for (inbox, _agent_id) in &actor.inboxes {
                 match actor.watcher.rotate_cur(inbox, CUR_RETENTION, now) {
                     Ok(outcome) if outcome.archived > 0 => {
                         debug!(archived = outcome.archived, "rotated cur/ to archive/");
@@ -250,6 +258,17 @@ impl Actor for WatcherActor {
                     Ok(_) => {}
                     Err(e) => warn!(err = %e, "cur/ rotation error"),
                 }
+            }
+        });
+
+        // Separate short-interval fallback for inbox/new/. macOS kqueue does
+        // not reliably deliver events for cross-directory renames (the TUI
+        // uses an atomic `inbox/tmp/ → inbox/new/` move). Polling every 2 s
+        // is the pragmatic fix; the delivery + replay ledgers make repeated
+        // scans idempotent.
+        ctx.run_interval(INBOX_SCAN_INTERVAL, |actor, _ctx| {
+            for (inbox, agent_id) in &actor.inboxes {
+                actor.watcher.scan_new_fallback(inbox, *agent_id);
             }
         });
     }
@@ -274,7 +293,7 @@ impl Handler<WatchInbox> for WatcherActor {
         let agent_id = msg.agent_id;
         let inbox = msg.inbox.clone();
         let recipient = msg.recipient.clone();
-        self.inboxes.push(msg.inbox.clone());
+        self.inboxes.push((msg.inbox.clone(), msg.agent_id));
         let on_quarantine = msg.on_quarantine;
 
         // Route must be registered before watcher.run starts. The run

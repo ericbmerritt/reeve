@@ -5,10 +5,13 @@
 //! (`SendResult` on success, `SendFailed` on error, with a relay-side timeout
 //! covering the silent case) from the tool's mailbox.
 
+use std::sync::Arc;
+
 use actix::{ActorContext, AsyncContext, Recipient};
 
-use super::{check_authority, AuthorityDecision, InvokeTool, ToolResult};
+use super::{check_authority, InvokeTool, ToolResult};
 use crate::agent_registry::ValidatedAgentName;
+use crate::capability::{CapabilityProfile, ToolCategory};
 use crate::dispatcher::{SendFailed, SendMessage, SendResult};
 
 /// Deadline for [`SendRelay`]: if the dispatcher does not reply within this
@@ -93,12 +96,19 @@ impl actix::Handler<SendFailed> for SendRelay {
 /// - `body` (required): message body to deliver.
 pub struct SendMessageTool {
     dispatcher: Recipient<SendMessage>,
+    profile: Option<Arc<CapabilityProfile>>,
 }
 
 impl SendMessageTool {
     /// Construct a [`SendMessageTool`] wired to the given dispatcher recipient.
-    pub fn new(dispatcher: Recipient<SendMessage>) -> Self {
-        Self { dispatcher }
+    pub fn new(
+        dispatcher: Recipient<SendMessage>,
+        profile: Option<Arc<CapabilityProfile>>,
+    ) -> Self {
+        Self {
+            dispatcher,
+            profile,
+        }
     }
 
     /// Adapter-facing tool descriptor for [`SendMessageTool`].
@@ -163,16 +173,20 @@ impl actix::Handler<InvokeTool> for SendMessageTool {
     fn handle(&mut self, msg: InvokeTool, _ctx: &mut actix::Context<Self>) {
         let InvokeTool {
             tool_use_id,
-            name,
+            name: _,
             input,
             sender_id,
             reply_to,
         } = msg;
 
-        if let AuthorityDecision::Deny { reason } = check_authority(sender_id, &name) {
+        if let Err(refusal) = check_authority(
+            self.profile.as_deref(),
+            ToolCategory::MessagePeers,
+            sender_id,
+        ) {
             reply_to.do_send(ToolResult {
                 tool_use_id,
-                content: format!("denied: {reason}"),
+                content: refusal.to_json(),
                 is_error: true,
             });
             return;
@@ -357,7 +371,7 @@ mod tests {
     fn send_message_missing_to_returns_error() {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool_addr = SendMessageTool::new(dispatcher_dropper()).start();
+            let tool_addr = SendMessageTool::new(dispatcher_dropper(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -389,7 +403,7 @@ mod tests {
     fn send_message_non_string_to_returns_error() {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool_addr = SendMessageTool::new(dispatcher_dropper()).start();
+            let tool_addr = SendMessageTool::new(dispatcher_dropper(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -421,7 +435,7 @@ mod tests {
     fn send_message_empty_to_returns_error() {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool_addr = SendMessageTool::new(dispatcher_dropper()).start();
+            let tool_addr = SendMessageTool::new(dispatcher_dropper(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -453,7 +467,7 @@ mod tests {
     fn send_message_to_with_slash_returns_error() {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool_addr = SendMessageTool::new(dispatcher_dropper()).start();
+            let tool_addr = SendMessageTool::new(dispatcher_dropper(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -485,7 +499,7 @@ mod tests {
     fn send_message_missing_body_returns_error() {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool_addr = SendMessageTool::new(dispatcher_dropper()).start();
+            let tool_addr = SendMessageTool::new(dispatcher_dropper(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -517,7 +531,7 @@ mod tests {
     fn send_message_whitespace_only_body_returns_error() {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool_addr = SendMessageTool::new(dispatcher_dropper()).start();
+            let tool_addr = SendMessageTool::new(dispatcher_dropper(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -551,7 +565,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let mock = MockSuccessDispatcher.start();
-            let tool_addr = SendMessageTool::new(mock.recipient()).start();
+            let tool_addr = SendMessageTool::new(mock.recipient(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -592,7 +606,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let mock = MockFailureDispatcher.start();
-            let tool_addr = SendMessageTool::new(mock.recipient()).start();
+            let tool_addr = SendMessageTool::new(mock.recipient(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -641,7 +655,7 @@ mod tests {
                 captured_to: Arc::clone(&captured_to),
             }
             .start();
-            let tool_addr = SendMessageTool::new(mock.recipient()).start();
+            let tool_addr = SendMessageTool::new(mock.recipient(), None).start();
             let (reply_to, rx) = capture_pair();
 
             let body_with_whitespace = "  meaningful body with spaces  ";
@@ -691,7 +705,7 @@ mod tests {
                 captured_to: Arc::clone(&captured_to),
             }
             .start();
-            let tool_addr = SendMessageTool::new(mock.recipient()).start();
+            let tool_addr = SendMessageTool::new(mock.recipient(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -841,7 +855,7 @@ mod tests {
                 MessageDispatcher::new(dispatcher_registry_path, Arc::clone(&identity_registry));
             let dispatcher_addr = actix::Supervisor::start(move |_| dispatcher);
 
-            let tool_addr = SendMessageTool::new(dispatcher_addr.recipient()).start();
+            let tool_addr = SendMessageTool::new(dispatcher_addr.recipient(), None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {

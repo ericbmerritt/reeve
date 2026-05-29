@@ -147,6 +147,45 @@ pub enum AuditEvent {
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
+
+    /// An authority check on a tool invocation completed — allow or refuse.
+    ///
+    /// Emitted by tool actors after each authority check. Allow
+    /// decisions are cheap and expected; refuse decisions are the actionable
+    /// signal. The `blacklist_version` is always `null` until phase 2 ships
+    /// the blacklist registry.
+    #[serde(rename = "authority.decision")]
+    AuthorityDecision {
+        /// Identity of the agent that issued the tool call.
+        agent_id: IdentityId,
+        /// Persona the agent was spawned under.
+        persona_name: String,
+        /// Schema version of the capability profile that was checked.
+        profile_version: u32,
+        /// Stub action descriptor (`ToolName(<input json>)`); the canonical
+        /// `Tool(specifier)` format arrives in phase 2.
+        action: String,
+        /// Whether the invocation was permitted.
+        disposition: AuthorityDisposition,
+        /// Which enforcement layer refused the call (`null` on allow).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        layer: Option<String>,
+        /// Human-readable reason (`null` on allow).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        rationale: Option<String>,
+        /// SHA-256 of the active blacklist (`null` until phase 2).
+        blacklist_version: Option<String>,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+}
+
+/// Disposition field for `authority.decision` audit entries.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuthorityDisposition {
+    Allow,
+    Refuse,
 }
 
 /// Errors surfaced by audit log operations.
