@@ -200,6 +200,15 @@ impl AgentDirs {
     pub fn identity_key_path(&self) -> PathBuf {
         self.root.join("identity.key")
     }
+
+    /// Capability profile snapshot for this agent: `root/profile.toml`.
+    ///
+    /// Written by the `SpawnCoordinator` at spawn time from the persona's
+    /// `profile.toml`; read by tool actors to gate `InvokeTool` calls.
+    /// Immutable for the agent's lifetime.
+    pub fn profile_path(&self) -> PathBuf {
+        self.root.join("profile.toml")
+    }
 }
 
 // ── ConversationEntry ─────────────────────────────────────────────────────────

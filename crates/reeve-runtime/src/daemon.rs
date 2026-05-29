@@ -24,6 +24,7 @@ use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
 };
 use crate::audit::AuditLog;
+use crate::capability::load_capability_profile;
 use crate::config::{install_defaults, load_persona_config, load_team_config};
 use crate::dispatcher::{MessageDispatcher, SendMessage};
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
@@ -31,7 +32,7 @@ use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
 use crate::model_resolution::{resolve_model, write_spawn_snapshot, SpawnSnapshot};
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
-use crate::spawn_coordinator::{build_subagent_tools, SpawnCoordinator};
+use crate::spawn_coordinator::{build_subagent_tools, SpawnCoordinator, SpawnRequest};
 use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 use crate::watcher::Watcher;
 
@@ -910,11 +911,36 @@ fn launch_actors(
     );
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
 
-    let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord_addr.recipient());
-    let send_message_tool = crate::tool::SendMessageTool::new(dispatcher_addr.clone().recipient());
-    let list_agents_tool = crate::tool::ListAgentsTool::new(agent_registry_path_for_resume.clone());
-    let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone());
-    let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois);
+    let lead_profile = {
+        let p = data_dir_for_resume
+            .join("personas")
+            .join("lead")
+            .join("profile.toml");
+        match load_capability_profile(&p) {
+            Ok(profile) => {
+                debug!(path = %p.display(), "loaded lead persona capability profile");
+                Some(Arc::new(profile))
+            }
+            Err(err) => {
+                warn!(err = %err, "lead persona profile.toml missing or unreadable;                        lead tools run without capability enforcement");
+                None
+            }
+        }
+    };
+    let coord_recipient_for_resume = coord_addr.clone();
+    let spawn_agent_tool =
+        crate::tool::SpawnAgentTool::new(coord_addr.recipient(), lead_profile.clone());
+    let send_message_tool = crate::tool::SendMessageTool::new(
+        dispatcher_addr.clone().recipient(),
+        lead_profile.clone(),
+    );
+    let list_agents_tool = crate::tool::ListAgentsTool::new(
+        agent_registry_path_for_resume.clone(),
+        lead_profile.clone(),
+    );
+    let whoami_tool =
+        crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone(), lead_profile.clone());
+    let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois, lead_profile);
     let tools: Vec<(
         reeve_adapter::Tool,
         actix::Recipient<crate::tool::InvokeTool>,
@@ -980,6 +1006,7 @@ fn launch_actors(
         &watcher_for_resume,
         &resume_inbox_starter,
         &dispatcher_recipient_for_resume,
+        Some(&coord_recipient_for_resume.recipient()),
     );
 
     Ok(dispatcher_addr)
@@ -1010,6 +1037,7 @@ fn resume_persisted_subagents(
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
+    coordinator: Option<&actix::Recipient<SpawnRequest>>,
 ) {
     let registry = match AgentRegistry::open(agent_registry_path.to_path_buf()) {
         Ok(r) => r,
@@ -1031,6 +1059,7 @@ fn resume_persisted_subagents(
             watcher,
             inbox_starter,
             dispatcher,
+            coordinator.cloned(),
             record,
         ) {
             warn!(
@@ -1053,6 +1082,11 @@ fn resume_persisted_subagents(
               registry write); bundling into a context struct trades \
               clarity for indirection at the only call site"
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear sequence of guards: each step depends on the previous; \
+              splitting on line count would fragment the error-handling chain"
+)]
 fn resume_one_subagent(
     data_dir: &Path,
     agent_registry_path: &Path,
@@ -1061,6 +1095,7 @@ fn resume_one_subagent(
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
+    coordinator: Option<actix::Recipient<SpawnRequest>>,
     record: &AgentRecord,
 ) -> Result<(), String> {
     let dirs = AgentDirs::open(data_dir, record.name.as_str())
@@ -1124,10 +1159,27 @@ fn resume_one_subagent(
         snapshot.system_prompt.clone()
     };
 
+    // Load the snapshotted capability profile so resumed agents are gated
+    // identically to freshly-spawned ones. A missing snapshot (e.g. an agent
+    // spawned before Phase 1) is treated as unrestricted rather than refusing
+    // to resume — the operator can add profile.toml and restart to enforce.
+    let profile = match load_capability_profile(&dirs.profile_path()) {
+        Ok(p) => Some(Arc::new(p)),
+        Err(err) => {
+            warn!(
+                agent_name = %record.name,
+                err = %err,
+                "resume: profile.toml missing or unreadable;                  agent tools run without capability enforcement"
+            );
+            None
+        }
+    };
     let tools = build_subagent_tools(
+        coordinator,
         dispatcher.clone(),
         agent_registry_path.to_path_buf(),
-        data_dir.to_path_buf(),
+        data_dir,
+        profile,
     );
     let new_agent = Agent::new(
         Arc::clone(adapter),
@@ -1596,7 +1648,6 @@ mod tests {
         let snapshot = SpawnSnapshot {
             persona_name: "worker".to_owned(),
             persona_version: 1,
-            capability_profile: None,
             adapter_id: adapter.id().to_owned(),
             agent_id: worker_id.to_string(),
             system_prompt: "You are a worker. Reply with 'ack' to any inbound.".to_owned(),
@@ -1633,6 +1684,7 @@ mod tests {
                 &watcher,
                 &inbox_starter,
                 &dispatcher,
+                None,
             );
 
             // resume runs synchronously: by the time it returns the worker
@@ -1685,7 +1737,6 @@ mod tests {
         let snapshot = SpawnSnapshot {
             persona_name: "worker".to_owned(),
             persona_version: 1,
-            capability_profile: None,
             adapter_id: "claude-opus-4-7@some-other-route".to_owned(),
             agent_id: worker_id.to_string(),
             system_prompt: String::from("ignored"),
@@ -1717,6 +1768,7 @@ mod tests {
                 &watcher,
                 &inbox_starter,
                 &dispatcher,
+                None,
             );
 
             actix::System::current().stop();

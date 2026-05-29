@@ -23,7 +23,6 @@ pub struct SpawnSnapshot {
     pub persona_name: String,
     /// `1` until `reeve-authority` introduces versioned artifacts.
     pub persona_version: u32,
-    pub capability_profile: Option<String>,
     /// Resolved adapter identifier (e.g., `"claude-opus-4-7@anthropic-direct"`).
     pub adapter_id: String,
     // model is derived from adapter_id — not stored separately
@@ -151,7 +150,6 @@ pub fn resolve_model(
             return Ok(SpawnSnapshot {
                 persona_name: persona.name.clone(),
                 persona_version: 1,
-                capability_profile: persona.capability_profile.clone(),
                 adapter_id: adapter.id().to_owned(),
                 agent_id: agent_id.to_string(),
                 system_prompt: String::new(), // filled in by the spawn caller
@@ -206,7 +204,6 @@ mod tests {
             name: name.to_owned(),
             system_prompt: String::from("Be helpful."),
             model_preferences: prefs,
-            capability_profile: None,
             display_name: None,
         }
     }
@@ -225,7 +222,6 @@ mod tests {
         assert_eq!(snapshot.model(), "claude-opus-4-7");
         assert_eq!(snapshot.persona_name, "lead");
         assert_eq!(snapshot.persona_version, 1);
-        assert!(snapshot.capability_profile.is_none());
         assert_eq!(snapshot.agent_id, agent_id.to_string());
     }
 
@@ -273,7 +269,6 @@ mod tests {
         let snapshot = SpawnSnapshot {
             persona_name: String::from("lead"),
             persona_version: 1,
-            capability_profile: Some(String::from("default")),
             adapter_id: String::from("claude-opus-4-7@anthropic-direct"),
             agent_id: String::from("01930000-0000-7000-8000-000000000001"),
             system_prompt: String::new(),
@@ -287,7 +282,6 @@ mod tests {
 
         assert_eq!(parsed.persona_name, snapshot.persona_name);
         assert_eq!(parsed.persona_version, snapshot.persona_version);
-        assert_eq!(parsed.capability_profile, snapshot.capability_profile);
         assert_eq!(parsed.adapter_id, snapshot.adapter_id);
         assert_eq!(parsed.agent_id, snapshot.agent_id);
         assert_eq!(parsed.model(), snapshot.model());
@@ -299,7 +293,6 @@ mod tests {
         let original = SpawnSnapshot {
             persona_name: String::from("analyst"),
             persona_version: 1,
-            capability_profile: None,
             adapter_id: String::from("claude-opus-4-7@anthropic-direct"),
             agent_id: String::from("01930000-0000-7000-8000-000000000002"),
             system_prompt: String::new(),
@@ -310,28 +303,9 @@ mod tests {
 
         assert_eq!(deserialized.persona_name, original.persona_name);
         assert_eq!(deserialized.persona_version, original.persona_version);
-        assert_eq!(deserialized.capability_profile, original.capability_profile);
         assert_eq!(deserialized.adapter_id, original.adapter_id);
         assert_eq!(deserialized.agent_id, original.agent_id);
         assert_eq!(deserialized.model(), original.model());
-    }
-
-    // M6: resolve_model includes capability_profile from persona in snapshot.
-    #[test]
-    fn resolve_model_propagates_capability_profile() {
-        let adapter = MockAdapter::new("claude-opus-4-7@anthropic-direct");
-        let persona = PersonaConfig {
-            name: String::from("lead"),
-            system_prompt: String::from("Be helpful."),
-            model_preferences: vec![String::from("claude-opus-4-7")],
-            capability_profile: Some(String::from("default")),
-            display_name: None,
-        };
-        let adapters: &[&dyn reeve_adapter::Adapter] = &[&adapter];
-        let agent_id = reeve_types::IdentityId::new().unwrap();
-
-        let snapshot = resolve_model(&persona, adapters, agent_id).expect("should resolve");
-        assert_eq!(snapshot.capability_profile.as_deref(), Some("default"));
     }
 
     // M7: ModelResolveError Display impls are non-empty and informative.

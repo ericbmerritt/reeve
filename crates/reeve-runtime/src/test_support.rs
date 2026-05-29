@@ -373,6 +373,24 @@ pub(crate) fn write_persona_config(data_dir: &Path, name: &str, model_pref: &str
     std::fs::write(persona_dir.join("config.toml"), config).unwrap();
 }
 
+/// Write an unrestricted `profile.toml` (no `enabled_categories`) for the
+/// given persona. Used in tests that exercise the spawn path, which requires
+/// a profile file to exist. Absent `enabled_categories` = all categories
+/// allowed.
+pub(crate) fn write_full_access_persona_profile(data_dir: &Path, name: &str) {
+    use crate::capability::{CapabilityProfile, Thresholds};
+    let persona_dir = data_dir.join("personas").join(name);
+    std::fs::create_dir_all(&persona_dir).unwrap();
+    let profile = CapabilityProfile {
+        name: name.to_owned(),
+        version: 1,
+        enabled_categories: None,
+        thresholds: Thresholds::default(),
+    };
+    crate::capability::write_capability_profile(&persona_dir.join("profile.toml"), &profile)
+        .unwrap();
+}
+
 // ── Shared registry builder ───────────────────────────────────────────────────
 
 /// Build the identity registry, watcher, and agent registry path for a test

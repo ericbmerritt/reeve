@@ -10,10 +10,10 @@
 //! tool actors.
 
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use actix::{Actor, Supervised};
+use actix::{Actor, AsyncContext as _, Supervised};
 use rand_core::{OsRng, RngCore as _};
 use reeve_types::{Identity, IdentityId, KeyRecord};
 use time::OffsetDateTime;
@@ -24,6 +24,7 @@ use crate::agent_fs::AgentDirs;
 use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentRegistryError, AgentStatus,
 };
+use crate::capability::{load_capability_profile, write_capability_profile, CapabilityProfile};
 use crate::config::load_persona_config;
 use crate::dispatcher::SendMessage;
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
@@ -264,16 +265,19 @@ impl Supervised for SpawnCoordinator {}
 /// Extracted into a free function so tests can assert the descriptor list
 /// without spinning up the full spawn pipeline.
 pub(crate) fn build_subagent_tools(
+    coordinator: Option<actix::Recipient<SpawnRequest>>,
     dispatcher: actix::Recipient<SendMessage>,
     agent_registry_path: PathBuf,
-    data_dir: PathBuf,
+    data_dir: &Path,
+    profile: Option<Arc<CapabilityProfile>>,
 ) -> Vec<(reeve_adapter::Tool, actix::Recipient<InvokeTool>)> {
     use actix::Actor as _;
-    let send_message_tool = SendMessageTool::new(dispatcher);
-    let list_agents_tool = crate::tool::ListAgentsTool::new(agent_registry_path.clone());
-    let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path);
-    let whois_tool = crate::tool::WhoisTool::new(data_dir);
-    vec![
+    let send_message_tool = SendMessageTool::new(dispatcher, profile.clone());
+    let list_agents_tool =
+        crate::tool::ListAgentsTool::new(agent_registry_path.clone(), profile.clone());
+    let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path, profile.clone());
+    let whois_tool = crate::tool::WhoisTool::new(data_dir.to_path_buf(), profile.clone());
+    let mut tools = vec![
         (
             SendMessageTool::descriptor(),
             send_message_tool.start().recipient(),
@@ -290,7 +294,18 @@ pub(crate) fn build_subagent_tools(
             crate::tool::WhoisTool::descriptor(),
             whois_tool.start().recipient(),
         ),
-    ]
+    ];
+    if let Some(coord) = coordinator {
+        let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord, profile);
+        tools.insert(
+            0,
+            (
+                crate::tool::SpawnAgentTool::descriptor(),
+                spawn_agent_tool.start().recipient(),
+            ),
+        );
+    }
+    tools
 }
 
 // ── SpawnRequest handler ──────────────────────────────────────────────────────
@@ -309,7 +324,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
         clippy::too_many_lines,
         reason = "splitting would obscure the linear dependency chain across the spawn steps"
     )]
-    fn handle(&mut self, msg: SpawnRequest, _ctx: &mut actix::Context<Self>) {
+    fn handle(&mut self, msg: SpawnRequest, ctx: &mut actix::Context<Self>) {
         let SpawnRequest {
             persona_name,
             system_prompt,
@@ -360,6 +375,37 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             Err(err) => {
                 warn!(%err, "failed to load persona config");
                 error_reply(&reply_to, String::from("failed to load persona config"));
+                return;
+            }
+        };
+
+        let persona_profile_path = self
+            .data_dir
+            .join(PERSONAS_DIR)
+            .join(persona_name_str)
+            .join("profile.toml");
+
+        let persona_profile = match load_capability_profile(&persona_profile_path) {
+            Ok(p) => p,
+            Err(crate::capability::ProfileError::Io { ref source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                error_reply(
+                    &reply_to,
+                    format!(
+                        "capability profile missing for persona '{persona_name_str}': \
+                         expected at {}",
+                        persona_profile_path.display()
+                    ),
+                );
+                return;
+            }
+            Err(err) => {
+                warn!(%err, "failed to load persona capability profile");
+                error_reply(
+                    &reply_to,
+                    String::from("failed to load persona capability profile"),
+                );
                 return;
             }
         };
@@ -455,6 +501,16 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             return;
         }
 
+        if let Err(err) = write_capability_profile(&dirs.profile_path(), &persona_profile) {
+            error_reply(
+                &reply_to,
+                format!("failed to write capability profile snapshot: {err}"),
+            );
+            return;
+        }
+
+        let profile = Arc::new(persona_profile);
+
         debug!(
             agent_name = %validated_name,
             %agent_id,
@@ -463,9 +519,11 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
         );
 
         let tools = build_subagent_tools(
+            Some(ctx.address().recipient()),
             self.dispatcher.clone(),
             self.agent_registry_path.clone(),
-            self.data_dir.clone(),
+            self.data_dir.as_path(),
+            Some(profile),
         );
 
         let new_agent = match Agent::new(
@@ -542,6 +600,7 @@ mod tests {
 
     fn write_minimal_persona(data_dir: &std::path::Path, persona_name: &str) {
         crate::test_support::write_persona_config(data_dir, persona_name, "claude-opus-4-7");
+        crate::test_support::write_full_access_persona_profile(data_dir, persona_name);
     }
 
     fn build_coordinator(
@@ -592,7 +651,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let dispatcher = NullDispatcher.start().recipient();
-            let tools = build_subagent_tools(dispatcher, registry_path, data_dir);
+            let tools = build_subagent_tools(None, dispatcher, registry_path, &data_dir, None);
             let names: Vec<String> = tools.iter().map(|(t, _)| t.name.clone()).collect();
             assert!(
                 names.iter().any(|n| n == "send_message"),
@@ -997,6 +1056,9 @@ mod tests {
             "name = \"unmatchable\"\nsystem_prompt = \"Be helpful.\"\nmodel_preferences = [\"gpt-4\"]\n",
         )
         .unwrap();
+        // Profile must exist so the spawn reaches the resolve_model step;
+        // otherwise the spawn fails earlier at profile loading.
+        crate::test_support::write_full_access_persona_profile(&data_dir, "unmatchable");
 
         let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
         let identity_registry_for_check = Arc::clone(&identity_registry);

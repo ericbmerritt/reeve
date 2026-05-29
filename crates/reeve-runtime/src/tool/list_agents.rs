@@ -12,20 +12,24 @@ use std::path::PathBuf;
 
 use actix::{Actor, Context, Handler};
 
-use super::{check_authority, AuthorityDecision, InvokeTool, ToolResult};
+use super::{check_authority, InvokeTool, ToolResult};
 use crate::agent_registry::AgentRegistry;
+use crate::capability::{CapabilityProfile, ToolCategory};
+use std::sync::Arc;
 
 /// Tool that lists every agent in the agent registry, including the lead and
 /// any spawned subagents, alive or stopped. Read-only; no side effects.
 pub struct ListAgentsTool {
     agent_registry_path: PathBuf,
+    profile: Option<Arc<CapabilityProfile>>,
 }
 
 impl ListAgentsTool {
     /// Construct a [`ListAgentsTool`] reading from the given registry file.
-    pub fn new(agent_registry_path: PathBuf) -> Self {
+    pub fn new(agent_registry_path: PathBuf, profile: Option<Arc<CapabilityProfile>>) -> Self {
         Self {
             agent_registry_path,
+            profile,
         }
     }
 
@@ -73,14 +77,17 @@ impl Handler<InvokeTool> for ListAgentsTool {
             reply_to,
         } = msg;
 
-        if let AuthorityDecision::Deny { reason } = check_authority(sender_id, &name) {
+        if let Err(refusal) =
+            check_authority(self.profile.as_deref(), ToolCategory::ReadFiles, sender_id)
+        {
             reply_to.do_send(ToolResult {
                 tool_use_id,
-                content: format!("denied: {reason}"),
+                content: refusal.to_json(),
                 is_error: true,
             });
             return;
         }
+        let _ = name;
 
         let registry = match AgentRegistry::open(self.agent_registry_path.clone()) {
             Ok(r) => r,
@@ -183,7 +190,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = ListAgentsTool::new(path).start();
+            let tool = ListAgentsTool::new(path, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {
@@ -232,7 +239,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = ListAgentsTool::new(path).start();
+            let tool = ListAgentsTool::new(path, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {
@@ -263,7 +270,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             use actix::Actor as _;
-            let tool = ListAgentsTool::new(path).start();
+            let tool = ListAgentsTool::new(path, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool.do_send(InvokeTool {
