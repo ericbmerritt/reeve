@@ -31,7 +31,7 @@ use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
 use crate::model_resolution::{resolve_model, write_spawn_snapshot};
 use crate::supervisor::WatchInbox;
-use crate::tool::{InvokeTool, SendMessageTool};
+use crate::tool::{BlacklistHandle, InvokeTool, SendMessageTool};
 use crate::watcher::Watcher;
 use crate::ValidatedAgentName;
 
@@ -211,6 +211,9 @@ pub struct SpawnCoordinator {
     /// [`SendMessageTool`] so subordinates can reply via `send_message` in
     /// their own tool loop.
     dispatcher: actix::Recipient<SendMessage>,
+    /// Shared blacklist handle. Written by the reload watcher; read on each
+    /// tool dispatch. `None` when the daemon started without a blacklist.
+    blacklist: Option<BlacklistHandle>,
 }
 
 impl SpawnCoordinator {
@@ -228,6 +231,7 @@ impl SpawnCoordinator {
         watcher: Arc<Watcher>,
         inbox_starter: actix::Recipient<WatchInbox>,
         dispatcher: actix::Recipient<SendMessage>,
+        blacklist: Option<BlacklistHandle>,
     ) -> Self {
         Self {
             data_dir,
@@ -237,6 +241,7 @@ impl SpawnCoordinator {
             watcher,
             inbox_starter,
             dispatcher,
+            blacklist,
         }
     }
 }
@@ -264,15 +269,21 @@ impl Supervised for SpawnCoordinator {}
 ///
 /// Extracted into a free function so tests can assert the descriptor list
 /// without spinning up the full spawn pipeline.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "build_subagent_tools wires six independent collaborators; \
+              bundling into a context struct adds indirection at three call sites"
+)]
 pub(crate) fn build_subagent_tools(
     coordinator: Option<actix::Recipient<SpawnRequest>>,
     dispatcher: actix::Recipient<SendMessage>,
     agent_registry_path: PathBuf,
     data_dir: &Path,
     profile: Option<Arc<CapabilityProfile>>,
+    blacklist: Option<BlacklistHandle>,
 ) -> Vec<(reeve_adapter::Tool, actix::Recipient<InvokeTool>)> {
     use actix::Actor as _;
-    let send_message_tool = SendMessageTool::new(dispatcher, profile.clone());
+    let send_message_tool = SendMessageTool::new(dispatcher, profile.clone(), blacklist.clone());
     let list_agents_tool =
         crate::tool::ListAgentsTool::new(agent_registry_path.clone(), profile.clone());
     let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path, profile.clone());
@@ -296,7 +307,7 @@ pub(crate) fn build_subagent_tools(
         ),
     ];
     if let Some(coord) = coordinator {
-        let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord, profile);
+        let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord, profile, blacklist);
         tools.insert(
             0,
             (
@@ -524,6 +535,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             self.agent_registry_path.clone(),
             self.data_dir.as_path(),
             Some(profile),
+            self.blacklist.clone(),
         );
 
         let new_agent = match Agent::new(
@@ -622,6 +634,7 @@ mod tests {
             watcher,
             inbox_starter,
             dispatcher,
+            None,
         )
     }
 
@@ -651,7 +664,8 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let dispatcher = NullDispatcher.start().recipient();
-            let tools = build_subagent_tools(None, dispatcher, registry_path, &data_dir, None);
+            let tools =
+                build_subagent_tools(None, dispatcher, registry_path, &data_dir, None, None);
             let names: Vec<String> = tools.iter().map(|(t, _)| t.name.clone()).collect();
             assert!(
                 names.iter().any(|n| n == "send_message"),
