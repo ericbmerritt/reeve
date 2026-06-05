@@ -178,6 +178,20 @@ pub enum AuditEvent {
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
+
+    /// The blacklist file could not be parsed or is structurally invalid.
+    ///
+    /// Emitted when the daemon's blacklist watcher attempts a reload and the
+    /// new file fails validation. The last-good blacklist remains in effect;
+    /// this event tells the operator exactly what went wrong so they can fix
+    /// the file.
+    #[serde(rename = "blacklist.reload_failed")]
+    BlacklistReloadFailed {
+        /// Human-readable description of the parse/validation failure.
+        error: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
 }
 
 /// Disposition field for `authority.decision` audit entries.

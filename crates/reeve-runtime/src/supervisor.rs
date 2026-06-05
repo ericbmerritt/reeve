@@ -48,7 +48,7 @@ const ROTATION_INTERVAL: Duration = Duration::from_mins(5);
 /// for cross-directory renames (the `inbox/tmp/ → inbox/new/` atomic move the
 /// TUI uses). Two seconds is fast enough to feel responsive without burning
 /// measurable CPU — the typical scan finds zero files.
-const INBOX_SCAN_INTERVAL: Duration = Duration::from_secs(2);
+const INBOX_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Files older than this are moved from `cur/` to `archive/` on each rotation.
 ///
@@ -224,6 +224,10 @@ pub struct WatcherActor {
     /// Inboxes registered via [`WatchInbox`]; iterated on each rotation tick
     /// and on the `FSEvents` fallback rescan.
     inboxes: Vec<(AgentInbox, IdentityId)>,
+    /// Live blacklist handle, if the daemon wired one up.
+    blacklist: Option<(PathBuf, crate::tool::BlacklistHandle)>,
+    /// Audit log for emitting `blacklist.reload_failed` events.
+    audit: Option<Arc<crate::audit::AuditLog>>,
 }
 
 impl WatcherActor {
@@ -232,7 +236,26 @@ impl WatcherActor {
         Self {
             watcher,
             inboxes: Vec::new(),
+            blacklist: None,
+            audit: None,
         }
+    }
+
+    /// Register a blacklist path + handle for periodic reloading.
+    ///
+    /// The `INBOX_SCAN_INTERVAL` tick will reload `<path>` on every poll and
+    /// swap the registry inside `handle` on success. Failed reloads emit a
+    /// `blacklist.reload_failed` audit event (if `audit` is wired) and leave
+    /// the last-good registry intact.
+    pub fn with_blacklist(
+        mut self,
+        path: PathBuf,
+        handle: crate::tool::BlacklistHandle,
+        audit: Arc<crate::audit::AuditLog>,
+    ) -> Self {
+        self.blacklist = Some((path, handle));
+        self.audit = Some(audit);
+        self
     }
 
     /// Return the shared watcher handle.
@@ -269,6 +292,35 @@ impl Actor for WatcherActor {
         ctx.run_interval(INBOX_SCAN_INTERVAL, |actor, _ctx| {
             for (inbox, agent_id) in &actor.inboxes {
                 actor.watcher.scan_new_fallback(inbox, *agent_id);
+            }
+            // Reload the blacklist on every poll so live edits to
+            // blacklist.toml take effect within INBOX_SCAN_INTERVAL.
+            if let Some((path, handle)) = &actor.blacklist {
+                match crate::blacklist::BlacklistRegistry::load_from_path(path) {
+                    Ok(new_registry) => {
+                        if let Ok(mut guard) = handle.write() {
+                            *guard = new_registry;
+                        }
+                    }
+                    Err(crate::blacklist::BlacklistError::Io { ref source, .. })
+                        if source.kind() == io::ErrorKind::NotFound =>
+                    {
+                        // File deleted — clear to empty rather than fail-closed.
+                        if let Ok(mut guard) = handle.write() {
+                            *guard = crate::blacklist::BlacklistRegistry::empty();
+                        }
+                    }
+                    Err(err) => {
+                        warn!(err = %err, "blacklist reload failed; last-good remains in effect");
+                        if let Some(audit) = &actor.audit {
+                            let _ =
+                                audit.append(&crate::audit::AuditEvent::BlacklistReloadFailed {
+                                    error: err.to_string(),
+                                    at: time::OffsetDateTime::now_utc(),
+                                });
+                        }
+                    }
+                }
             }
         });
     }

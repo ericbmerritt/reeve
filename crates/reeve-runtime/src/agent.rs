@@ -2087,7 +2087,7 @@ mod tests {
         actix::System::new().block_on(async move {
             // Start the SpawnAgentTool actor backed by a mock coordinator.
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None, None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2255,7 +2255,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None, None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2420,7 +2420,7 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None, None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2561,7 +2561,7 @@ mod tests {
         actix::System::new().block_on(async move {
             // Register SpawnAgentTool; the model will call "nonexistent_tool".
             let mock_coord = MockSpawnCoordinator.start();
-            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None).start();
+            let tool_addr = SpawnAgentTool::new(mock_coord.recipient(), None, None).start();
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2641,8 +2641,8 @@ mod tests {
 
         actix::System::new().block_on(async move {
             let mock_coord = MockSpawnCoordinator.start();
-            let a = SpawnAgentTool::new(mock_coord.clone().recipient(), None).start();
-            let b = SpawnAgentTool::new(mock_coord.recipient(), None).start();
+            let a = SpawnAgentTool::new(mock_coord.clone().recipient(), None, None).start();
+            let b = SpawnAgentTool::new(mock_coord.recipient(), None, None).start();
             // Both bindings declare the same name (SpawnAgentTool::descriptor()
             // returns "spawn_agent").
             let tools = vec![
@@ -2736,10 +2736,11 @@ mod tests {
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
+                None,
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
-            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient(), None);
+            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient(), None, None);
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,
@@ -2893,10 +2894,11 @@ mod tests {
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
+                None,
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
-            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient(), None);
+            let spawn_tool = SpawnAgentTool::new(coord_addr.recipient(), None, None);
             let tools: Vec<(
                 reeve_adapter::Tool,
                 actix::Recipient<crate::tool::InvokeTool>,

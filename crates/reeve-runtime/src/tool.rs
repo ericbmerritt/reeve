@@ -23,11 +23,22 @@
 //! Concrete tool implementations live in submodules and are re-exported
 //! here so external callers continue to address them as `crate::tool::Foo`.
 
+use std::sync::{Arc, RwLock};
+
 use actix::Recipient;
 use reeve_types::IdentityId;
 use serde::Serialize;
 
+use crate::blacklist::BlacklistRegistry;
 use crate::capability::{CapabilityProfile, ToolCategory};
+
+/// Shared handle to the live blacklist registry.
+///
+/// The daemon holds one of these and writes a new [`BlacklistRegistry`] into
+/// it on every successful reload. Tool actors hold a clone of the same
+/// `Arc` and read-lock it on each `InvokeTool` invocation. This makes
+/// blacklist updates visible to all running agents without restarting them.
+pub type BlacklistHandle = Arc<RwLock<BlacklistRegistry>>;
 
 pub mod list_agents;
 pub mod send_message;
@@ -178,6 +189,27 @@ pub fn check_authority(
             rationale: format!("{category} is not enabled in your capability profile"),
         })
     }
+}
+
+/// Check whether `action` matches any blacklist entry.
+///
+/// Returns `Err(Refusal::Blacklist { .. })` on a hit. When `handle` is `None`
+/// (tool constructed without a blacklist, e.g. at daemon startup before the
+/// blacklist file is wired up) the check passes silently.
+pub fn check_blacklist(handle: Option<&BlacklistHandle>, action: &str) -> Result<(), Refusal> {
+    let Some(handle) = handle else {
+        return Ok(());
+    };
+    let registry = handle
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((pattern, rationale)) = registry.check(action) {
+        return Err(Refusal::Blacklist {
+            pattern: pattern.to_owned(),
+            rationale: rationale.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

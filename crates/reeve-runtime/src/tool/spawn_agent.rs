@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use actix::{ActorContext, AsyncContext, Recipient};
 
-use super::{check_authority, InvokeTool, ToolResult};
+use super::{check_authority, check_blacklist, BlacklistHandle, InvokeTool, ToolResult};
 use crate::capability::{CapabilityProfile, ToolCategory};
 use crate::spawn_coordinator::{SpawnRequest, SpawnResponse};
 
@@ -93,6 +93,7 @@ impl actix::Handler<SpawnResponse> for SpawnRelay {
 pub struct SpawnAgentTool {
     coordinator: Recipient<SpawnRequest>,
     profile: Option<Arc<CapabilityProfile>>,
+    blacklist: Option<BlacklistHandle>,
 }
 
 impl SpawnAgentTool {
@@ -100,11 +101,23 @@ impl SpawnAgentTool {
     pub fn new(
         coordinator: Recipient<SpawnRequest>,
         profile: Option<Arc<CapabilityProfile>>,
+        blacklist: Option<BlacklistHandle>,
     ) -> Self {
         Self {
             coordinator,
             profile,
+            blacklist,
         }
+    }
+
+    /// Action descriptor for blacklist matching: `SpawnAgent(persona=<name>)`.
+    ///
+    /// Returns `None` when the `persona` field is absent or not a string —
+    /// the tool handler will surface a validation error before the blacklist
+    /// check is reached in that case.
+    pub fn canonical_action(input: &serde_json::Value) -> Option<String> {
+        let persona = input.get("persona")?.as_str()?;
+        Some(format!("SpawnAgent(persona={persona})"))
     }
 
     /// Adapter-facing tool descriptor for [`SpawnAgentTool`].
@@ -201,6 +214,19 @@ impl actix::Handler<InvokeTool> for SpawnAgentTool {
                 is_error: true,
             });
             return;
+        }
+
+        // Blacklist check uses the canonical action descriptor so the operator
+        // can write patterns like `SpawnAgent(persona=untrusted)`.
+        if let Some(action) = Self::canonical_action(&input) {
+            if let Err(refusal) = check_blacklist(self.blacklist.as_ref(), &action) {
+                reply_to.do_send(ToolResult {
+                    tool_use_id,
+                    content: refusal.to_json(),
+                    is_error: true,
+                });
+                return;
+            }
         }
 
         let Some(persona) = input.get("persona").and_then(|v| v.as_str()) else {
@@ -353,7 +379,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -387,7 +413,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -421,7 +447,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -455,7 +481,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             // control characters are rejected by ValidatedAgentName
@@ -493,7 +519,7 @@ mod tests {
             use crate::test_support::MockSpawnCoordinator;
             use actix::Actor as _;
             let coord = MockSpawnCoordinator.start().recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -536,7 +562,7 @@ mod tests {
             }
             .start()
             .recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -690,7 +716,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             let big = "x".repeat(MAX_SPAWN_CONTEXT_BYTES + 1);
@@ -731,7 +757,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -763,7 +789,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -807,7 +833,7 @@ mod tests {
             }
             .start()
             .recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {
@@ -851,7 +877,7 @@ mod tests {
             use crate::test_support::MockSpawnCoordinator;
             use actix::Actor as _;
             let coord = MockSpawnCoordinator.start().recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             let exact = "x".repeat(MAX_SPAWN_CONTEXT_BYTES);
@@ -895,7 +921,7 @@ mod tests {
         actix::System::new().block_on(async move {
             use actix::Actor as _;
             let coord = dropper_recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             let task = "x".repeat(32768);
@@ -931,7 +957,7 @@ mod tests {
             use crate::test_support::MockSpawnCoordinator;
             use actix::Actor as _;
             let coord = MockSpawnCoordinator.start().recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             let task = "x".repeat(32767);
@@ -973,7 +999,7 @@ mod tests {
             use crate::test_support::MockSpawnCoordinator;
             use actix::Actor as _;
             let coord = MockSpawnCoordinator.start().recipient();
-            let tool_addr = SpawnAgentTool::new(coord, None).start();
+            let tool_addr = SpawnAgentTool::new(coord, None, None).start();
             let (reply_to, rx) = capture_pair();
 
             tool_addr.do_send(InvokeTool {

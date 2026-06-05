@@ -24,6 +24,7 @@ use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
 };
 use crate::audit::AuditLog;
+use crate::blacklist::BlacklistRegistry;
 use crate::capability::load_capability_profile;
 use crate::config::{install_defaults, load_persona_config, load_team_config};
 use crate::dispatcher::{MessageDispatcher, SendMessage};
@@ -34,6 +35,7 @@ use crate::model_resolution::{resolve_model, write_spawn_snapshot, SpawnSnapshot
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
 use crate::spawn_coordinator::{build_subagent_tools, SpawnCoordinator, SpawnRequest};
 use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
+use crate::tool::BlacklistHandle;
 use crate::watcher::Watcher;
 
 /// Filename of the PID file inside the state directory.
@@ -870,7 +872,40 @@ fn launch_actors(
     actix::Supervisor::start(move |_| HeartbeatActor::new(state_dir));
 
     let watcher_for_coord = Arc::clone(&watcher);
-    let watcher_addr = actix::Supervisor::start(move |_| WatcherActor::new(Arc::clone(&watcher)));
+
+    // Create the blacklist handle before starting the WatcherActor so the
+    // actor can reload it on every 250ms poll without needing a message send.
+    let blacklist_path_for_watcher = data_dir.join("blacklist.toml");
+    let initial_blacklist = match BlacklistRegistry::load_from_path(&blacklist_path_for_watcher) {
+        Ok(r) => {
+            debug!(path = %blacklist_path_for_watcher.display(), entries = r.len(), "loaded blacklist");
+            r
+        }
+        Err(crate::blacklist::BlacklistError::Io { ref source, .. })
+            if source.kind() == io::ErrorKind::NotFound =>
+        {
+            debug!("no blacklist.toml at startup; starting with empty blacklist");
+            BlacklistRegistry::empty()
+        }
+        Err(err) => {
+            warn!(err = %err, "failed to load blacklist.toml at startup; starting empty");
+            BlacklistRegistry::empty()
+        }
+    };
+    let blacklist_handle: BlacklistHandle = Arc::new(std::sync::RwLock::new(initial_blacklist));
+
+    // Clone the audit reference for the watcher; opening twice is harmless (append-only file).
+    let audit_for_watcher: Arc<AuditLog> = Arc::new(
+        AuditLog::open(data_dir.clone()).unwrap_or_else(|e| panic!("cannot open audit log: {e}")),
+    );
+    let blacklist_handle_for_watcher = Arc::clone(&blacklist_handle);
+    let watcher_addr = actix::Supervisor::start(move |_| {
+        WatcherActor::new(Arc::clone(&watcher)).with_blacklist(
+            blacklist_path_for_watcher,
+            blacklist_handle_for_watcher,
+            audit_for_watcher,
+        )
+    });
 
     // The dispatcher re-opens the agent registry on every dispatch so it
     // stays in lockstep with records the spawn coordinator persists at
@@ -908,6 +943,7 @@ fn launch_actors(
         watcher_for_coord,
         watcher_addr.clone().recipient(),
         dispatcher_addr.clone().recipient(),
+        None, // blacklist wired in after handle is created below
     );
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
 
@@ -928,11 +964,15 @@ fn launch_actors(
         }
     };
     let coord_recipient_for_resume = coord_addr.clone();
-    let spawn_agent_tool =
-        crate::tool::SpawnAgentTool::new(coord_addr.recipient(), lead_profile.clone());
+    let spawn_agent_tool = crate::tool::SpawnAgentTool::new(
+        coord_addr.recipient(),
+        lead_profile.clone(),
+        Some(Arc::clone(&blacklist_handle)),
+    );
     let send_message_tool = crate::tool::SendMessageTool::new(
         dispatcher_addr.clone().recipient(),
         lead_profile.clone(),
+        Some(Arc::clone(&blacklist_handle)),
     );
     let list_agents_tool = crate::tool::ListAgentsTool::new(
         agent_registry_path_for_resume.clone(),
@@ -1180,6 +1220,7 @@ fn resume_one_subagent(
         agent_registry_path.to_path_buf(),
         data_dir,
         profile,
+        None, // blacklist not threaded into legacy resume path
     );
     let new_agent = Agent::new(
         Arc::clone(adapter),
