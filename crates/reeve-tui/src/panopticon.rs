@@ -76,6 +76,10 @@ pub struct AgentRow {
     /// uses this to pick between the running sigils (`○`/`●`/`!`/`?`) and
     /// the stopped sigils (`✓` clean, `✗` crash).
     pub is_running: bool,
+    /// `true` when the agent has no `agent.toml` on disk — the spawn sequence
+    /// never completed. Ghost agents have a registry record but no running
+    /// actor; messages sent to them land in an unwatched inbox.
+    pub is_ghost: bool,
     /// Cumulative cost from the agent's `cost` file (USD).
     pub cost_usd: f64,
     /// Time since the agent was spawned, evaluated at snapshot time. The
@@ -197,6 +201,9 @@ pub struct AgentInputs {
     pub persona_name: Option<String>,
     pub status: AgentStatus,
     pub is_running: bool,
+    /// `true` when `agent.toml` is absent — the spawn sequence never finished.
+    /// The agent has a registry record but no running actor.
+    pub is_ghost: bool,
     pub cost_usd: f64,
     pub spawned_at: OffsetDateTime,
     /// Best-effort time-in-state proxy: the `status` file's mtime, read by
@@ -235,6 +242,7 @@ pub fn build_snapshot(
             persona_name: a.persona_name.clone(),
             status: a.status.clone(),
             is_running: a.is_running,
+            is_ghost: a.is_ghost,
             cost_usd: a.cost_usd,
             elapsed: now - a.spawned_at,
             state_changed_at: a.state_changed_at,
@@ -400,12 +408,14 @@ pub fn read_snapshot(
             read_conversation_tail(&dirs.conversation_path(), CONVERSATION_TAIL_BYTES);
 
         let is_running = matches!(record.status, reeve_runtime::AgentStatus::Running);
+        let is_ghost = !dirs.agent_toml_path().exists();
 
         inputs.push(AgentInputs {
             name: record.name.as_str().to_owned(),
             persona_name: record.persona_name.clone(),
             status,
             is_running,
+            is_ghost,
             cost_usd,
             spawned_at: record.spawned_at,
             state_changed_at,
@@ -495,6 +505,7 @@ mod tests {
             persona_name: Some(name.to_owned()),
             status,
             is_running: running,
+            is_ghost: false,
             cost_usd: cost,
             spawned_at: OffsetDateTime::from_unix_timestamp(1_700_000_000 + spawned_offset)
                 .unwrap(),

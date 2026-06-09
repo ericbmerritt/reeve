@@ -19,7 +19,7 @@ use std::time::{Duration, SystemTime};
 use tracing::{debug, info, warn};
 
 use crate::agent::Agent;
-use crate::agent_fs::AgentDirs;
+use crate::agent_fs::{AgentDirs, RuntimeLayout};
 use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
 };
@@ -420,7 +420,7 @@ type Resources = (
 pub fn daemon_run(
     state_dir: PathBuf,
     data_dir: &Path,
-    adapter: &Arc<dyn reeve_adapter::Adapter>,
+    adapters: &[Arc<dyn reeve_adapter::Adapter>],
 ) -> Result<(), DaemonError> {
     info!(pid = std::process::id(), "daemon starting");
     let _lock = acquire_lock(state_dir.clone())?;
@@ -443,7 +443,7 @@ pub fn daemon_run(
         data_dir,
         &registry,
         watcher,
-        adapter,
+        adapters,
         agent_registry_path,
     )?;
     info!("daemon stopping cleanly");
@@ -498,7 +498,7 @@ fn run_actor_system(
     data_dir: &Path,
     identity_registry: &Arc<IdentityRegistry>,
     watcher: Arc<Watcher>,
-    adapter: &Arc<dyn reeve_adapter::Adapter>,
+    adapters: &[Arc<dyn reeve_adapter::Adapter>],
     agent_registry_path: PathBuf,
 ) -> Result<(), DaemonError> {
     // Prepare everything that can fail before entering the actix runtime.
@@ -508,7 +508,7 @@ fn run_actor_system(
         data_dir,
         identity_registry,
         watcher,
-        adapter,
+        adapters,
         agent_registry_path,
     )?;
     let agent_registry_path = startup.agent_registry_path.clone();
@@ -596,6 +596,10 @@ fn run_actor_system(
 /// can hold [`actix::Recipient`]s to tool actors that only exist once the
 /// actix runtime is up.
 struct AgentStartup {
+    /// All adapters available to the daemon; used by the subagent resume path
+    /// to match each subagent's snapshotted `adapter_id`.
+    adapters: Vec<Arc<dyn reeve_adapter::Adapter>>,
+    /// Resolved adapter for the lead agent.
     adapter: Arc<dyn reeve_adapter::Adapter>,
     dirs: AgentDirs,
     snapshot: SpawnSnapshot,
@@ -622,7 +626,7 @@ fn prepare_agent_startup(
     data_dir: &Path,
     identity_registry: &Arc<IdentityRegistry>,
     watcher: Arc<Watcher>,
-    adapter: &Arc<dyn reeve_adapter::Adapter>,
+    adapters: &[Arc<dyn reeve_adapter::Adapter>],
     agent_registry_path: PathBuf,
 ) -> Result<AgentStartup, DaemonError> {
     // 1. Install default configs if they do not already exist.
@@ -633,7 +637,8 @@ fn prepare_agent_startup(
     debug!("default configs ready");
 
     // 2. Load the default team config.
-    let team_path = data_dir.join("teams").join("default.toml");
+    let layout = RuntimeLayout::new(data_dir);
+    let team_path = layout.team_config_path("default");
     let team = load_team_config(&team_path).map_err(|e| DaemonError::Resource {
         component: "team config",
         source: Box::new(e),
@@ -654,10 +659,7 @@ fn prepare_agent_startup(
         })?;
 
     // 4. Load persona config for the lead member.
-    let persona_path = data_dir
-        .join("personas")
-        .join(&lead_member.persona_name)
-        .join("config.toml");
+    let persona_path = layout.persona_config_path(&lead_member.persona_name);
     let persona_config = load_persona_config(&persona_path).map_err(|e| DaemonError::Resource {
         component: "persona config",
         source: Box::new(e),
@@ -803,13 +805,24 @@ fn prepare_agent_startup(
     };
 
     // 7. Resolve the model adapter against this persona's preferences.
-    let snapshot = resolve_model(&persona_config, &[adapter.as_ref()], agent_id).map_err(|e| {
+    let adapter_refs: Vec<&dyn reeve_adapter::Adapter> =
+        adapters.iter().map(std::ops::Deref::deref).collect();
+    let snapshot = resolve_model(&persona_config, &adapter_refs, agent_id).map_err(|e| {
         DaemonError::Resource {
             component: "model resolution",
             source: Box::new(e),
         }
     })?;
     debug!(adapter_id = %snapshot.adapter_id, "resolved adapter");
+    let adapter = adapters
+        .iter()
+        .find(|a| a.id() == snapshot.adapter_id)
+        .ok_or_else(|| DaemonError::Resource {
+            component: "adapter post-resolution lookup",
+            source: Box::<dyn std::error::Error + Send + Sync>::from(
+                "resolve_model succeeded but adapter was not found in the slice",
+            ),
+        })?;
 
     // 8. Write the spawn snapshot to disk (includes agent_id for TUI signing).
     write_spawn_snapshot(&dirs, &snapshot).map_err(|e| DaemonError::Resource {
@@ -824,6 +837,7 @@ fn prepare_agent_startup(
     let system_prompt = persona_config.system_prompt.clone();
 
     Ok(AgentStartup {
+        adapters: adapters.to_vec(),
         adapter: Arc::clone(adapter),
         dirs,
         snapshot,
@@ -855,6 +869,7 @@ fn launch_actors(
     use actix::Actor as _;
 
     let AgentStartup {
+        adapters,
         adapter,
         dirs,
         snapshot,
@@ -875,7 +890,7 @@ fn launch_actors(
 
     // Create the blacklist handle before starting the WatcherActor so the
     // actor can reload it on every 250ms poll without needing a message send.
-    let blacklist_path_for_watcher = data_dir.join("blacklist.toml");
+    let blacklist_path_for_watcher = RuntimeLayout::new(&data_dir).blacklist_path();
     let initial_blacklist = match BlacklistRegistry::load_from_path(&blacklist_path_for_watcher) {
         Ok(r) => {
             debug!(path = %blacklist_path_for_watcher.display(), entries = r.len(), "loaded blacklist");
@@ -929,7 +944,7 @@ fn launch_actors(
     let data_dir_for_resume = data_dir.clone();
     let agent_registry_path_for_resume = agent_registry_path.clone();
     let identity_registry_for_resume = Arc::clone(&identity_registry);
-    let adapter_for_resume = Arc::clone(&adapter);
+    let adapters_for_resume = adapters.clone();
     let watcher_for_resume = Arc::clone(&watcher_for_coord);
     let watcher_addr_for_resume = watcher_addr.clone();
     let dispatcher_recipient_for_resume = dispatcher_addr.clone().recipient();
@@ -939,7 +954,7 @@ fn launch_actors(
         data_dir,
         agent_registry_path,
         identity_registry,
-        Arc::clone(&adapter),
+        adapters.clone(),
         watcher_for_coord,
         watcher_addr.clone().recipient(),
         dispatcher_addr.clone().recipient(),
@@ -948,10 +963,7 @@ fn launch_actors(
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
 
     let lead_profile = {
-        let p = data_dir_for_resume
-            .join("personas")
-            .join("lead")
-            .join("profile.toml");
+        let p = RuntimeLayout::new(&data_dir_for_resume).persona_profile_path("lead");
         match load_capability_profile(&p) {
             Ok(profile) => {
                 debug!(path = %p.display(), "loaded lead persona capability profile");
@@ -980,7 +992,8 @@ fn launch_actors(
     );
     let whoami_tool =
         crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone(), lead_profile.clone());
-    let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois, lead_profile);
+    let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois.clone(), lead_profile.clone());
+    let list_personas_tool = crate::tool::ListPersonasTool::new(data_dir_for_whois, lead_profile);
     let tools: Vec<(
         reeve_adapter::Tool,
         actix::Recipient<crate::tool::InvokeTool>,
@@ -1004,6 +1017,10 @@ fn launch_actors(
         (
             crate::tool::WhoisTool::descriptor(),
             whois_tool.start().recipient(),
+        ),
+        (
+            crate::tool::ListPersonasTool::descriptor(),
+            list_personas_tool.start().recipient(),
         ),
     ];
 
@@ -1042,7 +1059,7 @@ fn launch_actors(
         &data_dir_for_resume,
         &agent_registry_path_for_resume,
         &identity_registry_for_resume,
-        &adapter_for_resume,
+        &adapters_for_resume,
         &watcher_for_resume,
         &resume_inbox_starter,
         &dispatcher_recipient_for_resume,
@@ -1073,7 +1090,7 @@ fn resume_persisted_subagents(
     data_dir: &Path,
     agent_registry_path: &Path,
     identity_registry: &Arc<IdentityRegistry>,
-    adapter: &Arc<dyn reeve_adapter::Adapter>,
+    adapters: &[Arc<dyn reeve_adapter::Adapter>],
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
@@ -1095,7 +1112,7 @@ fn resume_persisted_subagents(
             data_dir,
             agent_registry_path,
             identity_registry,
-            adapter,
+            adapters,
             watcher,
             inbox_starter,
             dispatcher,
@@ -1105,9 +1122,13 @@ fn resume_persisted_subagents(
             warn!(
                 agent_name = %record.name,
                 err = %err,
-                "resume: failed to re-launch subagent; record remains but no actor; \
-                 next send_message to this name will land in an unwatched inbox"
+                "resume: failed to re-launch subagent; marking stopped"
             );
+            // Mark the record stopped so the panopticon shows an accurate
+            // status and the operator doesn't send messages to a dead inbox.
+            if let Ok(mut reg) = AgentRegistry::open(agent_registry_path.to_path_buf()) {
+                let _ = reg.update_status(record.name.as_str(), AgentStatus::Stopped);
+            }
         }
     }
 }
@@ -1131,7 +1152,7 @@ fn resume_one_subagent(
     data_dir: &Path,
     agent_registry_path: &Path,
     identity_registry: &Arc<IdentityRegistry>,
-    adapter: &Arc<dyn reeve_adapter::Adapter>,
+    adapters: &[Arc<dyn reeve_adapter::Adapter>],
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
@@ -1169,16 +1190,21 @@ fn resume_one_subagent(
     let snapshot: SpawnSnapshot =
         toml::from_str(&snapshot_text).map_err(|e| format!("parse agent.toml: {e}"))?;
 
-    // Refuse to resume if the daemon was reconfigured with a different
-    // adapter than the agent was spawned against — calls would fail at the
-    // model-resolution boundary in confusing ways.
-    if snapshot.adapter_id != adapter.id() {
-        return Err(format!(
-            "snapshot adapter_id '{}' does not match the running daemon's adapter '{}'",
-            snapshot.adapter_id,
-            adapter.id()
-        ));
-    }
+    // Find the adapter matching this agent's snapshot. A mismatch means the
+    // daemon was reconfigured without the adapter that spawned this agent, or
+    // the snapshot was written by a different deployment. Skip rather than
+    // fail the whole resume pass.
+    let adapter = adapters
+        .iter()
+        .find(|a| a.id() == snapshot.adapter_id)
+        .ok_or_else(|| {
+            let available: Vec<&str> = adapters.iter().map(|a| a.id()).collect();
+            format!(
+                "no running adapter matches snapshot adapter_id '{}'; available: [{}]",
+                snapshot.adapter_id,
+                available.join(", ")
+            )
+        })?;
 
     // System prompt fallback: snapshots written before the field existed
     // serialize with system_prompt == "". Use the persona's base prompt in
@@ -1188,10 +1214,7 @@ fn resume_one_subagent(
             .persona_name
             .as_deref()
             .unwrap_or(&snapshot.persona_name);
-        let persona_path = data_dir
-            .join("personas")
-            .join(persona_name)
-            .join("config.toml");
+        let persona_path = RuntimeLayout::new(data_dir).persona_config_path(persona_name);
         load_persona_config(&persona_path)
             .map_err(|e| format!("load persona for prompt fallback: {e}"))?
             .system_prompt
@@ -1448,7 +1471,7 @@ mod tests {
             &data_dir,
             &identity_registry,
             watcher,
-            &adapter,
+            std::slice::from_ref(&adapter),
             agent_registry_path,
         );
         assert!(
@@ -1496,7 +1519,7 @@ mod tests {
             &data_dir,
             &identity_registry,
             watcher,
-            &adapter,
+            std::slice::from_ref(&adapter),
             agent_registry_path,
         );
         let is_model_resolution_err = matches!(
@@ -1527,7 +1550,7 @@ mod tests {
             &data_dir,
             &identity_registry1,
             watcher1,
-            &adapter,
+            std::slice::from_ref(&adapter),
             registry_path_for_data_dir(&data_dir),
         )
         .expect("first prepare_agent_startup should succeed");
@@ -1539,7 +1562,7 @@ mod tests {
             &data_dir,
             &identity_registry2,
             watcher2,
-            &adapter,
+            std::slice::from_ref(&adapter),
             registry_path_for_data_dir(&data_dir),
         )
         .expect("second prepare_agent_startup should succeed");
@@ -1610,7 +1633,7 @@ mod tests {
             &data_dir,
             &identity_registry1,
             watcher1,
-            &adapter,
+            std::slice::from_ref(&adapter),
             registry_path_for_data_dir(&data_dir),
         )
         .expect("first call should succeed");
@@ -1630,7 +1653,7 @@ mod tests {
             &data_dir,
             &identity_registry2,
             watcher2,
-            &adapter,
+            std::slice::from_ref(&adapter),
             registry_path_for_data_dir(&data_dir),
         );
         assert!(
@@ -1721,7 +1744,7 @@ mod tests {
                 &data_dir,
                 &agent_registry_path,
                 &identity_registry,
-                &adapter,
+                std::slice::from_ref(&adapter),
                 &watcher,
                 &inbox_starter,
                 &dispatcher,
@@ -1805,7 +1828,7 @@ mod tests {
                 &data_dir,
                 &agent_registry_path,
                 &identity_registry,
-                &adapter,
+                std::slice::from_ref(&adapter),
                 &watcher,
                 &inbox_starter,
                 &dispatcher,

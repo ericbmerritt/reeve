@@ -15,6 +15,8 @@ use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::agent_fs::RuntimeLayout;
+
 use serde::{Deserialize, Serialize};
 
 use crate::fs_util::ensure_directory;
@@ -38,6 +40,29 @@ const DEFAULT_PERSONA_TOML: &str = r#"name = "lead"
 system_prompt = "You are a helpful AI assistant."
 model_preferences = ["claude-opus-4-7"]
 display_name = "Lead"
+"#;
+
+/// Default `DeepSeek` R1 persona written to
+/// `{data_dir}/personas/deepseek-r1/config.toml` if absent.
+///
+/// Requires `reeve adapter set-key-openrouter` before the daemon can spawn
+/// agents from this persona (the `OpenRouter` key must be in the keychain).
+const DEFAULT_DEEPSEEK_R1_PERSONA_TOML: &str = r#"name = "deepseek-r1"
+system_prompt = """
+You are a subordinate AI agent in the Reeve multi-agent runtime. You were \
+spawned by a lead agent to carry out a specific task.
+
+Respond directly in text. Do not use tools unless the task explicitly \
+requires them. Do not use send_message to reply to whoever sent you a \
+message — your text response IS the reply and will be delivered \
+automatically.
+
+Use tools only when the task requires taking an action (spawning another \
+agent, sending a message to a peer, etc.). When your task is complete, \
+write a clear summary of what you did and what you found.
+"""
+model_preferences = ["deepseek/deepseek-r1-0528"]
+display_name = "DeepSeek R1"
 "#;
 
 /// Default team TOML written to `{data_dir}/teams/default.toml` if absent.
@@ -231,20 +256,23 @@ pub fn load_team_config(path: &Path) -> Result<TeamConfig, ConfigError> {
 
 // ── Default installation ──────────────────────────────────────────────────────
 
-/// Install the default lead persona and default team configs if they do not
-/// already exist.
+/// Install the default persona and team configs if they do not already exist.
 ///
 /// Paths written:
 /// - `{data_dir}/personas/lead/config.toml`
+/// - `{data_dir}/personas/deepseek-r1/config.toml`
 /// - `{data_dir}/teams/default.toml`
 ///
 /// Idempotent: existing files are never overwritten. Parent directories are
 /// created with mode `0o700` if absent; files are created with mode `0o600`.
 pub fn install_defaults(data_dir: &Path) -> Result<(), ConfigError> {
-    let persona_path = data_dir.join("personas").join("lead").join("config.toml");
-    let team_path = data_dir.join("teams").join("default.toml");
+    let layout = RuntimeLayout::new(data_dir);
+    let persona_path = layout.persona_config_path("lead");
+    let deepseek_persona_path = layout.persona_config_path("deepseek-r1");
+    let team_path = layout.team_config_path("default");
 
     write_if_absent(&persona_path, DEFAULT_PERSONA_TOML)?;
+    write_if_absent(&deepseek_persona_path, DEFAULT_DEEPSEEK_R1_PERSONA_TOML)?;
     write_if_absent(&team_path, DEFAULT_TEAM_TOML)?;
 
     Ok(())

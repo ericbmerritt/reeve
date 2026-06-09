@@ -267,7 +267,7 @@ const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '�
 /// When the lead agent is `Working`, return a styled "thinking" line for the
 /// conversation pane. Returns `None` in every other state so an idle agent
 /// shows nothing extra below the last conversation entry.
-fn thinking_indicator(state: &AppState) -> Option<Line<'static>> {
+pub(crate) fn thinking_indicator(state: &AppState) -> Option<Line<'static>> {
     if state.status != AgentStatus::Working {
         return None;
     }
@@ -392,7 +392,7 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
 /// entry ended up below the viewport. We accept the unstable-feature
 /// pin for correctness here; the API surface is small and the build will
 /// loudly fail if ratatui changes it.
-fn render_conversation(
+pub(crate) fn render_conversation(
     lines: &[Line<'static>],
     area: ratatui::layout::Rect,
     user_scroll: u16,

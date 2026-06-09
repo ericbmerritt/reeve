@@ -2732,7 +2732,7 @@ mod tests {
                 data_dir_for_block.clone(),
                 agent_registry_path_for_block,
                 identity_registry,
-                Arc::clone(&coord_adapter),
+                vec![Arc::clone(&coord_adapter)],
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
@@ -2890,7 +2890,7 @@ mod tests {
                 data_dir_for_block.clone(),
                 agent_registry_path,
                 identity_registry,
-                Arc::clone(&coord_adapter),
+                vec![Arc::clone(&coord_adapter)],
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
@@ -2968,8 +2968,8 @@ mod tests {
         assert_eq!(error_result["tool_use_id"], "tu_bad");
         let content_str = error_result["content"].as_str().unwrap_or("");
         assert!(
-            content_str.contains("coordinator failed to provision agent"),
-            "error content must be the generic coordinator failure message: {content_str}"
+            content_str.starts_with("spawn_agent:"),
+            "error content must be spawn_agent: prefixed coordinator message: {content_str}"
         );
     }
 

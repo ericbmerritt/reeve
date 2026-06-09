@@ -291,6 +291,11 @@ fn read_spawn_snapshot(dirs: &AgentDirs) -> Option<reeve_runtime::SpawnSnapshot>
               trades clarity for indirection at the only non-test call \
               sites (cmd_reeve and cmd_attach in reeve-cli)."
 )]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear event loop: each branch is short but the full keyboard \
+              and reload surface must be wired in one place to stay auditable"
+)]
 pub fn run(
     data_dir: &Path,
     agent_registry_path: &Path,
@@ -385,7 +390,14 @@ pub fn run(
                     let prev_screen = state.screen;
                     let prev_chat_agent = state.chat_agent_name.clone();
                     let prev_inspect_agent = state.inspect_agent_name.clone();
-                    if handle_key(key, &mut state, data_dir, registry, keystore)? {
+                    if handle_key(
+                        key,
+                        &mut state,
+                        data_dir,
+                        agent_registry_path,
+                        registry,
+                        keystore,
+                    )? {
                         // Record the chat target the operator was on when
                         // they quit, so the next launch can resume it.
                         // Quitting from the panopticon does not write
@@ -465,10 +477,15 @@ fn handle_mouse(event: MouseEvent, state: &mut AppState) {
 /// convention of "Esc = back" that the operator brings with them. Without
 /// the screen-aware behavior, an operator who hits Esc expecting to leave
 /// the panopticon exits the whole TUI instead.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each parameter is a distinct runtime resource with no natural grouping peer"
+)]
 fn handle_key(
     key: event::KeyEvent,
     state: &mut AppState,
     data_dir: &Path,
+    agent_registry_path: &Path,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<bool, TuiError> {
@@ -490,7 +507,9 @@ fn handle_key(
                     quarantine_compose_cancel(state);
                     state.screen = Screen::Panopticon;
                 }
-                Screen::Inspect => return Ok(handle_key_inspect(key, state)),
+                Screen::Inspect => {
+                    return handle_key_inspect(key, state, data_dir, registry, keystore)
+                }
             }
             return Ok(false);
         }
@@ -515,8 +534,8 @@ fn handle_key(
 
     match state.screen {
         Screen::Chat => handle_key_chat(key, state, data_dir, registry, keystore),
-        Screen::Panopticon => Ok(handle_key_panopticon(key, state)),
-        Screen::Inspect => Ok(handle_key_inspect(key, state)),
+        Screen::Panopticon => Ok(handle_key_panopticon(key, state, agent_registry_path)),
+        Screen::Inspect => handle_key_inspect(key, state, data_dir, registry, keystore),
         Screen::Quarantine => Ok(handle_key_quarantine(key, state)),
         Screen::QuarantineCompose => {
             handle_key_quarantine_compose(key, state, data_dir, registry, keystore)
@@ -573,14 +592,12 @@ fn handle_key_chat(
     Ok(false)
 }
 
-/// Panopticon-screen key bindings. `j`/`k` (and arrow keys) navigate the
-/// agent table; `Enter` opens the focused agent's per-agent inspect
-/// screen (read-only drill-in). `Q` opens the quarantine review stub.
-///
-/// Per-agent *chat* is intentionally not reachable from the panopticon —
-/// the spec routes chat through `reeve attach <name>` from the CLI so
-/// the panopticon stays a watch surface, not a navigation hub.
-fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
+/// Panopticon-screen key bindings.
+fn handle_key_panopticon(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    agent_registry_path: &Path,
+) -> bool {
     match (key.code, key.modifiers) {
         (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
             state.panopticon_focus_down();
@@ -588,15 +605,6 @@ fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
         (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
             state.panopticon_focus_up();
         }
-        // Open the focused agent's inspect screen. Sets the inspect
-        // target on `state`; the event loop notices the change and
-        // triggers a reload so the inspect view shows the new agent's
-        // conversation/status/cost rather than whatever was loaded
-        // before. The Thread tab is the spec's default landing tab on
-        // entry. Defensive: if the focus index is out of range (empty
-        // registry, snapshot mid-refresh), leave the inspect target
-        // alone — switching to the inspect screen with a stale (or
-        // None) target would show last-good data rather than crash.
         (KeyCode::Enter, _) => {
             if let Some(agent) = state.panopticon.agents.get(state.panopticon_focus) {
                 state.inspect_agent_name = Some(agent.name.clone());
@@ -605,62 +613,114 @@ fn handle_key_panopticon(key: event::KeyEvent, state: &mut AppState) -> bool {
             }
             state.screen = Screen::Inspect;
         }
-        // `Q` opens the quarantine review. Phase 6 ships a stub renderer
-        // that surfaces the existing quarantine count; Phase 8 fills in
-        // the real per-message review UI. Crossterm typically delivers
-        // Shift+q as `Char('Q')` (uppercase, modifier-less) on most
-        // terminals, but a `SHIFT`-modifier variant is also possible —
-        // accept both.
+        // `c` opens a full-screen chat session with the focused agent.
+        (KeyCode::Char('c'), KeyModifiers::NONE) => {
+            if let Some(agent) = state.panopticon.agents.get(state.panopticon_focus) {
+                state.chat_agent_name.clear();
+                state.chat_agent_name.push_str(&agent.name);
+                state.scroll_to_bottom();
+                state.screen = Screen::Chat;
+            }
+        }
+        // `d` removes the focused agent's registry record.
+        // Allowed only for ghost or stopped non-lead agents; running agents
+        // and the lead are protected. The agent directory is left on disk.
+        (KeyCode::Char('d'), KeyModifiers::NONE) => {
+            if let Some(agent) = state.panopticon.agents.get(state.panopticon_focus) {
+                if agent.name != "lead" {
+                    if let Ok(mut reg) =
+                        reeve_runtime::AgentRegistry::open(agent_registry_path.to_path_buf())
+                    {
+                        let _ = reg.remove(&agent.name);
+                    }
+                }
+            }
+        }
         (KeyCode::Char('Q'), _) => state.screen = Screen::Quarantine,
         _ => {}
     }
     false
 }
 
-/// Inspect-screen key bindings: tab cycling and back-to-panopticon.
+/// Inspect-screen key bindings.
 ///
-/// - `Tab` advances to the next tab; `Shift+Tab` to the previous; both
-///   wrap. `1`–`5` jump directly to a tab (matches the wireframe's
-///   `Tabs switched with Tab/Shift+Tab or 1-5`).
-/// - `h` (vim-flavoured back) and `Esc` both return to the panopticon
-///   with `panopticon_focus` preserved so the operator can hop into
-///   another agent without re-navigating.
-/// - PageUp/PageDown/End scroll the Thread tab's body. Scroll keys
-///   are accepted on every tab for keystroke consistency even though
-///   the stub tabs have nothing to scroll — the renderer ignores the
-///   offset on those tabs.
+/// On the Thread tab the inspect screen doubles as a chat interface: typing
+/// populates the input buffer and Enter submits to the inspected agent.
+/// Tab/Shift+Tab switch between inspect tabs (clearing the input buffer when
+/// leaving Thread so stale text doesn't bleed into other tabs).
 ///
-/// `q` and the global `Esc`/`Tab` cases never reach here: the dispatcher
-/// in `handle_key` consumes them before delegating.
-fn handle_key_inspect(key: event::KeyEvent, state: &mut AppState) -> bool {
+/// `h`/`Esc` return to the panopticon. `q` and global `Esc`/`Tab` are
+/// consumed by the dispatcher before reaching here.
+fn handle_key_inspect(
+    key: event::KeyEvent,
+    state: &mut AppState,
+    data_dir: &Path,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<bool, TuiError> {
     const ROWS_PER_PAGE: u16 = 10;
     const ROWS_PER_LINE_NUDGE: u16 = 1;
 
+    // On the Thread tab, character input and Enter go to the agent.
+    if state.inspect_tab == InspectTab::Thread {
+        match (key.code, key.modifiers) {
+            (KeyCode::Enter, KeyModifiers::NONE) => {
+                submit_inspect_input(state, data_dir, registry, keystore)?;
+                return Ok(false);
+            }
+            (KeyCode::Backspace, _) => {
+                let mut s = state.input.clone();
+                if !s.is_empty() {
+                    let trim_pos = s.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                    s.truncate(trim_pos);
+                }
+                state.set_input(s);
+                return Ok(false);
+            }
+            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                let mut s = state.input.clone();
+                s.push(c);
+                state.set_input(s);
+                return Ok(false);
+            }
+            _ => {}
+        }
+    }
+
     match (key.code, key.modifiers) {
         (KeyCode::Tab, KeyModifiers::NONE) => {
+            state.set_input(String::new());
             state.inspect_tab = state.inspect_tab.next();
         }
         (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => {
+            state.set_input(String::new());
             state.inspect_tab = state.inspect_tab.prev();
         }
         (KeyCode::Char(c @ '1'..='5'), _) => {
-            // ASCII '1' → 0, '2' → 1, … '5' → 4. Spell out each
-            // mapping rather than reach for `c as usize` (which the
-            // crate's `as_conversions` lint forbids) or a clever
-            // arithmetic shuffle — the match table reads exactly like
-            // the spec's "Tabs switched with 1-5" line.
+            state.set_input(String::new());
             let tab = match c {
                 '1' => InspectTab::Thread,
                 '2' => InspectTab::Tools,
                 '3' => InspectTab::Model,
                 '4' => InspectTab::Decisions,
                 '5' => InspectTab::Memory,
-                _ => return false, // unreachable: bounded by the outer pattern
+                _ => return Ok(false),
             };
             state.inspect_tab = tab;
         }
         (KeyCode::Char('h'), KeyModifiers::NONE) => {
+            state.set_input(String::new());
             state.screen = Screen::Panopticon;
+        }
+        // `c` opens full-screen chat for the currently inspected agent.
+        (KeyCode::Char('c'), KeyModifiers::NONE) => {
+            if let Some(name) = state.inspect_agent_name.clone() {
+                state.set_input(String::new());
+                state.chat_agent_name.clear();
+                state.chat_agent_name.push_str(&name);
+                state.scroll_to_bottom();
+                state.screen = Screen::Chat;
+            }
         }
         (KeyCode::PageUp, _) => state.scroll_up(ROWS_PER_PAGE),
         (KeyCode::PageDown, _) => state.scroll_down(ROWS_PER_PAGE),
@@ -669,7 +729,7 @@ fn handle_key_inspect(key: event::KeyEvent, state: &mut AppState) -> bool {
         (KeyCode::End, _) => state.scroll_to_bottom(),
         _ => {}
     }
-    false
+    Ok(false)
 }
 
 /// Quarantine-screen key bindings.
@@ -830,18 +890,37 @@ fn submit_quarantine_compose(
     Ok(())
 }
 
-/// Submit the current input buffer to the active chat agent and clear it.
-///
-/// `data_dir` + `state.chat_agent_name` resolve to the recipient's
-/// `AgentDirs`. Messages typed in the lead's chat go to the lead; messages
-/// typed after Enter-ing a worker row in the panopticon go to that worker.
-///
-/// If the buffer is empty or all-whitespace, does nothing. On submission
-/// error, the error propagates to the caller; future iterations could
-/// catch it and display an inline error message.
 fn submit_input(
     state: &mut AppState,
     data_dir: &Path,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<(), TuiError> {
+    submit_to_agent(
+        state,
+        data_dir,
+        &state.chat_agent_name.clone(),
+        registry,
+        keystore,
+    )
+}
+
+fn submit_inspect_input(
+    state: &mut AppState,
+    data_dir: &Path,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<(), TuiError> {
+    let Some(agent_name) = state.inspect_agent_name.clone() else {
+        return Ok(());
+    };
+    submit_to_agent(state, data_dir, &agent_name, registry, keystore)
+}
+
+fn submit_to_agent(
+    state: &mut AppState,
+    data_dir: &Path,
+    agent_name: &str,
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<(), TuiError> {
@@ -849,13 +928,7 @@ fn submit_input(
     if payload.is_empty() {
         return Ok(());
     }
-    // AgentDirs::open is a path-construction call only — no I/O — so
-    // opening per submit is cheap. The agent name was validated when it
-    // was registered, so the only realistic failure mode is the agent
-    // being unregistered between Enter-ing the panopticon row and
-    // hitting Enter in chat; in that case the submit's inner reads
-    // (spawn snapshot, inbox path) surface a typed error.
-    let dirs = AgentDirs::open(data_dir, &state.chat_agent_name).map_err(|err| {
+    let dirs = AgentDirs::open(data_dir, agent_name).map_err(|err| {
         TuiError::Submit(crate::submit::SubmitError::Io {
             path: data_dir.to_path_buf(),
             source: io::Error::new(io::ErrorKind::InvalidInput, err.to_string()),
@@ -863,8 +936,6 @@ fn submit_input(
     })?;
     submit_message(&payload, &dirs, registry, keystore).map_err(TuiError::Submit)?;
     state.set_input(String::new());
-    // Sending a message means the operator wants to see the reply; snap the
-    // view back to the bottom so the response auto-scrolls into focus.
     state.scroll_to_bottom();
     Ok(())
 }
@@ -892,6 +963,7 @@ mod tests {
                     persona_name: None,
                     status: AgentStatus::Idle,
                     is_running: true,
+                    is_ghost: false,
                     cost_usd: 0.0,
                     elapsed: Duration::seconds(0),
                     state_changed_at: None,
@@ -910,12 +982,24 @@ mod tests {
     #[test]
     fn handle_key_panopticon_j_and_down_move_focus_down_with_clamp() {
         let mut state = state_with_agents(3);
-        assert!(!handle_key_panopticon(key(KeyCode::Char('j')), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Char('j')),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, 1);
-        assert!(!handle_key_panopticon(key(KeyCode::Down), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Down),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, 2);
         // Already at last agent; further presses clamp.
-        assert!(!handle_key_panopticon(key(KeyCode::Down), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Down),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, 2);
     }
 
@@ -924,12 +1008,24 @@ mod tests {
     fn handle_key_panopticon_k_and_up_move_focus_up_with_clamp() {
         let mut state = state_with_agents(3);
         state.panopticon_focus = 2;
-        assert!(!handle_key_panopticon(key(KeyCode::Char('k')), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Char('k')),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, 1);
-        assert!(!handle_key_panopticon(key(KeyCode::Up), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Up),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, 0);
         // Saturate at 0.
-        assert!(!handle_key_panopticon(key(KeyCode::Up), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Up),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, 0);
     }
 
@@ -939,7 +1035,11 @@ mod tests {
     #[test]
     fn handle_key_panopticon_enter_switches_to_inspect() {
         let mut state = state_with_agents(2);
-        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Enter),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.screen, Screen::Inspect);
     }
 
@@ -953,7 +1053,11 @@ mod tests {
         state.chat_agent_name = "lead".to_owned();
         state.panopticon_focus = 2;
         let expected = state.panopticon.agents[2].name.clone();
-        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Enter),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.screen, Screen::Inspect);
         assert_eq!(state.inspect_agent_name.as_deref(), Some(expected.as_str()));
         assert_eq!(state.inspect_tab, InspectTab::Thread);
@@ -971,7 +1075,11 @@ mod tests {
         state.set_input("draft for chat agent".to_owned());
         state.scroll_up(20);
         state.panopticon_focus = 1;
-        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Enter),
+            &mut state,
+            Path::new("")
+        ));
         assert!(
             state.is_at_bottom(),
             "scroll should snap to bottom on inspect entry"
@@ -990,7 +1098,11 @@ mod tests {
     fn handle_key_panopticon_enter_with_empty_table_leaves_inspect_target() {
         let mut state = state_with_agents(0);
         state.inspect_agent_name = Some("previous-agent".to_owned());
-        assert!(!handle_key_panopticon(key(KeyCode::Enter), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Enter),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.screen, Screen::Inspect);
         assert_eq!(state.inspect_agent_name.as_deref(), Some("previous-agent"));
     }
@@ -1001,7 +1113,11 @@ mod tests {
         let mut state = state_with_agents(3);
         state.panopticon_focus = 1;
         let before = state.panopticon_focus;
-        assert!(!handle_key_panopticon(key(KeyCode::Char('x')), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Char('x')),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, before);
         assert_eq!(state.screen, Screen::Panopticon);
     }
@@ -1012,7 +1128,11 @@ mod tests {
     #[test]
     fn handle_key_panopticon_focus_down_is_noop_on_empty_table() {
         let mut state = state_with_agents(0);
-        assert!(!handle_key_panopticon(key(KeyCode::Char('j')), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Char('j')),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.panopticon_focus, 0);
     }
 
@@ -1021,7 +1141,11 @@ mod tests {
     #[test]
     fn handle_key_panopticon_q_opens_quarantine() {
         let mut state = state_with_agents(2);
-        assert!(!handle_key_panopticon(key(KeyCode::Char('Q')), &mut state));
+        assert!(!handle_key_panopticon(
+            key(KeyCode::Char('Q')),
+            &mut state,
+            Path::new("")
+        ));
         assert_eq!(state.screen, Screen::Quarantine);
     }
 
@@ -1290,6 +1414,8 @@ mod tests {
     #[test]
     fn handle_key_inspect_tab_cycles_forward_with_wrap() {
         let mut state = state_in_inspect();
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
         let order = [
             InspectTab::Tools,
             InspectTab::Model,
@@ -1298,7 +1424,15 @@ mod tests {
             InspectTab::Thread,
         ];
         for expected in order {
-            assert!(!handle_key_inspect(key(KeyCode::Tab), &mut state));
+            let quit = handle_key_inspect(
+                key(KeyCode::Tab),
+                &mut state,
+                tmp.path(),
+                &registry,
+                &keystore,
+            )
+            .unwrap();
+            assert!(!quit);
             assert_eq!(state.inspect_tab, expected);
         }
     }
@@ -1308,6 +1442,8 @@ mod tests {
     #[test]
     fn handle_key_inspect_backtab_cycles_backward_with_wrap() {
         let mut state = state_in_inspect();
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
         let order = [
             InspectTab::Memory,
             InspectTab::Decisions,
@@ -1316,17 +1452,31 @@ mod tests {
             InspectTab::Thread,
         ];
         for expected in order {
-            assert!(!handle_key_inspect(key(KeyCode::BackTab), &mut state));
+            let quit = handle_key_inspect(
+                key(KeyCode::BackTab),
+                &mut state,
+                tmp.path(),
+                &registry,
+                &keystore,
+            )
+            .unwrap();
+            assert!(!quit);
             assert_eq!(state.inspect_tab, expected);
         }
     }
 
-    // IK3: 1-5 jump directly to a specific tab in display order. Any
-    // key outside that range is a no-op (handled by the catch-all `_`
-    // arm).
+    // IK3: 1-5 jump directly to a specific tab in display order when on a
+    // non-Thread tab. On the Thread tab, character keys go to the input
+    // buffer instead, so numeric shortcuts work from Tools and above.
     #[test]
     fn handle_key_inspect_numeric_keys_jump_to_tab() {
         let mut state = state_in_inspect();
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Start on Tools tab (Tab away from Thread) so numeric keys navigate.
+        state.inspect_tab = InspectTab::Tools;
+
         let cases = [
             ('1', InspectTab::Thread),
             ('2', InspectTab::Tools),
@@ -1335,26 +1485,58 @@ mod tests {
             ('5', InspectTab::Memory),
         ];
         for (ch, expected) in cases {
-            assert!(!handle_key_inspect(key(KeyCode::Char(ch)), &mut state));
+            // Move off Thread tab before each numeric press so the key
+            // reaches the navigation arm rather than the input buffer.
+            if state.inspect_tab == InspectTab::Thread {
+                state.inspect_tab = InspectTab::Tools;
+            }
+            let quit = handle_key_inspect(
+                key(KeyCode::Char(ch)),
+                &mut state,
+                tmp.path(),
+                &registry,
+                &keystore,
+            )
+            .unwrap();
+            assert!(!quit, "key '{ch}' should not quit");
             assert_eq!(
                 state.inspect_tab, expected,
                 "key '{ch}' should jump to {expected:?}"
             );
         }
-        // '6' is out of range; tab stays at the previous setting (Memory).
-        assert!(!handle_key_inspect(key(KeyCode::Char('6')), &mut state));
-        assert_eq!(state.inspect_tab, InspectTab::Memory);
+        // '6' is out of range on Tools tab; stays at Tools.
+        state.inspect_tab = InspectTab::Tools;
+        let quit = handle_key_inspect(
+            key(KeyCode::Char('6')),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!quit);
+        assert_eq!(state.inspect_tab, InspectTab::Tools);
     }
 
-    // IK4: `h` returns to the panopticon with panopticon_focus preserved
-    // so the operator can hop into another agent without re-navigating.
-    // This is the spec's done-when: "h from inspect returns to the
-    // panopticon with the same agent row focused".
+    // IK4: `h` returns to the panopticon from a non-Thread tab. On the
+    // Thread tab, `h` is a regular character that goes to the input buffer;
+    // Esc (handled by the global dispatcher) is the back key from Thread.
     #[test]
-    fn handle_key_inspect_h_returns_to_panopticon_with_focus_preserved() {
+    fn handle_key_inspect_h_returns_to_panopticon_from_non_thread_tab() {
         let mut state = state_in_inspect();
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        state.inspect_tab = InspectTab::Tools; // not Thread
         assert_eq!(state.panopticon_focus, 2);
-        assert!(!handle_key_inspect(key(KeyCode::Char('h')), &mut state));
+        let quit = handle_key_inspect(
+            key(KeyCode::Char('h')),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!quit);
         assert_eq!(state.screen, Screen::Panopticon);
         assert_eq!(state.panopticon_focus, 2);
     }
@@ -1372,6 +1554,7 @@ mod tests {
         let was_exit = handle_key(
             key(KeyCode::Esc),
             &mut state,
+            tmp.path(),
             tmp.path(),
             &registry,
             &keystore,
@@ -1394,6 +1577,7 @@ mod tests {
         let was_exit = handle_key(
             key(KeyCode::Tab),
             &mut state,
+            tmp.path(),
             tmp.path(),
             &registry,
             &keystore,
@@ -1553,6 +1737,7 @@ mod tests {
         let was_exit = handle_key(
             key(KeyCode::Esc),
             &mut state,
+            tmp.path(),
             tmp.path(),
             &registry,
             &keystore,
