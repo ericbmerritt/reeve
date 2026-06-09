@@ -46,7 +46,7 @@ const ROTATION_INTERVAL: Duration = Duration::from_mins(5);
 /// How often [`WatcherActor`] rescans `inbox/new/` as a fallback for missed
 /// filesystem events. macOS `kqueue`/`FSEvents` does not reliably deliver events
 /// for cross-directory renames (the `inbox/tmp/ → inbox/new/` atomic move the
-/// TUI uses). Two seconds is fast enough to feel responsive without burning
+/// TUI uses). 250 ms is fast enough to feel responsive without burning
 /// measurable CPU — the typical scan finds zero files.
 const INBOX_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 

@@ -958,7 +958,7 @@ fn launch_actors(
         watcher_for_coord,
         watcher_addr.clone().recipient(),
         dispatcher_addr.clone().recipient(),
-        None, // blacklist wired in after handle is created below
+        Some(Arc::clone(&blacklist_handle)),
     );
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
 
@@ -1060,6 +1060,7 @@ fn launch_actors(
         &agent_registry_path_for_resume,
         &identity_registry_for_resume,
         &adapters_for_resume,
+        Some(&blacklist_handle),
         &watcher_for_resume,
         &resume_inbox_starter,
         &dispatcher_recipient_for_resume,
@@ -1091,6 +1092,7 @@ fn resume_persisted_subagents(
     agent_registry_path: &Path,
     identity_registry: &Arc<IdentityRegistry>,
     adapters: &[Arc<dyn reeve_adapter::Adapter>],
+    blacklist: Option<&BlacklistHandle>,
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
@@ -1113,6 +1115,7 @@ fn resume_persisted_subagents(
             agent_registry_path,
             identity_registry,
             adapters,
+            blacklist,
             watcher,
             inbox_starter,
             dispatcher,
@@ -1153,6 +1156,7 @@ fn resume_one_subagent(
     agent_registry_path: &Path,
     identity_registry: &Arc<IdentityRegistry>,
     adapters: &[Arc<dyn reeve_adapter::Adapter>],
+    blacklist: Option<&BlacklistHandle>,
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
@@ -1243,7 +1247,7 @@ fn resume_one_subagent(
         agent_registry_path.to_path_buf(),
         data_dir,
         profile,
-        None, // blacklist not threaded into legacy resume path
+        blacklist.map(Arc::clone),
     );
     let new_agent = Agent::new(
         Arc::clone(adapter),
@@ -1745,6 +1749,7 @@ mod tests {
                 &agent_registry_path,
                 &identity_registry,
                 std::slice::from_ref(&adapter),
+                None,
                 &watcher,
                 &inbox_starter,
                 &dispatcher,
@@ -1829,6 +1834,7 @@ mod tests {
                 &agent_registry_path,
                 &identity_registry,
                 std::slice::from_ref(&adapter),
+                None,
                 &watcher,
                 &inbox_starter,
                 &dispatcher,

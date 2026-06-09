@@ -623,8 +623,8 @@ fn handle_key_panopticon(
             }
         }
         // `d` removes the focused agent's registry record.
-        // Allowed only for ghost or stopped non-lead agents; running agents
-        // and the lead are protected. The agent directory is left on disk.
+        // The lead is protected; all other agents may be deleted regardless
+        // of running state. The agent directory is left on disk.
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             if let Some(agent) = state.panopticon.agents.get(state.panopticon_focus) {
                 if agent.name != "lead" {
