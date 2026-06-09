@@ -49,7 +49,7 @@
         # still broken at HEAD. Use `cargoHash` + `useFetchCargoVendor`
         # to take the fixed path.
         useFetchCargoVendor = true;
-        cargoHash = "sha256-KxeNHEePZ3E08GKZpKZl6iUumOA3DBEKzoOHWinxf/w=";
+        cargoHash = "sha256-4/2DzZ+J5vr9i9ri1652qwBpUcYN5qY6MQ7rwrW/EfU=";
 
         doCheck = false;
 
