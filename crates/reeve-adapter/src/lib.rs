@@ -20,11 +20,16 @@
 //!
 //! - [`ClaudeOpus47`] — `claude-opus-4-7@anthropic-direct`: Anthropic's
 //!   Messages API with rustls TLS, no system OpenSSL dependency.
+//! - [`DeepSeekR1OpenRouter`] — `deepseek/deepseek-r1-0528@openrouter`:
+//!   `DeepSeek` R1 0528 via `OpenRouter`'s OpenAI-compatible endpoint.
 
 mod anthropic;
 mod claude_opus_47;
+mod deepseek_r1_openrouter;
+mod openai_compat;
 
 pub use claude_opus_47::ClaudeOpus47;
+pub use deepseek_r1_openrouter::DeepSeekR1OpenRouter;
 
 use std::collections::HashSet;
 use std::fmt;

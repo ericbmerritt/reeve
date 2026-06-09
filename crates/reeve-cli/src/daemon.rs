@@ -245,44 +245,57 @@ fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
 
     let state_dir = default_state_dir()?;
     let data_dir = IdentityRegistry::default_data_dir()?;
-    let adapter = build_adapter_for_daemon()?;
-    daemon_run(state_dir, &data_dir, &adapter).map_err(Into::into)
+    let adapters = build_adapters_for_daemon()?;
+    daemon_run(state_dir, &data_dir, &adapters).map_err(Into::into)
 }
 
-/// Fetch the Anthropic API key from the keychain and stash it in
-/// `REEVE_ADAPTER_KEY` so the spawned daemon subprocess can read it without
-/// triggering a second Keychain dialog.
+/// Fetch configured API keys from the keychain and stash them in environment
+/// variables so the spawned daemon subprocess can read them without triggering
+/// a second Keychain dialog per key.
 fn preload_adapter_key() -> Result<(), Box<dyn std::error::Error>> {
     let store = crate::keychain::open_platform_secretstore()?;
     let secret = store
         .retrieve_secret(labels::ANTHROPIC_API_KEY)
         .map_err(|e| format!("keychain: {e}"))?;
     std::env::set_var("REEVE_ADAPTER_KEY", secret.expose_secret());
+    // OpenRouter key is optional; silently skip if absent.
+    if let Ok(or_secret) = store.retrieve_secret(labels::OPENROUTER_API_KEY) {
+        std::env::set_var("REEVE_OPENROUTER_KEY", or_secret.expose_secret());
+    }
     Ok(())
 }
 
-/// Retrieve the Anthropic API key from the platform keychain and construct
-/// the `ClaudeOpus47` adapter.
+/// Build all available adapters from keychain secrets or pre-loaded env vars.
 ///
-/// Mirrors the key-loading path used by `reeve adapter test`
-/// (`adapter::retrieve_api_key`). The CLI layer owns keychain access;
-/// `reeve-runtime` receives an already-constructed adapter.
-fn build_adapter_for_daemon() -> Result<Arc<dyn reeve_adapter::Adapter>, Box<dyn std::error::Error>>
-{
-    // If the parent process pre-loaded the key (to avoid a macOS Keychain
-    // dialog in a background process), use it directly.
-    if let Ok(key_str) = std::env::var("REEVE_ADAPTER_KEY") {
-        let secret = secrecy::SecretString::from(key_str);
-        return Ok(Arc::new(reeve_adapter::ClaudeOpus47::new(secret)));
+/// Always includes the `ClaudeOpus47` adapter (Anthropic key is required).
+/// Adds `DeepSeekR1OpenRouter` when an `OpenRouter` key is available.
+fn build_adapters_for_daemon(
+) -> Result<Vec<Arc<dyn reeve_adapter::Adapter>>, Box<dyn std::error::Error>> {
+    let mut adapters: Vec<Arc<dyn reeve_adapter::Adapter>> = Vec::new();
+
+    // Anthropic adapter — required.
+    let anthropic_key = if let Ok(key_str) = std::env::var("REEVE_ADAPTER_KEY") {
+        secrecy::SecretString::from(key_str)
+    } else {
+        let store = crate::keychain::open_platform_secretstore()?;
+        store
+            .retrieve_secret(labels::ANTHROPIC_API_KEY)
+            .map_err(keychain_error_for_daemon)?
+    };
+    adapters.push(Arc::new(reeve_adapter::ClaudeOpus47::new(anthropic_key)));
+
+    // OpenRouter adapter — optional; skip if no key is available.
+    let openrouter_key = if let Ok(key_str) = std::env::var("REEVE_OPENROUTER_KEY") {
+        Some(secrecy::SecretString::from(key_str))
+    } else {
+        let store = crate::keychain::open_platform_secretstore()?;
+        store.retrieve_secret(labels::OPENROUTER_API_KEY).ok()
+    };
+    if let Some(key) = openrouter_key {
+        adapters.push(Arc::new(reeve_adapter::DeepSeekR1OpenRouter::new(key)));
     }
-    // Fall back to the keychain — reached when the daemon is started
-    // independently (e.g. `reeve daemon start`).
-    let store = crate::keychain::open_platform_secretstore()?;
-    let secret = store
-        .retrieve_secret(labels::ANTHROPIC_API_KEY)
-        .map_err(keychain_error_for_daemon)?;
-    let adapter = reeve_adapter::ClaudeOpus47::new(secret);
-    Ok(Arc::new(adapter))
+
+    Ok(adapters)
 }
 
 /// Map a [`KeychainError`] from daemon adapter loading to a user-facing error.

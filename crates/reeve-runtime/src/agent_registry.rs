@@ -387,6 +387,19 @@ impl AgentRegistry {
         self.flush()
     }
 
+    /// Remove the record for `name` and flush to disk.
+    ///
+    /// Returns [`AgentRegistryError::NotFound`] when `name` is not in the
+    /// registry. Does not touch the agent's on-disk directory tree.
+    pub fn remove(&mut self, name: &str) -> Result<(), AgentRegistryError> {
+        if self.records.remove(name).is_none() {
+            return Err(AgentRegistryError::NotFound {
+                name: name.to_owned(),
+            });
+        }
+        self.flush()
+    }
+
     /// Look up a record by name. In-memory only — no I/O.
     pub fn lookup(&self, name: &str) -> Option<&AgentRecord> {
         self.records.get(name)

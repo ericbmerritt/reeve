@@ -161,6 +161,12 @@ fn build_status_cell(row: &AgentRow, now: OffsetDateTime) -> Span<'static> {
 /// the cell builder can apply [`STATUS_COL_WIDTH`] padding uniformly and
 /// tests can pin the raw content without caring about column alignment.
 fn status_cell_text(row: &AgentRow, now: OffsetDateTime) -> (String, Option<Color>) {
+    // Ghost: registry record exists but spawn never completed (no agent.toml).
+    // Shown regardless of is_running so even "running"-labelled ghosts from
+    // before the transactionality fix are visually distinct.
+    if row.is_ghost {
+        return ("\u{2205}".to_owned(), Some(Color::DarkGray)); // ∅
+    }
     if !row.is_running {
         return match row.status {
             AgentStatus::Crashed => ("\u{2717}".to_owned(), Some(Color::Red)), // ✗
@@ -443,7 +449,7 @@ fn build_queues_strip(counts: QueueCounts) -> Line<'static> {
 /// the same `·` separators as the queues strip for visual rhythm.
 fn build_footer() -> Line<'static> {
     Line::from(
-        "j/k navigate \u{00B7} Enter open \u{00B7} Tab chat \u{00B7} \
+        "j/k navigate \u{00B7} Enter inspect \u{00B7} c chat \u{00B7} d delete \u{00B7} \
          Q quarantine \u{00B7} q quit"
             .to_owned(),
     )
@@ -603,6 +609,7 @@ mod tests {
             persona_name: Some("lead".to_owned()),
             status: AgentStatus::Working,
             is_running: true,
+            is_ghost: false,
             cost_usd: 0.0,
             elapsed: Duration::seconds(100),
             state_changed_at: Some(changed),
@@ -627,6 +634,7 @@ mod tests {
             persona_name: Some("lead".to_owned()),
             status: AgentStatus::Idle,
             is_running: true,
+            is_ghost: false,
             cost_usd: 0.0,
             elapsed: Duration::seconds(0),
             state_changed_at: None,
@@ -650,6 +658,7 @@ mod tests {
             persona_name: Some("worker".to_owned()),
             status: AgentStatus::Idle,
             is_running: false,
+            is_ghost: false,
             cost_usd: 0.0,
             elapsed: Duration::seconds(10),
             state_changed_at: None,
@@ -700,6 +709,7 @@ mod tests {
                 persona_name: Some("lead".to_owned()),
                 status: AgentStatus::Idle,
                 is_running: true,
+                is_ghost: false,
                 cost_usd: 0.0,
                 spawned_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
                 state_changed_at: None,
@@ -722,6 +732,7 @@ mod tests {
                     persona_name: Some("lead".to_owned()),
                     status: AgentStatus::Idle,
                     is_running: true,
+                    is_ghost: false,
                     cost_usd: 0.0,
                     spawned_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
                     state_changed_at: None,
@@ -732,6 +743,7 @@ mod tests {
                     persona_name: Some("worker".to_owned()),
                     status: AgentStatus::Working,
                     is_running: true,
+                    is_ghost: false,
                     cost_usd: 0.0,
                     spawned_at: OffsetDateTime::from_unix_timestamp(1_700_000_050).unwrap(),
                     state_changed_at: None,
@@ -770,6 +782,7 @@ mod tests {
                 persona_name: Some("worker".to_owned()),
                 status: AgentStatus::Idle,
                 is_running: true,
+                is_ghost: false,
                 cost_usd: 0.0,
                 spawned_at: OffsetDateTime::from_unix_timestamp(1_700_000_000 + i64::from(i))
                     .unwrap(),
@@ -835,6 +848,7 @@ mod tests {
                     persona_name: Some("lead".to_owned()),
                     status: AgentStatus::Idle,
                     is_running: true,
+                    is_ghost: false,
                     cost_usd: 0.0,
                     spawned_at: OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap(),
                     state_changed_at: None,
@@ -845,6 +859,7 @@ mod tests {
                     persona_name: Some("worker".to_owned()),
                     status: AgentStatus::Idle,
                     is_running: true,
+                    is_ghost: false,
                     cost_usd: 0.0,
                     spawned_at: OffsetDateTime::from_unix_timestamp(1_700_000_050).unwrap(),
                     state_changed_at: None,

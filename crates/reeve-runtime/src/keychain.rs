@@ -79,6 +79,13 @@ pub mod labels {
     ///
     /// See `specs/reeve-walking-skeleton.ladder.md` Phase 5.
     pub const ANTHROPIC_API_KEY: &str = "reeve-anthropic-api-key";
+
+    /// Label under which the `OpenRouter` API key is stored.
+    ///
+    /// Used by adapters that route through `openrouter.ai` (e.g.
+    /// `DeepSeekR1OpenRouter`). Follows the same `reeve-{provider}-api-key`
+    /// schema as [`ANTHROPIC_API_KEY`].
+    pub const OPENROUTER_API_KEY: &str = "reeve-openrouter-api-key";
 }
 
 /// Service name used for every reeve keychain entry. The macOS generic-

@@ -1,8 +1,15 @@
-//! Per-agent filesystem layout: directory provisioning, conversation thread
-//! (JSONL), and atomic status/cost file writers.
+//! Filesystem layout types for the Reeve data directory.
 //!
-//! Walking-skeleton scope: the `lead` agent at `{data_dir}/agents/lead/` is
-//! the primary consumer.
+//! Two layout structs mirror two levels of the directory tree:
+//!
+//! - [`RuntimeLayout`] — the root data directory. Vends typed paths for
+//!   cross-cutting files: `personas/`, `teams/`, `blacklist.toml`, etc.
+//! - [`AgentDirs`] — the per-agent subtree under `agents/<name>/`. Vends
+//!   paths for the agent's inbox, journal, status, cost, keypair, and
+//!   profile snapshot.
+//!
+//! Neither struct contains any mutable state; all accessors return freshly
+//! computed `PathBuf`s. Callers are responsible for I/O.
 //!
 //! Filesystem safety follows `specs/reeve-transport-security.md` §
 //! Filesystem Safety: no symlink following (`O_NOFOLLOW`), mode `0o700` on
@@ -23,6 +30,100 @@ use crate::fs_util::{ensure_directory, open_jsonl_file, FsCheckError};
 // ── Mode constants ────────────────────────────────────────────────────────────
 
 const AGENT_DIR_MODE: u32 = 0o700;
+
+// ── RuntimeLayout ─────────────────────────────────────────────────────────────
+
+/// Root-level filesystem layout for the Reeve data directory.
+///
+/// Holds the path once and vends typed accessors so callers never
+/// reconstruct `data_dir.join("personas").join(name).join("profile.toml")`
+/// by hand. If the on-disk layout changes, only the methods here need
+/// updating.
+///
+/// ```text
+/// <root>/
+///   personas/<name>/config.toml
+///   personas/<name>/profile.toml
+///   agents/<name>/…                ← see AgentDirs
+///   teams/<name>.toml
+///   blacklist.toml
+/// ```
+#[derive(Debug, Clone)]
+pub struct RuntimeLayout {
+    root: PathBuf,
+}
+
+impl RuntimeLayout {
+    /// Construct a layout rooted at `root`.
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    /// The data root itself.
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    // ── Personas ──────────────────────────────────────────────────────────────
+
+    /// Directory for a named persona: `<root>/personas/<name>/`.
+    pub fn persona_dir(&self, name: &str) -> PathBuf {
+        self.root.join("personas").join(name)
+    }
+
+    /// Persona configuration: `<root>/personas/<name>/config.toml`.
+    pub fn persona_config_path(&self, name: &str) -> PathBuf {
+        self.persona_dir(name).join("config.toml")
+    }
+
+    /// Persona capability profile: `<root>/personas/<name>/profile.toml`.
+    pub fn persona_profile_path(&self, name: &str) -> PathBuf {
+        self.persona_dir(name).join("profile.toml")
+    }
+
+    // ── Agents ────────────────────────────────────────────────────────────────
+
+    /// Root of the agents subtree: `<root>/agents/`.
+    ///
+    /// Root of the personas directory: `<root>/personas/`.
+    ///
+    /// Each subdirectory here is a named persona with its own `config.toml`.
+    pub fn personas_root(&self) -> PathBuf {
+        self.root.join("personas")
+    }
+
+    /// The TUI watcher watches this directory recursively; the agent registry
+    /// TOML lives directly here (`registry.toml`).
+    pub fn agents_root(&self) -> PathBuf {
+        self.root.join("agents")
+    }
+
+    /// Open an [`AgentDirs`] handle for the named agent.
+    ///
+    /// This is a path-construction call only — no I/O. Returns
+    /// `Err(AgentFsError)` when `name` fails the agent-name validation rules.
+    pub fn agent_dirs(&self, name: &str) -> Result<AgentDirs, AgentFsError> {
+        AgentDirs::open(&self.root, name)
+    }
+
+    // ── Teams ─────────────────────────────────────────────────────────────────
+
+    /// Team configuration file: `<root>/teams/<name>.toml`.
+    pub fn team_config_path(&self, name: &str) -> PathBuf {
+        self.root.join("teams").join(name).with_extension("toml")
+    }
+
+    // ── Blacklist ─────────────────────────────────────────────────────────────
+
+    /// Global blacklist file: `<root>/blacklist.toml`.
+    ///
+    /// The daemon's `WatcherActor` polls this on every `INBOX_SCAN_INTERVAL`
+    /// tick and swaps the in-memory `BlacklistRegistry` on each successful
+    /// reload.
+    pub fn blacklist_path(&self) -> PathBuf {
+        self.root.join("blacklist.toml")
+    }
+}
 const AGENT_FILE_MODE: u32 = 0o600;
 
 // ── Error type ────────────────────────────────────────────────────────────────

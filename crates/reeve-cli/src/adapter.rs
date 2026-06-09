@@ -56,6 +56,19 @@ pub(crate) enum AdapterSubcommand {
     #[command(name = "set-key")]
     SetKey,
 
+    /// Store the `OpenRouter` API key in the OS keychain.
+    ///
+    /// Reads the key from stdin (one line). Required to use OpenRouter-routed
+    /// adapters such as `deepseek/deepseek-r1-0528@openrouter`.
+    ///
+    /// Pipe from a file or password manager:
+    ///
+    /// ```text
+    /// printf '%s' "$OPENROUTER_KEY" | reeve adapter set-key-openrouter
+    /// ```
+    #[command(name = "set-key-openrouter")]
+    SetKeyOpenRouter,
+
     /// Send a single prompt to the configured Claude model and print the
     /// response.
     ///
@@ -107,6 +120,7 @@ pub(crate) fn dispatch_with_store(
 ) -> Result<(), Box<dyn std::error::Error>> {
     match cmd {
         AdapterSubcommand::SetKey => cmd_set_key(store),
+        AdapterSubcommand::SetKeyOpenRouter => cmd_set_key_openrouter(store),
         AdapterSubcommand::Test { prompt } => cmd_test(store, prompt),
     }
 }
@@ -132,6 +146,30 @@ fn cmd_set_key(store: &dyn OperatorSecretStore) -> Result<(), Box<dyn std::error
 fn read_api_key_from_stdin() -> Result<secrecy::SecretString, Box<dyn std::error::Error>> {
     let value = crate::prompt::prompt_one_line(
         "Anthropic API key (input will NOT be hidden): ",
+        "API key must not be empty",
+    )?;
+    Ok(secrecy::SecretString::from(value))
+}
+
+// ── set-key-openrouter ─────────────────────────────────────────────────────────
+
+fn cmd_set_key_openrouter(
+    store: &dyn OperatorSecretStore,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let key = read_openrouter_key_from_stdin()?;
+    store.store_secret(labels::OPENROUTER_API_KEY, key)?;
+    let mut out = io::stdout().lock();
+    writeln!(
+        out,
+        "Stored OpenRouter API key in keychain (label: {label})",
+        label = labels::OPENROUTER_API_KEY,
+    )?;
+    Ok(())
+}
+
+fn read_openrouter_key_from_stdin() -> Result<secrecy::SecretString, Box<dyn std::error::Error>> {
+    let value = crate::prompt::prompt_one_line(
+        "OpenRouter API key (input will NOT be hidden): ",
         "API key must not be empty",
     )?;
     Ok(secrecy::SecretString::from(value))

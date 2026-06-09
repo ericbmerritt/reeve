@@ -17,8 +17,8 @@
 
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::state::{AgentStatus, AppState, InspectTab};
@@ -29,25 +29,64 @@ pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
     let area = frame.area();
     let width = area.width;
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1), // title bar
-            Constraint::Length(1), // tab bar
-            Constraint::Length(1), // separator
-            Constraint::Min(1),    // body
-            Constraint::Length(1), // footer
-        ])
-        .split(area);
+    // On the Thread tab we carve out an input pane between the body and
+    // footer, same layout as the chat screen. Other tabs are read-only.
+    if state.inspect_tab == InspectTab::Thread {
+        let input_line = build_input_line(state);
+        let input_widget = Paragraph::new(Text::from(vec![input_line])).wrap(Wrap { trim: false });
+        let input_height_cap = (area.height / 2).max(1);
+        let input_height = input_widget
+            .line_count(width)
+            .try_into()
+            .unwrap_or(u16::MAX)
+            .min(input_height_cap);
 
-    frame.render_widget(Paragraph::new(build_title_bar(state)), chunks[0]);
-    frame.render_widget(Paragraph::new(build_tab_bar(state.inspect_tab)), chunks[1]);
-    frame.render_widget(Paragraph::new(build_separator_line(width)), chunks[2]);
-    frame.render_widget(
-        Paragraph::new(build_body(state, chunks[3].width)),
-        chunks[3],
-    );
-    frame.render_widget(Paragraph::new(build_footer()), chunks[4]);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),            // title bar
+                Constraint::Length(1),            // tab bar
+                Constraint::Length(1),            // separator
+                Constraint::Min(1),               // thread body
+                Constraint::Length(1),            // separator before input
+                Constraint::Length(input_height), // input
+                Constraint::Length(1),            // footer
+            ])
+            .split(area);
+
+        frame.render_widget(Paragraph::new(build_title_bar(state)), chunks[0]);
+        frame.render_widget(Paragraph::new(build_tab_bar(state.inspect_tab)), chunks[1]);
+        frame.render_widget(Paragraph::new(build_separator_line(width)), chunks[2]);
+        let body_lines = build_body(state, chunks[3].width);
+        frame.render_widget(
+            crate::ui::render_conversation(&body_lines, chunks[3], state.scroll_offset),
+            chunks[3],
+        );
+        frame.render_widget(Paragraph::new(build_separator_line(width)), chunks[4]);
+        frame.render_widget(input_widget, chunks[5]);
+        frame.render_widget(Paragraph::new(build_footer()), chunks[6]);
+    } else {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1), // title bar
+                Constraint::Length(1), // tab bar
+                Constraint::Length(1), // separator
+                Constraint::Min(1),    // body
+                Constraint::Length(1), // footer
+            ])
+            .split(area);
+
+        frame.render_widget(Paragraph::new(build_title_bar(state)), chunks[0]);
+        frame.render_widget(Paragraph::new(build_tab_bar(state.inspect_tab)), chunks[1]);
+        frame.render_widget(Paragraph::new(build_separator_line(width)), chunks[2]);
+        let body_lines = build_body(state, chunks[3].width);
+        frame.render_widget(
+            crate::ui::render_conversation(&body_lines, chunks[3], state.scroll_offset),
+            chunks[3],
+        );
+        frame.render_widget(Paragraph::new(build_footer()), chunks[4]);
+    }
 }
 
 /// Title bar: `reeve · {name} ({persona}) ─── {model} · {sigil} {status} · ${cost}`.
@@ -135,9 +174,13 @@ fn build_body(state: &AppState, width: u16) -> Vec<Line<'static>> {
     }
 }
 
+/// Input line for the Thread tab: `> {text}_` (underscore = cursor).
+fn build_input_line(state: &AppState) -> Line<'static> {
+    Line::from(format!("> {}_", state.input))
+}
+
 /// Thread tab body: conversation entries with speaker label and timestamp.
-/// Matches the chat-screen rendering except no input pane is shown — the
-/// inspect screen is read-only.
+/// Rendered above the input pane; scrolled by `state.scroll_offset`.
 fn build_thread_body(state: &AppState, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for entry in &state.conversation {
@@ -158,6 +201,9 @@ fn build_thread_body(state: &AppState, width: u16) -> Vec<Line<'static>> {
             }
         }
         lines.push(Line::from(""));
+    }
+    if let Some(indicator) = crate::ui::thinking_indicator(state) {
+        lines.push(indicator);
     }
     if lines.is_empty() {
         let dim = if no_color() {
@@ -232,7 +278,7 @@ fn stub_body(tab_name: &str) -> Vec<Line<'static>> {
 /// same thing for muscle memory consistency with the rest of the TUI.
 fn build_footer() -> Line<'static> {
     Line::from(
-        "h back \u{00B7} Tab next \u{00B7} Shift+Tab prev \u{00B7} 1-5 jump \u{00B7} q quit"
+        "Enter send \u{00B7} c chat \u{00B7} h back \u{00B7} Tab next \u{00B7} Shift+Tab prev \u{00B7} 1-5 jump \u{00B7} q quit"
             .to_owned(),
     )
 }

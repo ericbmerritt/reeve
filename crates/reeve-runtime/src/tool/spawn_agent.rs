@@ -66,10 +66,7 @@ impl actix::Handler<SpawnResponse> for SpawnRelay {
                 SpawnResponse::Success { agent_name, .. } => (agent_name, false),
                 SpawnResponse::Failure { message } => {
                     tracing::warn!("spawn_agent: coordinator failure: {message}");
-                    (
-                        "spawn_agent: coordinator failed to provision agent".to_owned(),
-                        true,
-                    )
+                    (format!("spawn_agent: {message}"), true)
                 }
             };
             r.do_send(ToolResult {
@@ -144,7 +141,7 @@ impl SpawnAgentTool {
                 - task+context exceeds 65536-byte limit\n\
                 - validation errors from SpawnRequest::validate (invalid \
                   persona name shape, etc.)\n\
-                - `spawn_agent: coordinator failed to provision agent` — the \
+                - `spawn_agent: failed to resolve model adapter: …` — the \
                   coordinator could not load the persona, mint an identity, \
                   or start the actor; the underlying detail is logged but \
                   scrubbed from the result\n\
@@ -657,10 +654,10 @@ mod tests {
     }
 
     // T_SA8b: SpawnRelay::Failure branch — coordinator replies Failure; relay
-    // delivers is_error=true with a generic scrubbed message, not the internal
-    // detail.
+    // delivers is_error=true with the coordinator's message prefixed by
+    // "spawn_agent: " so the model has actionable context.
     #[test]
-    fn spawn_agent_tool_relay_sends_generic_error_on_coordinator_failure() {
+    fn spawn_agent_tool_relay_sends_coordinator_message_on_failure() {
         const RELAY_TEST_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
         const WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -680,10 +677,8 @@ mod tests {
             };
             let relay_addr = relay.start();
 
-            // Send a Failure response with an internal detail that must not
-            // appear in the scrubbed ToolResult content.
             relay_addr.do_send(SpawnResponse::Failure {
-                message: "internal error detail".to_owned(),
+                message: "failed to resolve model adapter: no adapter matches".to_owned(),
             });
 
             let result = tokio::time::timeout(WAIT_TIMEOUT, capture_rx)
@@ -697,13 +692,8 @@ mod tests {
                 "expected is_error=true on coordinator failure"
             );
             assert_eq!(
-                result.content, "spawn_agent: coordinator failed to provision agent",
-                "content must be the generic scrubbed message"
-            );
-            assert!(
-                !result.content.contains("internal error detail"),
-                "internal detail must not appear in scrubbed content: {}",
-                result.content
+                result.content, "spawn_agent: failed to resolve model adapter: no adapter matches",
+                "content must be spawn_agent: prefixed coordinator message"
             );
 
             actix::System::current().stop();

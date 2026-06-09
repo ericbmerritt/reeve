@@ -20,7 +20,7 @@ use time::OffsetDateTime;
 use tracing::{debug, warn};
 
 use crate::agent::Agent;
-use crate::agent_fs::AgentDirs;
+use crate::agent_fs::{AgentDirs, RuntimeLayout};
 use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentRegistryError, AgentStatus,
 };
@@ -60,9 +60,6 @@ impl std::error::Error for SpawnRequestError {
         }
     }
 }
-
-/// Directory name under `data_dir` where persona configs are stored.
-const PERSONAS_DIR: &str = "personas";
 
 /// Pre-validated parameters for a spawn request, not yet bound to a reply
 /// recipient.
@@ -198,8 +195,9 @@ pub struct SpawnCoordinator {
     agent_registry_path: PathBuf,
     /// Shared identity registry for writing new agent identities.
     identity_registry: Arc<IdentityRegistry>,
-    /// Model adapter used by all spawned agents.
-    adapter: Arc<dyn reeve_adapter::Adapter>,
+    /// All model adapters available to the daemon; model resolution picks the
+    /// first adapter whose model segment matches the persona's preference list.
+    adapters: Vec<Arc<dyn reeve_adapter::Adapter>>,
     /// Watcher that owns the routing table; `register_route` is called after
     /// the agent actor starts.
     watcher: Arc<Watcher>,
@@ -227,7 +225,7 @@ impl SpawnCoordinator {
         data_dir: PathBuf,
         agent_registry_path: PathBuf,
         identity_registry: Arc<IdentityRegistry>,
-        adapter: Arc<dyn reeve_adapter::Adapter>,
+        adapters: Vec<Arc<dyn reeve_adapter::Adapter>>,
         watcher: Arc<Watcher>,
         inbox_starter: actix::Recipient<WatchInbox>,
         dispatcher: actix::Recipient<SendMessage>,
@@ -237,7 +235,7 @@ impl SpawnCoordinator {
             data_dir,
             agent_registry_path,
             identity_registry,
-            adapter,
+            adapters,
             watcher,
             inbox_starter,
             dispatcher,
@@ -366,11 +364,8 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             }
         };
 
-        let persona_path = self
-            .data_dir
-            .join(PERSONAS_DIR)
-            .join(persona_name_str)
-            .join("config.toml");
+        let layout = RuntimeLayout::new(&self.data_dir);
+        let persona_path = layout.persona_config_path(persona_name_str);
 
         let persona_config = match load_persona_config(&persona_path) {
             Ok(cfg) => cfg,
@@ -390,36 +385,29 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             }
         };
 
-        let persona_profile_path = self
-            .data_dir
-            .join(PERSONAS_DIR)
-            .join(persona_name_str)
-            .join("profile.toml");
+        let persona_profile_path = layout.persona_profile_path(persona_name_str);
 
-        let persona_profile = match load_capability_profile(&persona_profile_path) {
-            Ok(p) => p,
-            Err(crate::capability::ProfileError::Io { ref source, .. })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                error_reply(
-                    &reply_to,
-                    format!(
-                        "capability profile missing for persona '{persona_name_str}': \
-                         expected at {}",
-                        persona_profile_path.display()
-                    ),
-                );
-                return;
-            }
-            Err(err) => {
-                warn!(%err, "failed to load persona capability profile");
-                error_reply(
-                    &reply_to,
-                    String::from("failed to load persona capability profile"),
-                );
-                return;
-            }
-        };
+        let persona_profile: Option<CapabilityProfile> =
+            match load_capability_profile(&persona_profile_path) {
+                Ok(p) => Some(p),
+                Err(crate::capability::ProfileError::Io { ref source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    debug!(
+                        persona = persona_name_str,
+                        "no profile.toml for persona; agent will run unrestricted"
+                    );
+                    None
+                }
+                Err(err) => {
+                    warn!(%err, "failed to load persona capability profile");
+                    error_reply(
+                        &reply_to,
+                        String::from("failed to load persona capability profile"),
+                    );
+                    return;
+                }
+            };
 
         let dirs = match AgentDirs::provision(&self.data_dir, &agent_name_str) {
             Ok(d) => d,
@@ -474,6 +462,73 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             return;
         }
 
+        // Model resolution and snapshot write happen before the agent registry
+        // record is created. A failure here leaves an orphaned identity entry
+        // (acceptable — tiny, harmless) but NO agent registry record, so the
+        // resume pass on the next daemon restart will not attempt to re-launch
+        // an agent that was never fully provisioned.
+        let adapter_refs: Vec<&dyn reeve_adapter::Adapter> =
+            self.adapters.iter().map(std::ops::Deref::deref).collect();
+        let mut snapshot = match resolve_model(&persona_config, &adapter_refs, agent_id) {
+            Ok(s) => s,
+            Err(crate::model_resolution::ModelResolveError::NoMatchingAdapter {
+                ref preferences,
+                ..
+            }) => {
+                let loaded: Vec<&str> = adapter_refs.iter().map(|a| a.id()).collect();
+                error_reply(
+                    &reply_to,
+                    format!(
+                        "no adapter loaded for model preferences {preferences:?}; \
+                         loaded adapters: {loaded:?}. \
+                         If a provider key is missing, run \
+                         `reeve adapter set-key-<provider>` and restart the daemon."
+                    ),
+                );
+                return;
+            }
+            Err(err) => {
+                error_reply(&reply_to, format!("failed to resolve model adapter: {err}"));
+                return;
+            }
+        };
+        let Some(resolved_adapter) = self.adapters.iter().find(|a| a.id() == snapshot.adapter_id)
+        else {
+            error_reply(
+                &reply_to,
+                "failed to resolve model adapter: adapter disappeared from slice".to_owned(),
+            );
+            return;
+        };
+
+        let final_system_prompt = if system_prompt.is_empty() {
+            persona_config.system_prompt.clone()
+        } else {
+            format!("{}\n\n{}", persona_config.system_prompt, system_prompt)
+        };
+        snapshot.system_prompt.clone_from(&final_system_prompt);
+
+        if let Err(err) = write_spawn_snapshot(&dirs, &snapshot) {
+            error_reply(&reply_to, format!("failed to write spawn snapshot: {err}"));
+            return;
+        }
+
+        if let Some(ref p) = persona_profile {
+            if let Err(err) = write_capability_profile(&dirs.profile_path(), p) {
+                error_reply(
+                    &reply_to,
+                    format!("failed to write capability profile snapshot: {err}"),
+                );
+                return;
+            }
+        }
+
+        let profile = persona_profile.map(Arc::new);
+
+        // Write the agent registry record only after the snapshot is on disk.
+        // This is the commit point: a record in the agent registry means the
+        // agent is resumable on the next daemon restart. Any failure before
+        // this point is invisible to the resume pass.
         let record = AgentRecord {
             name: validated_name.clone(),
             identity_id: agent_id,
@@ -489,39 +544,6 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             return;
         }
 
-        let mut snapshot = match resolve_model(&persona_config, &[self.adapter.as_ref()], agent_id)
-        {
-            Ok(s) => s,
-            Err(err) => {
-                error_reply(&reply_to, format!("failed to resolve model adapter: {err}"));
-                return;
-            }
-        };
-
-        let final_system_prompt = if system_prompt.is_empty() {
-            persona_config.system_prompt.clone()
-        } else {
-            format!("{}\n\n{}", persona_config.system_prompt, system_prompt)
-        };
-        // Persist the composed prompt so a daemon restart can re-launch this
-        // agent with the same task context, not just the persona's base.
-        snapshot.system_prompt.clone_from(&final_system_prompt);
-
-        if let Err(err) = write_spawn_snapshot(&dirs, &snapshot) {
-            error_reply(&reply_to, format!("failed to write spawn snapshot: {err}"));
-            return;
-        }
-
-        if let Err(err) = write_capability_profile(&dirs.profile_path(), &persona_profile) {
-            error_reply(
-                &reply_to,
-                format!("failed to write capability profile snapshot: {err}"),
-            );
-            return;
-        }
-
-        let profile = Arc::new(persona_profile);
-
         debug!(
             agent_name = %validated_name,
             %agent_id,
@@ -534,12 +556,12 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             self.dispatcher.clone(),
             self.agent_registry_path.clone(),
             self.data_dir.as_path(),
-            Some(profile),
+            profile,
             self.blacklist.clone(),
         );
 
         let new_agent = match Agent::new(
-            Arc::clone(&self.adapter),
+            Arc::clone(resolved_adapter),
             &dirs,
             snapshot,
             final_system_prompt,
@@ -623,14 +645,15 @@ mod tests {
         inbox_starter: actix::Recipient<WatchInbox>,
     ) -> SpawnCoordinator {
         use actix::Actor as _;
-        let adapter: Arc<dyn reeve_adapter::Adapter> =
-            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+        let adapters: Vec<Arc<dyn reeve_adapter::Adapter>> = vec![Arc::new(MockAdapter::new(
+            "claude-opus-4-7@anthropic-direct",
+        ))];
         let dispatcher = NullDispatcher.start().recipient();
         SpawnCoordinator::new(
             data_dir.to_path_buf(),
             agent_registry_path,
             identity_registry,
-            adapter,
+            adapters,
             watcher,
             inbox_starter,
             dispatcher,
@@ -1051,19 +1074,20 @@ mod tests {
         );
     }
 
-    // ── SC9: resolve_model failure leaves double-orphan ───────────────────────
+    // ── SC9: resolve_model failure leaves only identity orphan, not agent record ─
 
     /// When the persona's model preferences do not match any registered adapter,
-    /// `resolve_model` fails after identity and agent registry records have
-    /// already been written. Both registries retain their entries (double-orphan)
-    /// even though the spawn ultimately fails.
+    /// `resolve_model` fails before the agent registry record is written. The
+    /// identity registry retains a single orphan entry (written earlier to
+    /// obtain `agent_id`), but the agent registry has no record — so a daemon
+    /// restart will not attempt to resume a never-fully-provisioned agent.
     #[test]
-    fn resolve_model_failure_leaves_double_orphan() {
+    fn resolve_model_failure_leaves_only_identity_orphan() {
         let tmp: TempDir = secure_dir();
         let data_dir = tmp.path().to_path_buf();
 
         // Write a persona that requests a model the mock adapter cannot serve.
-        let persona_dir = data_dir.join("personas").join("unmatchable");
+        let persona_dir = crate::agent_fs::RuntimeLayout::new(&data_dir).persona_dir("unmatchable");
         std::fs::create_dir_all(&persona_dir).unwrap();
         std::fs::write(
             persona_dir.join("config.toml"),
@@ -1124,7 +1148,7 @@ mod tests {
             "expected SpawnResponse::Failure when model resolution fails",
         );
 
-        // Identity written at step 8 before resolve_model is called — one orphan identity (see agent registry check below for the second orphan).
+        // One orphan identity: written before resolve_model so we have agent_id.
         let identities_after = identity_registry_for_check
             .list()
             .expect("list after spawn must succeed")
@@ -1135,14 +1159,15 @@ mod tests {
             "one orphan identity expected: written before resolve_model fails",
         );
 
-        // Agent registry entry also written before resolve_model fails — double-orphan: one identity + one agent registry entry.
+        // No orphan agent registry record: the write was moved to after the
+        // snapshot, so a failed resolve_model leaves the agent registry clean.
+        // A daemon restart will not attempt to resume this never-provisioned agent.
         let agent_registry =
             AgentRegistry::open(agent_registry_path_for_check).expect("open agent registry");
-        let orphan_count = agent_registry.list().count();
+        let agents_after = agent_registry.list().count();
         assert_eq!(
-            orphan_count,
-            agents_before + 1,
-            "one orphan agent registry record expected: written before resolve_model fails",
+            agents_after, agents_before,
+            "no agent registry record expected: written only after snapshot succeeds",
         );
     }
 

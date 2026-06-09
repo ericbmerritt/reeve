@@ -41,12 +41,14 @@ use crate::capability::{CapabilityProfile, ToolCategory};
 pub type BlacklistHandle = Arc<RwLock<BlacklistRegistry>>;
 
 pub mod list_agents;
+pub mod list_personas;
 pub mod send_message;
 pub mod spawn_agent;
 pub mod whoami;
 pub mod whois;
 
 pub use list_agents::ListAgentsTool;
+pub use list_personas::ListPersonasTool;
 pub use send_message::SendMessageTool;
 pub use spawn_agent::SpawnAgentTool;
 pub use whoami::WhoamiTool;
