@@ -212,6 +212,9 @@ pub struct SpawnCoordinator {
     /// Shared blacklist handle. Written by the reload watcher; read on each
     /// tool dispatch. `None` when the daemon started without a blacklist.
     blacklist: Option<BlacklistHandle>,
+    /// Audit log for `authority.decision` events emitted when a spawned
+    /// agent's cost thresholds trip.
+    audit: Arc<crate::audit::AuditLog>,
 }
 
 impl SpawnCoordinator {
@@ -226,6 +229,7 @@ impl SpawnCoordinator {
         agent_registry_path: PathBuf,
         identity_registry: Arc<IdentityRegistry>,
         adapters: Vec<Arc<dyn reeve_adapter::Adapter>>,
+        audit: Arc<crate::audit::AuditLog>,
         watcher: Arc<Watcher>,
         inbox_starter: actix::Recipient<WatchInbox>,
         dispatcher: actix::Recipient<SendMessage>,
@@ -240,6 +244,7 @@ impl SpawnCoordinator {
             inbox_starter,
             dispatcher,
             blacklist,
+            audit,
         }
     }
 }
@@ -523,6 +528,10 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             }
         }
 
+        let spawn_thresholds = persona_profile
+            .as_ref()
+            .map(|p| p.thresholds.clone())
+            .unwrap_or_default();
         let profile = persona_profile.map(Arc::new);
 
         // Write the agent registry record only after the snapshot is on disk.
@@ -568,6 +577,9 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             agent_id,
             keypair,
             tools,
+            spawn_thresholds,
+            Some(Arc::clone(&self.audit)),
+            self.data_dir.clone(),
         ) {
             Ok(a) => a,
             Err(err) => {
@@ -649,11 +661,16 @@ mod tests {
             "claude-opus-4-7@anthropic-direct",
         ))];
         let dispatcher = NullDispatcher.start().recipient();
+        let audit = Arc::new(
+            crate::audit::AuditLog::open(data_dir.to_path_buf())
+                .expect("open audit log in test coordinator"),
+        );
         SpawnCoordinator::new(
             data_dir.to_path_buf(),
             agent_registry_path,
             identity_registry,
             adapters,
+            audit,
             watcher,
             inbox_starter,
             dispatcher,

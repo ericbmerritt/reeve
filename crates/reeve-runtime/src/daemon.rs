@@ -909,10 +909,10 @@ fn launch_actors(
     };
     let blacklist_handle: BlacklistHandle = Arc::new(std::sync::RwLock::new(initial_blacklist));
 
-    // Clone the audit reference for the watcher; opening twice is harmless (append-only file).
-    let audit_for_watcher: Arc<AuditLog> = Arc::new(
+    let audit_shared: Arc<AuditLog> = Arc::new(
         AuditLog::open(data_dir.clone()).unwrap_or_else(|e| panic!("cannot open audit log: {e}")),
     );
+    let audit_for_watcher = Arc::clone(&audit_shared);
     let blacklist_handle_for_watcher = Arc::clone(&blacklist_handle);
     let watcher_addr = actix::Supervisor::start(move |_| {
         WatcherActor::new(Arc::clone(&watcher)).with_blacklist(
@@ -942,6 +942,7 @@ fn launch_actors(
     // Keep clones for the subagent re-launch pass below; the spawn coordinator
     // and lead agent both consume their respective handles.
     let data_dir_for_resume = data_dir.clone();
+    let data_dir_for_lead = data_dir.clone();
     let agent_registry_path_for_resume = agent_registry_path.clone();
     let identity_registry_for_resume = Arc::clone(&identity_registry);
     let adapters_for_resume = adapters.clone();
@@ -955,6 +956,7 @@ fn launch_actors(
         agent_registry_path,
         identity_registry,
         adapters.clone(),
+        Arc::clone(&audit_shared),
         watcher_for_coord,
         watcher_addr.clone().recipient(),
         dispatcher_addr.clone().recipient(),
@@ -993,7 +995,12 @@ fn launch_actors(
     let whoami_tool =
         crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone(), lead_profile.clone());
     let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois.clone(), lead_profile.clone());
-    let list_personas_tool = crate::tool::ListPersonasTool::new(data_dir_for_whois, lead_profile);
+    let list_personas_tool =
+        crate::tool::ListPersonasTool::new(data_dir_for_whois, lead_profile.clone());
+    let lead_thresholds_from_profile = lead_profile
+        .as_deref()
+        .map(|p| p.thresholds.clone())
+        .unwrap_or_default();
     let tools: Vec<(
         reeve_adapter::Tool,
         actix::Recipient<crate::tool::InvokeTool>,
@@ -1034,6 +1041,9 @@ fn launch_actors(
         agent_id,
         keypair,
         tools,
+        lead_thresholds_from_profile,
+        Some(Arc::clone(&audit_shared)),
+        data_dir_for_lead,
     )
     .map_err(|e| DaemonError::Resource {
         component: "lead agent",
@@ -1061,6 +1071,7 @@ fn launch_actors(
         &identity_registry_for_resume,
         &adapters_for_resume,
         Some(&blacklist_handle),
+        &audit_shared,
         &watcher_for_resume,
         &resume_inbox_starter,
         &dispatcher_recipient_for_resume,
@@ -1093,6 +1104,7 @@ fn resume_persisted_subagents(
     identity_registry: &Arc<IdentityRegistry>,
     adapters: &[Arc<dyn reeve_adapter::Adapter>],
     blacklist: Option<&BlacklistHandle>,
+    audit: &Arc<AuditLog>,
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
@@ -1116,6 +1128,7 @@ fn resume_persisted_subagents(
             identity_registry,
             adapters,
             blacklist,
+            audit,
             watcher,
             inbox_starter,
             dispatcher,
@@ -1157,6 +1170,7 @@ fn resume_one_subagent(
     identity_registry: &Arc<IdentityRegistry>,
     adapters: &[Arc<dyn reeve_adapter::Adapter>],
     blacklist: Option<&BlacklistHandle>,
+    audit: &Arc<AuditLog>,
     watcher: &Arc<Watcher>,
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
@@ -1241,6 +1255,10 @@ fn resume_one_subagent(
             None
         }
     };
+    let resume_thresholds = profile
+        .as_deref()
+        .map(|p| p.thresholds.clone())
+        .unwrap_or_default();
     let tools = build_subagent_tools(
         coordinator,
         dispatcher.clone(),
@@ -1257,6 +1275,9 @@ fn resume_one_subagent(
         record.identity_id,
         keypair,
         tools,
+        resume_thresholds,
+        Some(Arc::clone(audit)),
+        data_dir.to_path_buf(),
     )
     .map_err(|e| format!("construct Agent: {e}"))?;
     let agent_addr = actix::Supervisor::start(move |_| new_agent);
@@ -1296,6 +1317,7 @@ mod tests {
     use crate::agent_registry::{
         generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
     };
+    use crate::audit::AuditLog;
     use crate::identity_registry::StoredIdentity;
     use crate::model_resolution::{write_spawn_snapshot, SpawnSnapshot};
     use crate::test_support::{build_registries, enroll_test_operator, MockAdapter};
@@ -1744,12 +1766,15 @@ mod tests {
             let inbox_starter = NullInboxStarter.start().recipient();
             let dispatcher = NullDispatcher.start().recipient();
 
+            let test_audit =
+                Arc::new(AuditLog::open(data_dir.clone()).expect("open audit log in test"));
             resume_persisted_subagents(
                 &data_dir,
                 &agent_registry_path,
                 &identity_registry,
                 std::slice::from_ref(&adapter),
                 None,
+                &test_audit,
                 &watcher,
                 &inbox_starter,
                 &dispatcher,
@@ -1829,12 +1854,15 @@ mod tests {
             let inbox_starter = NullInboxStarter.start().recipient();
             let dispatcher = NullDispatcher.start().recipient();
 
+            let test_audit =
+                Arc::new(AuditLog::open(data_dir.clone()).expect("open audit log in test"));
             resume_persisted_subagents(
                 &data_dir,
                 &agent_registry_path,
                 &identity_registry,
                 std::slice::from_ref(&adapter),
                 None,
+                &test_audit,
                 &watcher,
                 &inbox_starter,
                 &dispatcher,

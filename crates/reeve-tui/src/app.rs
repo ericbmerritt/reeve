@@ -209,6 +209,15 @@ fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Pat
             state.model_id.push_str(snapshot.model());
             state.persona_name = snapshot.persona_name;
         }
+        // Load thresholds for the Model tab — only when not actively editing
+        // so a slow reload doesn't overwrite what the operator is typing.
+        if !state.inspect_model_editing {
+            if let Ok(profile) =
+                reeve_runtime::capability::load_capability_profile(&dirs.profile_path())
+            {
+                state.inspect_thresholds = profile.thresholds;
+            }
+        }
     }
     state.panopticon = read_panopticon_snapshot(data_dir, agent_registry_path, state.operator_id);
     // The quarantine snapshot is rebuilt on every reload so the
@@ -651,6 +660,11 @@ fn handle_key_panopticon(
 ///
 /// `h`/`Esc` return to the panopticon. `q` and global `Esc`/`Tab` are
 /// consumed by the dispatcher before reaching here.
+#[expect(
+    clippy::too_many_lines,
+    reason = "three tab-specific input modes (Thread chat, Model editor, global \
+              navigation) must be dispatched in one function to share the key event"
+)]
 fn handle_key_inspect(
     key: event::KeyEvent,
     state: &mut AppState,
@@ -660,6 +674,65 @@ fn handle_key_inspect(
 ) -> Result<bool, TuiError> {
     const ROWS_PER_PAGE: u16 = 10;
     const ROWS_PER_LINE_NUDGE: u16 = 1;
+
+    // On the Model tab, j/k navigate threshold fields; Enter begins editing;
+    // while editing, chars update the input buffer, Enter saves, Esc cancels.
+    if state.inspect_tab == InspectTab::Model {
+        let n = crate::state::MODEL_FIELD_LABELS.len();
+        if state.inspect_model_editing {
+            match (key.code, key.modifiers) {
+                (KeyCode::Esc, _) => {
+                    state.inspect_model_editing = false;
+                    state.set_input(String::new());
+                    return Ok(false);
+                }
+                (KeyCode::Enter, KeyModifiers::NONE) => {
+                    save_threshold(state, data_dir);
+                    state.inspect_model_editing = false;
+                    state.set_input(String::new());
+                    return Ok(false);
+                }
+                (KeyCode::Backspace, _) => {
+                    let mut s = state.input.clone();
+                    if !s.is_empty() {
+                        let trim = s.char_indices().next_back().map(|(i, _)| i).unwrap_or(0);
+                        s.truncate(trim);
+                    }
+                    state.set_input(s);
+                    return Ok(false);
+                }
+                (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+                    let mut s = state.input.clone();
+                    s.push(c);
+                    state.set_input(s);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        } else {
+            match (key.code, key.modifiers) {
+                (KeyCode::Char('j') | KeyCode::Down, KeyModifiers::NONE) => {
+                    state.inspect_model_field =
+                        (state.inspect_model_field + 1).min(n.saturating_sub(1));
+                    return Ok(false);
+                }
+                (KeyCode::Char('k') | KeyCode::Up, KeyModifiers::NONE) => {
+                    state.inspect_model_field = state.inspect_model_field.saturating_sub(1);
+                    return Ok(false);
+                }
+                (KeyCode::Enter, KeyModifiers::NONE) => {
+                    state.inspect_model_editing = true;
+                    let current = threshold_field_display(
+                        &state.inspect_thresholds,
+                        state.inspect_model_field,
+                    );
+                    state.set_input(current);
+                    return Ok(false);
+                }
+                _ => {}
+            }
+        }
+    }
 
     // On the Thread tab, character input and Enter go to the agent.
     if state.inspect_tab == InspectTab::Thread {
@@ -677,7 +750,16 @@ fn handle_key_inspect(
                 state.set_input(s);
                 return Ok(false);
             }
-            (KeyCode::Char(c), KeyModifiers::NONE | KeyModifiers::SHIFT) => {
+            // `1`-`5` with no modifier are reserved for tab switching;
+            // let them fall through to the outer match rather than entering
+            // the digit literally into the chat input.
+            (KeyCode::Char(c), KeyModifiers::NONE) if !matches!(c, '1'..='5') => {
+                let mut s = state.input.clone();
+                s.push(c);
+                state.set_input(s);
+                return Ok(false);
+            }
+            (KeyCode::Char(c), KeyModifiers::SHIFT) => {
                 let mut s = state.input.clone();
                 s.push(c);
                 state.set_input(s);
@@ -690,14 +772,17 @@ fn handle_key_inspect(
     match (key.code, key.modifiers) {
         (KeyCode::Tab, KeyModifiers::NONE) => {
             state.set_input(String::new());
+            state.inspect_model_editing = false;
             state.inspect_tab = state.inspect_tab.next();
         }
         (KeyCode::Tab, KeyModifiers::SHIFT) | (KeyCode::BackTab, _) => {
             state.set_input(String::new());
+            state.inspect_model_editing = false;
             state.inspect_tab = state.inspect_tab.prev();
         }
         (KeyCode::Char(c @ '1'..='5'), _) => {
             state.set_input(String::new());
+            state.inspect_model_editing = false;
             let tab = match c {
                 '1' => InspectTab::Thread,
                 '2' => InspectTab::Tools,
@@ -710,6 +795,7 @@ fn handle_key_inspect(
         }
         (KeyCode::Char('h'), KeyModifiers::NONE) => {
             state.set_input(String::new());
+            state.inspect_model_editing = false;
             state.screen = Screen::Panopticon;
         }
         // `c` opens full-screen chat for the currently inspected agent.
@@ -938,6 +1024,81 @@ fn submit_to_agent(
     state.set_input(String::new());
     state.scroll_to_bottom();
     Ok(())
+}
+
+// ── Model tab threshold editor ────────────────────────────────────────────────
+
+/// Format the current value of a threshold field for display/pre-fill.
+/// Returns an empty string for `None` (operator clears to remove the limit).
+pub(crate) fn threshold_field_display(
+    t: &reeve_runtime::capability::Thresholds,
+    field: usize,
+) -> String {
+    match field {
+        0 => t
+            .cost_per_agent
+            .map_or(String::new(), |v| format!("{v:.6}")),
+        1 => t
+            .cost_per_session
+            .map_or(String::new(), |v| format!("{v:.6}")),
+        2 => t
+            .max_concurrent_subordinates
+            .map_or(String::new(), |v| v.to_string()),
+        3 => t
+            .max_task_duration_secs
+            .map_or(String::new(), |v| v.to_string()),
+        _ => String::new(),
+    }
+}
+
+/// Parse `state.input` and write the updated threshold to
+/// `agents/<name>/profile.toml`. Silently ignores parse/write errors so
+/// a bad value leaves the existing file untouched.
+fn save_threshold(state: &mut AppState, data_dir: &Path) {
+    let Some(agent_name) = state.inspect_agent_name.clone() else {
+        return;
+    };
+    let Ok(dirs) = AgentDirs::open(data_dir, &agent_name) else {
+        return;
+    };
+    let profile_path = dirs.profile_path();
+    let raw = state.input.trim().to_owned();
+
+    let mut profile = reeve_runtime::capability::load_capability_profile(&profile_path)
+        .unwrap_or_else(|_| reeve_runtime::capability::CapabilityProfile {
+            name: state.persona_name.clone(),
+            version: 1,
+            enabled_categories: None,
+            thresholds: reeve_runtime::capability::Thresholds::default(),
+        });
+
+    match state.inspect_model_field {
+        0 => {
+            profile.thresholds.cost_per_agent = raw
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0);
+        }
+        1 => {
+            profile.thresholds.cost_per_session = raw
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v > 0.0);
+        }
+        2 => {
+            profile.thresholds.max_concurrent_subordinates = raw.parse::<u32>().ok();
+        }
+        3 => {
+            profile.thresholds.max_task_duration_secs = raw.parse::<u64>().ok();
+        }
+        _ => {}
+    }
+
+    if reeve_runtime::capability::write_capability_profile(&profile_path, &profile).is_ok() {
+        // Mirror the change immediately so the display is consistent before
+        // the next reload cycle picks up the new file from disk.
+        state.inspect_thresholds = profile.thresholds;
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

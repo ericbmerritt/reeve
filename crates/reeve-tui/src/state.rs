@@ -271,7 +271,27 @@ pub struct AppState {
     /// compose screen submits to this agent's inbox. Empty string when
     /// no compose is in progress.
     pub quarantine_compose_recipient: String,
+    /// Current threshold values for the inspected agent, loaded from
+    /// `agents/<name>/profile.toml` on every reload. Used by the Model tab
+    /// renderer; written back to disk when the operator edits a field.
+    pub inspect_thresholds: reeve_runtime::capability::Thresholds,
+    /// Which threshold field has focus in the Model tab editor.
+    /// `0` = `cost_per_agent`, `1` = `cost_per_session`,
+    /// `2` = `max_concurrent_subordinates`, `3` = `max_task_duration_secs`.
+    pub inspect_model_field: usize,
+    /// True while the operator is typing a new value for a threshold field.
+    /// The shared `input` buffer holds the current edit.
+    pub inspect_model_editing: bool,
 }
+
+/// The four editable threshold fields in display order: label shown in the
+/// Model tab UI.
+pub const MODEL_FIELD_LABELS: &[&str] = &[
+    "Cost / agent (USD)",
+    "Cost / session (USD)",
+    "Max subordinates",
+    "Max task duration (s)",
+];
 
 impl AppState {
     /// Replace input content; cursor moves to end.
@@ -337,6 +357,9 @@ impl Default for AppState {
             quarantine_focus: 0,
             quarantine_confirm_discard: false,
             quarantine_compose_recipient: String::new(),
+            inspect_thresholds: reeve_runtime::capability::Thresholds::default(),
+            inspect_model_field: 0,
+            inspect_model_editing: false,
         }
     }
 }
