@@ -168,7 +168,7 @@ fn build_body(state: &AppState, width: u16) -> Vec<Line<'static>> {
     match state.inspect_tab {
         InspectTab::Thread => build_thread_body(state, width),
         InspectTab::Tools => stub_body("Tools"),
-        InspectTab::Model => stub_body("Model"),
+        InspectTab::Model => build_model_body(state),
         InspectTab::Decisions => stub_body("Decisions"),
         InspectTab::Memory => stub_body("Memory"),
     }
@@ -247,6 +247,91 @@ fn wrap_body_line(text: &str, width: u16) -> Vec<String> {
         out.push(BODY_INDENT.to_owned());
     }
     out
+}
+
+/// Model tab body: adapter, persona, and editable threshold fields.
+///
+/// `j`/`k` navigate between fields; `Enter` begins editing the focused field;
+/// the shared input buffer shows inline. Changes are written to
+/// `agents/<name>/profile.toml` and take effect on the next daemon restart.
+fn build_model_body(state: &AppState) -> Vec<Line<'static>> {
+    use crate::state::MODEL_FIELD_LABELS;
+
+    const LABEL_COL_WIDTH: usize = 36;
+
+    let focused_style = if no_color() {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    };
+    let dim = if no_color() {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Read-only adapter / persona info.
+    lines.push(Line::from(Span::styled(
+        format!("  Adapter  {}", state.model_id),
+        dim,
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("  Persona  {}", state.persona_name),
+        dim,
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  \u{2500}\u{2500} Thresholds \u{2500}\u{2500}  (changes take effect on restart)"
+            .to_owned(),
+        dim,
+    )));
+    lines.push(Line::from(""));
+
+    // Editable threshold fields.
+    let t = &state.inspect_thresholds;
+    let field_values = [
+        crate::app::threshold_field_display(t, 0),
+        crate::app::threshold_field_display(t, 1),
+        crate::app::threshold_field_display(t, 2),
+        crate::app::threshold_field_display(t, 3),
+    ];
+
+    for (i, label) in MODEL_FIELD_LABELS.iter().enumerate() {
+        let is_focused = state.inspect_model_field == i;
+        let prefix = if is_focused { "> " } else { "  " };
+
+        let value_str = if is_focused && state.inspect_model_editing {
+            // Show live input buffer with cursor.
+            format!("{}_", state.input)
+        } else if field_values[i].is_empty() {
+            "\u{2013}".to_owned() // en-dash for "no limit"
+        } else {
+            field_values[i].clone()
+        };
+
+        let label_col = format!("{prefix}{label}");
+        let pad = LABEL_COL_WIDTH.saturating_sub(label_col.chars().count());
+        let row = format!("{label_col}{:pad$}{value_str}", "", pad = pad);
+
+        let style = if is_focused {
+            focused_style
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(row, style)));
+        lines.push(Line::from(""));
+    }
+
+    // Help hint.
+    lines.push(Line::from(Span::styled(
+        "  j/k select \u{00B7} Enter edit \u{00B7} Esc cancel \u{00B7} empty = no limit".to_owned(),
+        dim,
+    )));
+    lines
 }
 
 /// Placeholder body for stub tabs. The operator should know what they're

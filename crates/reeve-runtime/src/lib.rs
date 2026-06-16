@@ -11,6 +11,7 @@ pub mod audit;
 pub mod blacklist;
 pub mod capability;
 pub mod config;
+pub mod cost_meter;
 pub mod daemon;
 pub mod delivery;
 pub mod dispatcher;

@@ -30,8 +30,10 @@ use tracing::{debug, info, warn};
 use crate::agent_fs::{
     AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread,
 };
+use crate::audit::{AuditEvent, AuditLog, AuthorityDisposition};
+use crate::capability::Thresholds;
 use crate::model_resolution::SpawnSnapshot;
-use crate::tool::{InvokeTool, ToolResult};
+use crate::tool::{InvokeTool, Refusal, ToolResult};
 
 // ── History loader ────────────────────────────────────────────────────────────
 
@@ -412,6 +414,15 @@ pub struct Agent {
         reason = "envelope signing consumed in a later phase; field committed now so the private key has exactly one in-memory home"
     )]
     keypair: reeve_types::Keypair,
+    /// Snapshotted cost and concurrency thresholds from the persona profile.
+    /// `None` fields mean no limit. Checked before every adapter call.
+    thresholds: Thresholds,
+    /// Audit log for `authority.decision` events. `None` when the daemon
+    /// did not provide one (e.g., test harnesses).
+    audit: Option<Arc<AuditLog>>,
+    /// Root of the Reeve data directory. Used by the session cost meter to
+    /// walk all agent cost files when checking `cost_per_session`.
+    data_dir: PathBuf,
     /// `message_id`s the agent has already accepted (whether processed or
     /// queued). Duplicate `ProcessInbound` messages with the same id are
     /// dropped silently.
@@ -529,8 +540,8 @@ impl Agent {
     /// an empty tools vector behaves as a text-only agent.
     #[expect(
         clippy::too_many_arguments,
-        reason = "agent constructor wires together seven independent collaborators; \
-                  bundling into a struct trades complexity for indirection"
+        reason = "agent constructor wires together ten independent collaborators; \
+                  bundling into a struct trades clarity for indirection"
     )]
     pub fn new(
         adapter: Arc<dyn reeve_adapter::Adapter>,
@@ -540,6 +551,9 @@ impl Agent {
         agent_id: reeve_types::IdentityId,
         keypair: reeve_types::Keypair,
         tools: Vec<(reeve_adapter::Tool, Recipient<InvokeTool>)>,
+        thresholds: Thresholds,
+        audit: Option<Arc<AuditLog>>,
+        data_dir: PathBuf,
     ) -> Result<Self, AgentError> {
         let conversation_path = dirs.conversation_path();
         let conversation = ConversationThread::open(&conversation_path).map_err(AgentError::Fs)?;
@@ -581,6 +595,9 @@ impl Agent {
             keypair,
             pending_inbound: VecDeque::new(),
             seen_message_ids,
+            thresholds,
+            audit,
+            data_dir,
         })
     }
 
@@ -840,6 +857,86 @@ impl Agent {
     /// Increments [`Self::tool_iteration`] before firing. If the iteration
     /// would exceed [`MAX_TOOL_ITERATIONS`] the call is aborted, a system
     /// entry is recorded, and the agent returns to idle — the runaway guard.
+    /// Emit a threshold refusal: append a system journal entry with the
+    /// serialized `Refusal`, emit an `authority.decision` audit event, and
+    /// return the agent to idle. Returns `true` so the caller can early-return.
+    fn refuse_threshold(&mut self, refusal: &Refusal, ctx: &mut Context<Self>) -> bool {
+        // Human-readable message for the panopticon recent-events stream.
+        // Structured data lives in the audit log; Phase 5 surfaces this
+        // properly in the Decisions tab.
+        let msg = match refusal {
+            Refusal::Threshold {
+                name,
+                current,
+                limit,
+                ..
+            } => {
+                format!("refused ({name}): ${current} \u{2265} limit ${limit}")
+            }
+            Refusal::Profile { .. } | Refusal::Blacklist { .. } => refusal.rationale().to_owned(),
+        };
+        self.append_system_entry(&msg, ctx);
+        if let Some(audit) = &self.audit {
+            let event = AuditEvent::AuthorityDecision {
+                agent_id: self.agent_id,
+                persona_name: self.snapshot.persona_name.clone(),
+                profile_version: self.snapshot.persona_version,
+                action: format!("{} threshold", refusal.layer()),
+                disposition: AuthorityDisposition::Refuse,
+                layer: Some(refusal.layer().to_owned()),
+                rationale: Some(refusal.rationale().to_owned()),
+                blacklist_version: None,
+                at: OffsetDateTime::now_utc(),
+            };
+            let _ = audit.append(&event);
+        }
+        self.in_flight = false;
+        self.tool_iteration = 0;
+        self.set_idle(ctx);
+        true
+    }
+
+    /// Check `cost_per_agent` and `cost_per_session` thresholds before an
+    /// adapter call. Returns `true` and goes idle if either threshold is
+    /// exceeded; returns `false` if the call may proceed.
+    fn check_cost_thresholds(&mut self, ctx: &mut Context<Self>) -> bool {
+        let current_usd = reeve_adapter::CostEstimate {
+            microdollars: self.total_cost_microdollars,
+        }
+        .usd();
+
+        if let Some(limit) = self.thresholds.cost_per_agent {
+            if current_usd >= limit {
+                let refusal = Refusal::Threshold {
+                    name: "cost_per_agent".to_owned(),
+                    current: format!("{current_usd:.6}"),
+                    limit: format!("{limit:.6}"),
+                    rationale: format!(
+                        "agent cost {current_usd:.6} USD reached limit {limit:.6} USD"
+                    ),
+                };
+                return self.refuse_threshold(&refusal, ctx);
+            }
+        }
+
+        if let Some(limit) = self.thresholds.cost_per_session {
+            let session_usd = crate::cost_meter::session_cost_usd(&self.data_dir);
+            if session_usd >= limit {
+                let refusal = Refusal::Threshold {
+                    name: "cost_per_session".to_owned(),
+                    current: format!("{session_usd:.6}"),
+                    limit: format!("{limit:.6}"),
+                    rationale: format!(
+                        "session cost {session_usd:.6} USD reached limit {limit:.6} USD"
+                    ),
+                };
+                return self.refuse_threshold(&refusal, ctx);
+            }
+        }
+
+        false
+    }
+
     fn spawn_adapter_call(&mut self, ctx: &mut Context<Self>) {
         use actix::fut::WrapFuture as _;
         use actix::ActorFutureExt as _;
@@ -857,6 +954,10 @@ impl Agent {
             self.in_flight = false;
             self.tool_iteration = 0;
             self.set_idle(ctx);
+            return;
+        }
+
+        if self.check_cost_thresholds(ctx) {
             return;
         }
 
@@ -1229,6 +1330,9 @@ mod tests {
             IdentityId::new().unwrap(),
             reeve_types::Keypair::generate(),
             tools,
+            crate::capability::Thresholds::default(),
+            None,
+            dirs.root().to_path_buf(),
         )
     }
 
@@ -2728,11 +2832,16 @@ mod tests {
             let null_inbox = NullInboxStarter.start();
             let null_dispatcher = NullDispatcher.start();
 
+            let audit = Arc::new(
+                crate::audit::AuditLog::open(data_dir_for_block.clone())
+                    .expect("open audit log in test"),
+            );
             let spawn_coordinator = SpawnCoordinator::new(
                 data_dir_for_block.clone(),
                 agent_registry_path_for_block,
                 identity_registry,
                 vec![Arc::clone(&coord_adapter)],
+                audit,
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
@@ -2886,11 +2995,16 @@ mod tests {
             let null_inbox = NullInboxStarter.start();
             let null_dispatcher = NullDispatcher.start();
 
+            let audit2 = Arc::new(
+                crate::audit::AuditLog::open(data_dir_for_block.clone())
+                    .expect("open audit log in test"),
+            );
             let spawn_coordinator = SpawnCoordinator::new(
                 data_dir_for_block.clone(),
                 agent_registry_path,
                 identity_registry,
                 vec![Arc::clone(&coord_adapter)],
+                audit2,
                 Arc::clone(&watcher),
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
@@ -3984,5 +4098,148 @@ mod tests {
             "unreadable file should return Err, got Ok({:?})",
             result.ok()
         );
+    }
+
+    // ── Cost threshold tests ──────────────────────────────────────────────────
+
+    /// Build a mock agent with a given `Thresholds` and the `TextResponseAdapter`
+    /// (42 µUSD/call).
+    fn agent_with_thresholds(
+        data_dir: &std::path::Path,
+        dirs: &AgentDirs,
+        thresholds: crate::capability::Thresholds,
+    ) -> Agent {
+        Agent::new(
+            Arc::new(TextResponseAdapter::new("mock@test")),
+            dirs,
+            mock_snapshot(),
+            String::new(),
+            IdentityId::new().unwrap(),
+            reeve_types::Keypair::generate(),
+            Vec::new(),
+            thresholds,
+            None,
+            data_dir.to_path_buf(),
+        )
+        .unwrap()
+    }
+
+    /// Poll the journal file until it contains at least `min_entries` entries
+    /// or the timeout expires. Returns the lines.
+    async fn poll_journal(path: &std::path::Path, min_entries: usize) -> Vec<String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            let lines: Vec<String> = content.lines().map(str::to_owned).collect();
+            if lines.len() >= min_entries {
+                return lines;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {min_entries} journal entries; got {}",
+                lines.len()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    // CT1: When cost_per_agent is set to 42 µUSD (= $0.000042) and the agent has
+    // already spent that amount (after one successful call), the next adapter call
+    // is refused: a system entry carrying the threshold refusal JSON is appended
+    // and the agent returns to idle.
+    #[test]
+    fn cost_per_agent_threshold_refuses_when_exceeded() {
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+
+        // 42 µUSD limit — TextResponseAdapter returns exactly 42 µUSD per call,
+        // so after the first call the running cost equals the limit and the
+        // second call must be refused.
+        let thresholds = crate::capability::Thresholds {
+            cost_per_agent: Some(0.000_042), // 42 µUSD in USD
+            ..Default::default()
+        };
+        let agent = agent_with_thresholds(&data_dir, &dirs, thresholds);
+
+        let conv_path = dirs.conversation_path();
+        let sender_id = IdentityId::new().unwrap();
+
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |_| agent);
+
+            // First message → adapter call succeeds, cost updates to 42 µUSD.
+            addr.do_send(ProcessInbound {
+                message_id: "ct1-msg-1".to_owned(),
+                sender_id,
+                payload: "hello".to_owned(),
+            });
+            // Wait: system(started) + inbound + outbound + model_call = 4 entries
+            poll_journal(&conv_path, 4).await;
+
+            // Second message → threshold check fires before the adapter call.
+            addr.do_send(ProcessInbound {
+                message_id: "ct1-msg-2".to_owned(),
+                sender_id,
+                payload: "hello again".to_owned(),
+            });
+            // Wait for the inbound + system(refusal) entries.
+            let lines = poll_journal(&conv_path, 6).await;
+
+            let has_threshold_refusal = lines
+                .iter()
+                .any(|l| l.contains("\"type\":\"system\"") && l.contains("cost_per_agent"));
+            assert!(
+                has_threshold_refusal,
+                "journal must contain a threshold-refusal system entry; entries: {lines:?}"
+            );
+
+            actix::System::current().stop();
+        });
+    }
+
+    // CT2: When cost_per_session is set to $0.04 and another agent's cost file
+    // already shows $0.04, the first adapter call on this agent is refused because
+    // the session total (0.04 + 0) >= 0.04.
+    #[test]
+    fn cost_per_session_threshold_refuses_when_session_total_exceeded() {
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+
+        // Provision the lead dirs first so agents/ is created with the right
+        // permissions (0o700); then add the peer cost file inside it.
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let peer_dirs = AgentDirs::provision(&data_dir, "worker-peer").unwrap();
+        std::fs::write(peer_dirs.cost_path(), "0.040000").unwrap();
+        let thresholds = crate::capability::Thresholds {
+            cost_per_session: Some(0.04),
+            ..Default::default()
+        };
+        let agent = agent_with_thresholds(&data_dir, &dirs, thresholds);
+
+        let conv_path = dirs.conversation_path();
+        let sender_id = IdentityId::new().unwrap();
+
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |_| agent);
+
+            addr.do_send(ProcessInbound {
+                message_id: "ct2-msg-1".to_owned(),
+                sender_id,
+                payload: "hello".to_owned(),
+            });
+            // Wait: system(started) + inbound + system(refusal) = 3 entries
+            let lines = poll_journal(&conv_path, 3).await;
+
+            let has_session_refusal = lines
+                .iter()
+                .any(|l| l.contains("\"type\":\"system\"") && l.contains("cost_per_session"));
+            assert!(
+                has_session_refusal,
+                "journal must contain a cost_per_session refusal system entry; entries: {lines:?}"
+            );
+
+            actix::System::current().stop();
+        });
     }
 }
