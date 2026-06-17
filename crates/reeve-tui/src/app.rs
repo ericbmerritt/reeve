@@ -34,6 +34,7 @@ use crossterm::{execute, ExecutableCommand as _};
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
+use reeve_runtime::capability::{CapabilityProfile, Thresholds};
 use reeve_runtime::AgentDirs;
 
 use crate::panopticon::read_snapshot as read_panopticon_snapshot;
@@ -1030,10 +1031,7 @@ fn submit_to_agent(
 
 /// Format the current value of a threshold field for display/pre-fill.
 /// Returns an empty string for `None` (operator clears to remove the limit).
-pub(crate) fn threshold_field_display(
-    t: &reeve_runtime::capability::Thresholds,
-    field: usize,
-) -> String {
+pub(crate) fn threshold_field_display(t: &Thresholds, field: usize) -> String {
     match field {
         0 => t
             .cost_per_agent
@@ -1065,11 +1063,11 @@ fn save_threshold(state: &mut AppState, data_dir: &Path) {
     let raw = state.input.trim().to_owned();
 
     let mut profile = reeve_runtime::capability::load_capability_profile(&profile_path)
-        .unwrap_or_else(|_| reeve_runtime::capability::CapabilityProfile {
+        .unwrap_or_else(|_| CapabilityProfile {
             name: state.persona_name.clone(),
             version: 1,
             enabled_categories: None,
-            thresholds: reeve_runtime::capability::Thresholds::default(),
+            thresholds: Thresholds::default(),
         });
 
     // Apply the edit. Empty input explicitly clears the limit (None). A
@@ -1138,12 +1136,11 @@ fn save_threshold(state: &mut AppState, data_dir: &Path) {
         }
     };
 
-    if wrote {
-        if reeve_runtime::capability::write_capability_profile(&profile_path, &profile).is_ok() {
-            // Mirror the change immediately so the display is consistent before
-            // the next reload cycle picks up the new file from disk.
-            state.inspect_thresholds = profile.thresholds;
-        }
+    if wrote && reeve_runtime::capability::write_capability_profile(&profile_path, &profile).is_ok()
+    {
+        // Mirror the change immediately so the display is consistent before
+        // the next reload cycle picks up the new file from disk.
+        state.inspect_thresholds = profile.thresholds;
     }
 }
 
@@ -2134,12 +2131,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
 
-        let dirs = reeve_runtime::AgentDirs::provision(data_dir, "lead").unwrap();
-        let profile = reeve_runtime::capability::CapabilityProfile {
+        let dirs = AgentDirs::provision(data_dir, "lead").unwrap();
+        let profile = CapabilityProfile {
             name: "lead".to_owned(),
             version: 1,
             enabled_categories: None,
-            thresholds: reeve_runtime::capability::Thresholds {
+            thresholds: Thresholds {
                 cost_per_agent: Some(0.10),
                 ..Default::default()
             },
@@ -2179,12 +2176,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path();
 
-        let dirs = reeve_runtime::AgentDirs::provision(data_dir, "lead").unwrap();
-        let profile = reeve_runtime::capability::CapabilityProfile {
+        let dirs = AgentDirs::provision(data_dir, "lead").unwrap();
+        let profile = CapabilityProfile {
             name: "lead".to_owned(),
             version: 1,
             enabled_categories: None,
-            thresholds: reeve_runtime::capability::Thresholds {
+            thresholds: Thresholds {
                 cost_per_agent: Some(0.10),
                 ..Default::default()
             },

@@ -883,7 +883,9 @@ impl Agent {
                 profile_version: self.snapshot.persona_version,
                 action: match refusal {
                     Refusal::Threshold { name, .. } => format!("threshold:{name}"),
-                    _ => refusal.layer().to_owned(),
+                    Refusal::Profile { .. } | Refusal::Blacklist { .. } => {
+                        refusal.layer().to_owned()
+                    }
                 },
                 disposition: AuthorityDisposition::Refuse,
                 layer: Some(refusal.layer().to_owned()),
@@ -1339,7 +1341,7 @@ mod tests {
             dirs.root()
                 .parent()
                 .and_then(std::path::Path::parent)
-                .unwrap_or(dirs.root())
+                .unwrap_or_else(|| dirs.root())
                 .to_path_buf(),
         )
     }
