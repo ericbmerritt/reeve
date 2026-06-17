@@ -31,7 +31,12 @@ pub fn session_cost_usd(data_dir: &Path) -> f64 {
         .filter_map(|entry| {
             let cost_path = entry.path().join("cost");
             let text = std::fs::read_to_string(&cost_path).ok()?;
-            text.trim().parse::<f64>().ok()
+            // Reject NaN, inf, and negatives so a corrupt cost file cannot
+            // suppress the cost_per_session threshold check.
+            text.trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
         })
         .sum()
 }

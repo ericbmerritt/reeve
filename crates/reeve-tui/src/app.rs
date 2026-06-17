@@ -1072,32 +1072,78 @@ fn save_threshold(state: &mut AppState, data_dir: &Path) {
             thresholds: reeve_runtime::capability::Thresholds::default(),
         });
 
-    match state.inspect_model_field {
-        0 => {
-            profile.thresholds.cost_per_agent = raw
+    // Apply the edit. Empty input explicitly clears the limit (None). A
+    // non-empty value must parse to a valid positive number — an invalid or
+    // non-positive input leaves the file untouched rather than silently
+    // clearing an existing limit.
+    let wrote = if raw.is_empty() {
+        match state.inspect_model_field {
+            0 => {
+                profile.thresholds.cost_per_agent = None;
+                true
+            }
+            1 => {
+                profile.thresholds.cost_per_session = None;
+                true
+            }
+            2 => {
+                profile.thresholds.max_concurrent_subordinates = None;
+                true
+            }
+            3 => {
+                profile.thresholds.max_task_duration_secs = None;
+                true
+            }
+            _ => false,
+        }
+    } else {
+        match state.inspect_model_field {
+            0 => match raw
                 .parse::<f64>()
                 .ok()
-                .filter(|v| v.is_finite() && *v > 0.0);
-        }
-        1 => {
-            profile.thresholds.cost_per_session = raw
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                Some(v) => {
+                    profile.thresholds.cost_per_agent = Some(v);
+                    true
+                }
+                None => false,
+            },
+            1 => match raw
                 .parse::<f64>()
                 .ok()
-                .filter(|v| v.is_finite() && *v > 0.0);
+                .filter(|v| v.is_finite() && *v > 0.0)
+            {
+                Some(v) => {
+                    profile.thresholds.cost_per_session = Some(v);
+                    true
+                }
+                None => false,
+            },
+            2 => match raw.parse::<u32>().ok().filter(|v| *v > 0) {
+                Some(v) => {
+                    profile.thresholds.max_concurrent_subordinates = Some(v);
+                    true
+                }
+                None => false,
+            },
+            3 => match raw.parse::<u64>().ok().filter(|v| *v > 0) {
+                Some(v) => {
+                    profile.thresholds.max_task_duration_secs = Some(v);
+                    true
+                }
+                None => false,
+            },
+            _ => false,
         }
-        2 => {
-            profile.thresholds.max_concurrent_subordinates = raw.parse::<u32>().ok();
-        }
-        3 => {
-            profile.thresholds.max_task_duration_secs = raw.parse::<u64>().ok();
-        }
-        _ => {}
-    }
+    };
 
-    if reeve_runtime::capability::write_capability_profile(&profile_path, &profile).is_ok() {
-        // Mirror the change immediately so the display is consistent before
-        // the next reload cycle picks up the new file from disk.
-        state.inspect_thresholds = profile.thresholds;
+    if wrote {
+        if reeve_runtime::capability::write_capability_profile(&profile_path, &profile).is_ok() {
+            // Mirror the change immediately so the display is consistent before
+            // the next reload cycle picks up the new file from disk.
+            state.inspect_thresholds = profile.thresholds;
+        }
     }
 }
 
@@ -1995,5 +2041,178 @@ mod tests {
             format!("{ledger_entry}\n"),
             "replay ledger content must be unchanged after discard"
         );
+    }
+
+    // ── Model tab editor tests ─────────────────────────────────────────────
+
+    fn state_in_model_tab() -> AppState {
+        let mut state = AppState::default();
+        state.screen = Screen::Inspect;
+        state.inspect_tab = InspectTab::Model;
+        state.inspect_agent_name = Some("lead".to_owned());
+        state
+    }
+
+    // MT1: j/k navigate between threshold fields and clamp at bounds.
+    #[test]
+    fn model_tab_jk_navigate_fields() {
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state_in_model_tab();
+        assert_eq!(state.inspect_model_field, 0);
+
+        handle_key_inspect(
+            key(KeyCode::Char('j')),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert_eq!(state.inspect_model_field, 1);
+
+        handle_key_inspect(
+            key(KeyCode::Char('k')),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert_eq!(state.inspect_model_field, 0);
+
+        // Clamp at 0.
+        handle_key_inspect(
+            key(KeyCode::Char('k')),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert_eq!(state.inspect_model_field, 0);
+    }
+
+    // MT2: Enter starts editing and pre-fills the input buffer with the
+    // current value; Esc cancels without changing state.
+    #[test]
+    fn model_tab_enter_starts_editing_esc_cancels() {
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = state_in_model_tab();
+        state.inspect_thresholds.cost_per_agent = Some(0.05);
+
+        handle_key_inspect(
+            key(KeyCode::Enter),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(state.inspect_model_editing);
+        assert_eq!(state.input, "0.050000");
+
+        handle_key_inspect(
+            key(KeyCode::Esc),
+            &mut state,
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!state.inspect_model_editing);
+        assert!(state.input.is_empty());
+        assert_eq!(state.inspect_thresholds.cost_per_agent, Some(0.05));
+    }
+
+    // MT3: invalid input (zero, negative, non-numeric) does not write the
+    // profile — the existing threshold is preserved.
+    #[test]
+    fn model_tab_invalid_input_leaves_file_untouched() {
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+
+        let dirs = reeve_runtime::AgentDirs::provision(data_dir, "lead").unwrap();
+        let profile = reeve_runtime::capability::CapabilityProfile {
+            name: "lead".to_owned(),
+            version: 1,
+            enabled_categories: None,
+            thresholds: reeve_runtime::capability::Thresholds {
+                cost_per_agent: Some(0.10),
+                ..Default::default()
+            },
+        };
+        reeve_runtime::capability::write_capability_profile(&dirs.profile_path(), &profile)
+            .unwrap();
+
+        let mut state = state_in_model_tab();
+        state.inspect_agent_name = Some("lead".to_owned());
+        state.inspect_model_field = 0; // cost_per_agent
+
+        for bad_input in &["0", "-1", "abc", "NaN", "inf", "0.0"] {
+            state.inspect_model_editing = true;
+            state.set_input(bad_input.to_string());
+            handle_key_inspect(
+                key(KeyCode::Enter),
+                &mut state,
+                data_dir,
+                &registry,
+                &keystore,
+            )
+            .unwrap();
+            let reloaded =
+                reeve_runtime::capability::load_capability_profile(&dirs.profile_path()).unwrap();
+            assert_eq!(
+                reloaded.thresholds.cost_per_agent,
+                Some(0.10),
+                "input {bad_input:?} must not overwrite existing threshold"
+            );
+        }
+    }
+
+    // MT4: empty input clears (sets to None) and writes the file.
+    #[test]
+    fn model_tab_empty_input_clears_threshold() {
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path();
+
+        let dirs = reeve_runtime::AgentDirs::provision(data_dir, "lead").unwrap();
+        let profile = reeve_runtime::capability::CapabilityProfile {
+            name: "lead".to_owned(),
+            version: 1,
+            enabled_categories: None,
+            thresholds: reeve_runtime::capability::Thresholds {
+                cost_per_agent: Some(0.10),
+                ..Default::default()
+            },
+        };
+        reeve_runtime::capability::write_capability_profile(&dirs.profile_path(), &profile)
+            .unwrap();
+
+        let mut state = state_in_model_tab();
+        state.inspect_agent_name = Some("lead".to_owned());
+        state.inspect_model_field = 0;
+        state.inspect_model_editing = true;
+        state.set_input(String::new());
+
+        handle_key_inspect(
+            key(KeyCode::Enter),
+            &mut state,
+            data_dir,
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+
+        let reloaded =
+            reeve_runtime::capability::load_capability_profile(&dirs.profile_path()).unwrap();
+        assert_eq!(
+            reloaded.thresholds.cost_per_agent, None,
+            "empty input must clear the limit"
+        );
+        assert_eq!(state.inspect_thresholds.cost_per_agent, None);
     }
 }

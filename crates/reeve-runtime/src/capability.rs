@@ -9,7 +9,12 @@
 //! Persona profiles live at `<data_dir>/personas/<name>/profile.toml` (next to
 //! the persona's `config.toml`). At spawn time the coordinator snapshots the
 //! profile verbatim to `<data_dir>/agents/<name>/profile.toml` via
-//! [`crate::agent_fs::AgentDirs::profile_path`]. The snapshot is immutable.
+//! [`crate::agent_fs::AgentDirs::profile_path`].
+//!
+//! The snapshot is immutable for a *running* agent: the in-memory thresholds
+//! are loaded once at construction and are not reloaded mid-turn. However the
+//! file may be updated externally (e.g., via the TUI Model tab) and will be
+//! re-read on the next daemon restart or agent respawn.
 
 use std::path::Path;
 

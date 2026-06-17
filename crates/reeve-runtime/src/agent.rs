@@ -857,8 +857,8 @@ impl Agent {
     /// Increments [`Self::tool_iteration`] before firing. If the iteration
     /// would exceed [`MAX_TOOL_ITERATIONS`] the call is aborted, a system
     /// entry is recorded, and the agent returns to idle — the runaway guard.
-    /// Emit a threshold refusal: append a system journal entry with the
-    /// serialized `Refusal`, emit an `authority.decision` audit event, and
+    /// Emit a threshold refusal: append a human-readable system journal entry,
+    /// emit an `authority.decision` audit event with structured fields, and
     /// return the agent to idle. Returns `true` so the caller can early-return.
     fn refuse_threshold(&mut self, refusal: &Refusal, ctx: &mut Context<Self>) -> bool {
         // Human-readable message for the panopticon recent-events stream.
@@ -881,7 +881,10 @@ impl Agent {
                 agent_id: self.agent_id,
                 persona_name: self.snapshot.persona_name.clone(),
                 profile_version: self.snapshot.persona_version,
-                action: format!("{} threshold", refusal.layer()),
+                action: match refusal {
+                    Refusal::Threshold { name, .. } => format!("threshold:{name}"),
+                    _ => refusal.layer().to_owned(),
+                },
                 disposition: AuthorityDisposition::Refuse,
                 layer: Some(refusal.layer().to_owned()),
                 rationale: Some(refusal.rationale().to_owned()),
@@ -1332,7 +1335,12 @@ mod tests {
             tools,
             crate::capability::Thresholds::default(),
             None,
-            dirs.root().to_path_buf(),
+            // data_dir is two levels up from dirs.root() (<data_dir>/agents/<name>)
+            dirs.root()
+                .parent()
+                .and_then(std::path::Path::parent)
+                .unwrap_or(dirs.root())
+                .to_path_buf(),
         )
     }
 
