@@ -52,13 +52,13 @@ reeve attach lead  # open lead's chat directly
 
 ### Screens
 
-| Key                   | Action                    |
-| --------------------- | ------------------------- |
+| Key                   | Action                   |
+| --------------------- | ------------------------ |
 | `Tab`                 | Toggle chat ↔ panopticon |
-| `Enter` (panopticon)  | Open per-agent inspect    |
-| `Q` (panopticon)      | Open quarantine review    |
-| `h` / `Esc` (inspect) | Back to panopticon        |
-| `q` / `Esc` (chat)    | Quit                      |
+| `Enter` (panopticon)  | Open per-agent inspect   |
+| `Q` (panopticon)      | Open quarantine review   |
+| `h` / `Esc` (inspect) | Back to panopticon       |
+| `q` / `Esc` (chat)    | Quit                     |
 
 ## Send a message without the TUI
 
