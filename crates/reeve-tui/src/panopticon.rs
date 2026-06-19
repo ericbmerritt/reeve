@@ -304,8 +304,9 @@ fn sort_key(row: &AgentRow) -> (u8, u8, std::cmp::Reverse<i128>) {
     let status_priority: u8 = match row.status {
         AgentStatus::Working => 0,
         AgentStatus::Idle => 1,
-        AgentStatus::Crashed => 2,
-        AgentStatus::Unknown => 3,
+        AgentStatus::Exiting => 2,
+        AgentStatus::Crashed => 3,
+        AgentStatus::Unknown => 4,
     };
     (
         group,

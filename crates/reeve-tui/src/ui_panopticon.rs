@@ -170,7 +170,10 @@ fn status_cell_text(row: &AgentRow, now: OffsetDateTime) -> (String, Option<Colo
     if !row.is_running {
         return match row.status {
             AgentStatus::Crashed => ("\u{2717}".to_owned(), Some(Color::Red)), // ✗
-            AgentStatus::Idle | AgentStatus::Working | AgentStatus::Unknown => {
+            AgentStatus::Idle
+            | AgentStatus::Working
+            | AgentStatus::Exiting
+            | AgentStatus::Unknown => {
                 ("\u{2713}".to_owned(), Some(Color::Green)) // ✓
             }
         };
@@ -186,6 +189,7 @@ fn status_cell_text(row: &AgentRow, now: OffsetDateTime) -> (String, Option<Colo
             (format!("\u{25CF}{suffix}"), Some(Color::Yellow))
         }
         AgentStatus::Idle => ("\u{25CB}".to_owned(), None), // ○
+        AgentStatus::Exiting => ("\u{2026}".to_owned(), Some(Color::DarkGray)), // … draining
         AgentStatus::Crashed => ("\u{2717}".to_owned(), Some(Color::Red)), // ✗
         AgentStatus::Unknown => ("?".to_owned(), None),
     }

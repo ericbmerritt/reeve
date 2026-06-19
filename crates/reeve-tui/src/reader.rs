@@ -33,6 +33,7 @@ fn parse_status(s: &str) -> AgentStatus {
     match s.trim() {
         "idle" => AgentStatus::Idle,
         "working" => AgentStatus::Working,
+        "exiting" => AgentStatus::Exiting,
         "error" | "crashed" => AgentStatus::Crashed,
         _ => AgentStatus::Unknown,
     }
