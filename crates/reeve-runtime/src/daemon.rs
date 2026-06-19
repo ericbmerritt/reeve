@@ -1044,6 +1044,8 @@ fn launch_actors(
         lead_thresholds_from_profile,
         Some(Arc::clone(&audit_shared)),
         data_dir_for_lead,
+        "lead".to_owned(),
+        agent_registry_path_for_resume.clone(),
     )
     .map_err(|e| DaemonError::Resource {
         component: "lead agent",
@@ -1278,6 +1280,8 @@ fn resume_one_subagent(
         resume_thresholds,
         Some(Arc::clone(audit)),
         data_dir.to_path_buf(),
+        record.name.as_str().to_owned(),
+        agent_registry_path.to_path_buf(),
     )
     .map_err(|e| format!("construct Agent: {e}"))?;
     let agent_addr = actix::Supervisor::start(move |_| new_agent);

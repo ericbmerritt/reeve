@@ -41,6 +41,7 @@ fn status_sigil(status: &AgentStatus) -> &'static str {
     match status {
         AgentStatus::Idle => "○",
         AgentStatus::Working => "●",
+        AgentStatus::Exiting => "…",
         AgentStatus::Crashed => "✗",
         AgentStatus::Unknown => "?",
     }
@@ -53,6 +54,7 @@ fn status_color(status: &AgentStatus) -> Option<Color> {
     }
     match status {
         AgentStatus::Working => Some(Color::Yellow),
+        AgentStatus::Exiting => Some(Color::DarkGray),
         AgentStatus::Crashed => Some(Color::Red),
         AgentStatus::Idle | AgentStatus::Unknown => None,
     }
@@ -63,6 +65,7 @@ fn status_text(status: &AgentStatus) -> &'static str {
     match status {
         AgentStatus::Idle => "idle",
         AgentStatus::Working => "working",
+        AgentStatus::Exiting => "exiting",
         AgentStatus::Crashed => "crashed",
         AgentStatus::Unknown => "unknown",
     }

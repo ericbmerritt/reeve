@@ -84,6 +84,10 @@ pub enum AgentStatus {
     Idle,
     /// Agent is processing (model call in flight or tool execution running).
     Working,
+    /// The agent has exceeded its `max_task_duration` threshold and is
+    /// draining in-flight work before stopping. New messages are not
+    /// delivered; the current turn runs to completion.
+    Exiting,
     /// The agent has crashed or the status file contains `"error"` / `"crashed"`.
     Crashed,
     /// Status file absent, unreadable, or contains an unrecognised token.

@@ -30,6 +30,7 @@ use tracing::{debug, info, warn};
 use crate::agent_fs::{
     AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread,
 };
+use crate::agent_registry::{AgentRegistry, AgentStatus};
 use crate::audit::{AuditEvent, AuditLog, AuthorityDisposition};
 use crate::capability::Thresholds;
 use crate::model_resolution::SpawnSnapshot;
@@ -417,6 +418,19 @@ pub struct Agent {
     /// Snapshotted cost and concurrency thresholds from the persona profile.
     /// `None` fields mean no limit. Checked before every adapter call.
     thresholds: Thresholds,
+    /// When the current task started (set on `ProcessInbound`, cleared on
+    /// `set_idle`). `None` when the agent is idle between tasks.
+    task_started_at: Option<std::time::Instant>,
+    /// True once `max_task_duration` trips. In this state the agent refuses
+    /// new adapter calls and new inbound messages; in-flight work drains to
+    /// completion and then the agent transitions to `Stopped`.
+    exiting: bool,
+    /// Role name of this agent in the registry (e.g. `"lead"`, `"worker-abc12345"`).
+    /// Used when updating the registry record to `Stopped` on exit.
+    role_name: String,
+    /// Path to the agent registry TOML file. Used on exiting to mark the
+    /// agent `Stopped` before stopping the actor.
+    registry_path: PathBuf,
     /// Audit log for `authority.decision` events. `None` when the daemon
     /// did not provide one (e.g., test harnesses).
     audit: Option<Arc<AuditLog>>,
@@ -526,6 +540,9 @@ const MAX_TOOL_ITERATIONS: u32 = 16;
 /// — that pattern is not used by any tool yet.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How often the agent checks the task clock against `max_task_duration`.
+const TASK_DURATION_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+
 impl Agent {
     /// Construct an `Agent`.
     ///
@@ -554,6 +571,8 @@ impl Agent {
         thresholds: Thresholds,
         audit: Option<Arc<AuditLog>>,
         data_dir: PathBuf,
+        role_name: String,
+        registry_path: PathBuf,
     ) -> Result<Self, AgentError> {
         let conversation_path = dirs.conversation_path();
         let conversation = ConversationThread::open(&conversation_path).map_err(AgentError::Fs)?;
@@ -598,13 +617,88 @@ impl Agent {
             thresholds,
             audit,
             data_dir,
+            task_started_at: None,
+            exiting: false,
+            role_name,
+            registry_path,
         })
     }
 
-    /// Write `"idle"` to the status file; stop the actor on failure.
-    fn set_idle(&self, ctx: &mut Context<Self>) {
+    /// Write `"idle"` to the status file and clear the task clock.
+    ///
+    /// If the agent is in the `Exiting` state, transitions to `Stopped`
+    /// instead of returning to idle: updates the registry record and stops
+    /// the actor.
+    fn set_idle(&mut self, ctx: &mut Context<Self>) {
+        self.task_started_at = None;
+        if self.exiting {
+            self.transition_to_stopped(ctx);
+            return;
+        }
         if self.status_writer.write("idle").is_err() {
             ctx.stop();
+        }
+    }
+
+    /// Enter the `Exiting` state: write `"exiting"` to the status file,
+    /// append a system journal entry, and emit an audit event. If no
+    /// adapter call is in flight at the time of the check, transition to
+    /// `Stopped` immediately.
+    fn enter_exiting(&mut self, ctx: &mut Context<Self>) {
+        if self.exiting {
+            return;
+        }
+        self.exiting = true;
+        if self.status_writer.write("exiting").is_err() {
+            ctx.stop();
+            return;
+        }
+        let secs = self.thresholds.max_task_duration_secs.unwrap_or(0);
+        let msg = format!("exiting: max_task_duration {secs}s exceeded");
+        self.append_system_entry(&msg, ctx);
+        if let Some(audit) = &self.audit {
+            let event = AuditEvent::AuthorityDecision {
+                agent_id: self.agent_id,
+                persona_name: self.snapshot.persona_name.clone(),
+                profile_version: self.snapshot.persona_version,
+                action: "threshold:max_task_duration".to_owned(),
+                disposition: AuthorityDisposition::Refuse,
+                layer: Some("threshold".to_owned()),
+                rationale: Some(msg.clone()),
+                blacklist_version: None,
+                at: OffsetDateTime::now_utc(),
+            };
+            let _ = audit.append(&event);
+        }
+        // If no work is in-flight, stop now; otherwise wait for it to drain.
+        if !self.in_flight {
+            self.transition_to_stopped(ctx);
+        }
+    }
+
+    /// Update the registry to `Stopped` and stop the actor.
+    fn transition_to_stopped(&self, ctx: &mut Context<Self>) {
+        if let Ok(mut reg) = AgentRegistry::open(self.registry_path.clone()) {
+            let _ = reg.update_status(&self.role_name, AgentStatus::Stopped);
+        }
+        ctx.stop();
+    }
+
+    /// Check the task clock against `max_task_duration`. Called by the
+    /// periodic tick and on every state-affecting event. No-op when not
+    /// applicable.
+    fn check_task_duration(&mut self, ctx: &mut Context<Self>) {
+        if self.exiting {
+            return;
+        }
+        let Some(limit_secs) = self.thresholds.max_task_duration_secs else {
+            return;
+        };
+        let Some(started_at) = self.task_started_at else {
+            return;
+        };
+        if started_at.elapsed().as_secs() >= limit_secs {
+            self.enter_exiting(ctx);
         }
     }
 
@@ -962,6 +1056,14 @@ impl Agent {
             return;
         }
 
+        if self.exiting {
+            // In-flight work has completed; stop now.
+            self.in_flight = false;
+            self.tool_iteration = 0;
+            self.transition_to_stopped(ctx);
+            return;
+        }
+
         if self.check_cost_thresholds(ctx) {
             return;
         }
@@ -1017,11 +1119,17 @@ impl Agent {
 impl Actor for Agent {
     type Context = Context<Self>;
 
-    /// Initialize the agent: record the start event and write idle status.
+    /// Initialize the agent: record the start event, write idle status, and
+    /// schedule the periodic task-duration check when a limit is configured.
     fn started(&mut self, ctx: &mut Context<Self>) {
         info!(adapter = %self.snapshot.adapter_id, "agent ready");
         self.append_system_entry("agent started", ctx);
         self.set_idle(ctx);
+        if self.thresholds.max_task_duration_secs.is_some() {
+            ctx.run_interval(TASK_DURATION_CHECK_INTERVAL, |actor, inner_ctx| {
+                actor.check_task_duration(inner_ctx);
+            });
+        }
     }
 }
 
@@ -1036,6 +1144,8 @@ impl Supervised for Agent {
         warn!("agent restarting");
         self.in_flight = false;
         self.tool_iteration = 0;
+        self.exiting = false;
+        self.task_started_at = None;
         self.pending_tool_use_ids.clear();
         self.pending_results.clear();
         self.pending_inbound.clear();
@@ -1057,6 +1167,12 @@ impl Handler<ProcessInbound> for Agent {
         // envelope can arrive multiple times.
         if !self.seen_message_ids.insert(msg.message_id.clone()) {
             debug!(message_id = %msg.message_id, "dropping duplicate inbound");
+            return;
+        }
+        if self.exiting {
+            // Agent is draining; new messages stay in inbox/cur/ for the next
+            // agent with this role to pick up on restart.
+            debug!(message_id = %msg.message_id, "exiting: dropping inbound");
             return;
         }
         if self.in_flight {
@@ -1087,6 +1203,9 @@ impl Agent {
         } = msg;
         info!(message_id = %message_id, "processing");
         self.in_flight = true;
+        if self.task_started_at.is_none() {
+            self.task_started_at = Some(std::time::Instant::now());
+        }
         if self.status_writer.write("working").is_err() {
             ctx.stop();
             return;
@@ -1327,6 +1446,13 @@ mod tests {
             actix::Recipient<crate::tool::InvokeTool>,
         )>,
     ) -> Result<Agent, super::AgentError> {
+        let data_dir = dirs
+            .root()
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap_or_else(|| dirs.root())
+            .to_path_buf();
+        let registry_path = data_dir.join("agents").join("registry.toml");
         Agent::new(
             adapter,
             dirs,
@@ -1337,12 +1463,9 @@ mod tests {
             tools,
             crate::capability::Thresholds::default(),
             None,
-            // data_dir is two levels up from dirs.root() (<data_dir>/agents/<name>)
-            dirs.root()
-                .parent()
-                .and_then(std::path::Path::parent)
-                .unwrap_or_else(|| dirs.root())
-                .to_path_buf(),
+            data_dir,
+            "lead".to_owned(),
+            registry_path,
         )
     }
 
@@ -4119,6 +4242,7 @@ mod tests {
         dirs: &AgentDirs,
         thresholds: crate::capability::Thresholds,
     ) -> Agent {
+        let registry_path = data_dir.join("agents").join("registry.toml");
         Agent::new(
             Arc::new(TextResponseAdapter::new("mock@test")),
             dirs,
@@ -4130,6 +4254,8 @@ mod tests {
             thresholds,
             None,
             data_dir.to_path_buf(),
+            "lead".to_owned(),
+            registry_path,
         )
         .unwrap()
     }

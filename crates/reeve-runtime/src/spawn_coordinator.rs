@@ -414,6 +414,35 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
                 }
             };
 
+        // Concurrency check: refuse if the caller already has max_concurrent_subordinates
+        // live subordinates. All Running agents that are not the caller itself count.
+        if let Some(max) = persona_profile
+            .as_ref()
+            .and_then(|p| p.thresholds.max_concurrent_subordinates)
+        {
+            let live_count: u32 = AgentRegistry::open(self.agent_registry_path.clone())
+                .map(|reg| {
+                    reg.list()
+                        .filter(|r| {
+                            matches!(r.status, AgentStatus::Running) && r.identity_id != sender_id
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+                .try_into()
+                .unwrap_or(u32::MAX);
+            if live_count >= max {
+                let refusal = crate::tool::Refusal::Threshold {
+                    name: "max_concurrent_subordinates".to_owned(),
+                    current: live_count.to_string(),
+                    limit: max.to_string(),
+                    rationale: format!("{live_count} subordinates running, limit is {max}"),
+                };
+                error_reply(&reply_to, refusal.to_json());
+                return;
+            }
+        }
+
         let dirs = match AgentDirs::provision(&self.data_dir, &agent_name_str) {
             Ok(d) => d,
             Err(err) => {
@@ -580,6 +609,8 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             spawn_thresholds,
             Some(Arc::clone(&self.audit)),
             self.data_dir.clone(),
+            agent_name_str.clone(),
+            self.agent_registry_path.clone(),
         ) {
             Ok(a) => a,
             Err(err) => {
@@ -632,12 +663,13 @@ mod tests {
     use super::{
         build_subagent_tools, SpawnCoordinator, SpawnRequest, SpawnRequestError, SpawnResponse,
     };
+    use crate::agent_fs::RuntimeLayout;
     use crate::agent_registry::{AgentRegistry, AgentStatus};
     use crate::identity_registry::IdentityRegistry;
     use crate::supervisor::WatchInbox;
     use crate::test_support::{
-        build_registries, secure_dir, MockAdapter, NullDispatcher, NullInboxStarter,
-        ResponseCapture,
+        build_registries, enroll_test_operator, secure_dir, MockAdapter, NullDispatcher,
+        NullInboxStarter, ResponseCapture,
     };
     use crate::watcher::Watcher;
     use reeve_types::IdentityId;
@@ -1104,7 +1136,7 @@ mod tests {
         let data_dir = tmp.path().to_path_buf();
 
         // Write a persona that requests a model the mock adapter cannot serve.
-        let persona_dir = crate::agent_fs::RuntimeLayout::new(&data_dir).persona_dir("unmatchable");
+        let persona_dir = RuntimeLayout::new(&data_dir).persona_dir("unmatchable");
         std::fs::create_dir_all(&persona_dir).unwrap();
         std::fs::write(
             persona_dir.join("config.toml"),
@@ -1251,5 +1283,100 @@ mod tests {
             matches!(guard.as_ref().unwrap(), SpawnResponse::Failure { .. }),
             "expected SpawnResponse::Failure when identity registry write fails",
         );
+    }
+
+    // SC-CONC: max_concurrent_subordinates is enforced — the third spawn
+    // attempt is refused when the limit is 2 and two Running agents already
+    // exist in the registry.
+    #[test]
+    #[cfg(unix)]
+    fn max_concurrent_subordinates_refuses_third_spawn() {
+        use crate::agent_fs::{AgentDirs, RuntimeLayout};
+        use crate::capability::{write_capability_profile, CapabilityProfile, Thresholds};
+        use crate::identity_registry::StoredIdentity;
+
+        let tmp = secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let operator_id = enroll_test_operator(&identity_registry);
+        let sender_id = operator_id;
+
+        // Persona with max_concurrent_subordinates = 2.
+        write_minimal_persona(&data_dir, "worker");
+        let profile = CapabilityProfile {
+            name: "worker".to_owned(),
+            version: 1,
+            enabled_categories: None,
+            thresholds: Thresholds {
+                max_concurrent_subordinates: Some(2),
+                ..Default::default()
+            },
+        };
+        let persona_profile_path = RuntimeLayout::new(&data_dir).persona_profile_path("worker");
+        write_capability_profile(&persona_profile_path, &profile).unwrap();
+
+        // Register two fake Running agents so the counter is already at limit.
+        for fake_name in &["worker-fake1", "worker-fake2"] {
+            let fake_id = IdentityId::new().unwrap();
+            let fake_keypair = reeve_types::Keypair::generate();
+            let stored_identity = {
+                use reeve_types::{Identity, KeyRecord};
+                let mut id = Identity::new_agent((*fake_name).to_owned(), operator_id).unwrap();
+                id.identity_id = fake_id;
+                let kr = KeyRecord::new(fake_id, *fake_keypair.public()).unwrap();
+                StoredIdentity::new(id, kr).unwrap()
+            };
+            identity_registry.write(&stored_identity).unwrap();
+
+            let fake_dirs = AgentDirs::provision(&data_dir, fake_name).unwrap();
+            let mut reg = AgentRegistry::open(agent_registry_path.clone()).unwrap();
+            reg.register(crate::agent_registry::AgentRecord {
+                name: crate::agent_registry::ValidatedAgentName::new(fake_name).unwrap(),
+                identity_id: fake_id,
+                inbox_dir: fake_dirs.inbox_root(),
+                persona_name: Some("worker".to_owned()),
+                spawned_at: time::OffsetDateTime::now_utc(),
+                status: AgentStatus::Running,
+            })
+            .unwrap();
+        }
+
+        let response: Arc<Mutex<Option<SpawnResponse>>> = Arc::new(Mutex::new(None));
+        let response_outer = Arc::clone(&response);
+
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let (tx, rx) = oneshot::channel();
+            let capture_addr = ResponseCapture { tx: Some(tx) }.start();
+
+            let coordinator = build_coordinator(
+                &data_dir,
+                identity_registry,
+                watcher,
+                agent_registry_path,
+                inbox_starter,
+            );
+            let coord_addr = coordinator.start();
+
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("worker", "task", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
+
+            let resp = collect_response(rx).await;
+            *response_outer.lock().unwrap() = Some(resp);
+            actix::System::current().stop();
+        });
+
+        let guard = response.lock().unwrap();
+        match guard.as_ref().unwrap() {
+            SpawnResponse::Failure { message } => {
+                assert!(
+                    message.contains("max_concurrent_subordinates"),
+                    "failure message must identify the threshold; got: {message}"
+                );
+            }
+            SpawnResponse::Success { .. } => panic!("expected failure but got success"),
+        }
     }
 }
