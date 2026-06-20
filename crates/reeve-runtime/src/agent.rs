@@ -681,12 +681,14 @@ impl Agent {
         if let Ok(mut reg) = AgentRegistry::open(self.registry_path.clone()) {
             let _ = reg.update_status(&self.role_name, AgentStatus::Stopped);
         }
-        ctx.stop();
+        // Use terminate() rather than stop() so that actix::Supervisor does
+        // not invoke restarting() and restart the actor — this is an
+        // intentional permanent stop, not a crash.
+        ctx.terminate();
     }
 
     /// Check the task clock against `max_task_duration`. Called by the
-    /// periodic tick and on every state-affecting event. No-op when not
-    /// applicable.
+    /// periodic 1-second tick. No-op when not applicable.
     fn check_task_duration(&mut self, ctx: &mut Context<Self>) {
         if self.exiting {
             return;
@@ -1056,14 +1058,6 @@ impl Agent {
             return;
         }
 
-        if self.exiting {
-            // In-flight work has completed; stop now.
-            self.in_flight = false;
-            self.tool_iteration = 0;
-            self.transition_to_stopped(ctx);
-            return;
-        }
-
         if self.check_cost_thresholds(ctx) {
             return;
         }
@@ -1142,9 +1136,15 @@ impl Supervised for Agent {
     /// the model.
     fn restarting(&mut self, ctx: &mut Context<Self>) {
         warn!("agent restarting");
+        // If the agent was intentionally stopping (Exiting state), don't
+        // reinitialize — terminate immediately so the supervisor does not
+        // keep a dead-ended actor running.
+        if self.exiting {
+            ctx.terminate();
+            return;
+        }
         self.in_flight = false;
         self.tool_iteration = 0;
-        self.exiting = false;
         self.task_started_at = None;
         self.pending_tool_use_ids.clear();
         self.pending_results.clear();
@@ -1162,17 +1162,18 @@ impl Handler<ProcessInbound> for Agent {
     type Result = ();
 
     fn handle(&mut self, msg: ProcessInbound, ctx: &mut Context<Self>) {
-        // Dedup by message_id. scan_cur_and_dispatch re-dispatches all
-        // files in cur/ on restart (at-least-once semantics); the same
-        // envelope can arrive multiple times.
-        if !self.seen_message_ids.insert(msg.message_id.clone()) {
-            debug!(message_id = %msg.message_id, "dropping duplicate inbound");
+        if self.exiting {
+            // Agent is draining; drop without marking as seen so the message
+            // remains available for re-dispatch after the next agent starts.
+            debug!(message_id = %msg.message_id, "exiting: dropping inbound");
             return;
         }
-        if self.exiting {
-            // Agent is draining; new messages stay in inbox/cur/ for the next
-            // agent with this role to pick up on restart.
-            debug!(message_id = %msg.message_id, "exiting: dropping inbound");
+        // Dedup by message_id. scan_cur_and_dispatch re-dispatches all
+        // files in cur/ on restart (at-least-once semantics); the same
+        // envelope can arrive multiple times. Only insert after the exiting
+        // guard so dropped messages are not falsely treated as duplicates.
+        if !self.seen_message_ids.insert(msg.message_id.clone()) {
+            debug!(message_id = %msg.message_id, "dropping duplicate inbound");
             return;
         }
         if self.in_flight {
