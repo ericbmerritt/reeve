@@ -42,8 +42,9 @@ impl ListAgentsTool {
                 Returns a JSON array of objects: \
                 `{name, identity_id, persona_name, status}` where status is \
                 \"running\" or \"stopped\". Use the `name` field as the `to` \
-                argument to send_message. The registry is cumulative: \
-                stopped agents remain listed with their last status. \
+                argument to send_message. Stopped agents appear with \
+                status \"stopped\"; records can be removed by the operator \
+                via the TUI. \
                 Re-read on every call — newly spawned subagents appear \
                 without a daemon restart. \
                 \n\nNo arguments. \
