@@ -420,17 +420,23 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             .as_ref()
             .and_then(|p| p.thresholds.max_concurrent_subordinates)
         {
-            let live_count: u32 = AgentRegistry::open(self.agent_registry_path.clone())
-                .map(|reg| {
-                    reg.list()
-                        .filter(|r| {
-                            matches!(r.status, AgentStatus::Running) && r.identity_id != sender_id
-                        })
-                        .count()
-                })
-                .unwrap_or(0)
-                .try_into()
-                .unwrap_or(u32::MAX);
+            // Fail closed: if the registry can't be read, treat the count as
+            // at-limit (u32::MAX) so the threshold remains enforceable under
+            // transient FS errors rather than silently allowing the spawn.
+            let live_count: u32 = match AgentRegistry::open(self.agent_registry_path.clone()) {
+                Ok(reg) => reg
+                    .list()
+                    .filter(|r| {
+                        matches!(r.status, AgentStatus::Running) && r.identity_id != sender_id
+                    })
+                    .count()
+                    .try_into()
+                    .unwrap_or(u32::MAX),
+                Err(err) => {
+                    warn!(%err, "concurrency check: failed to open agent registry; treating as at-limit");
+                    u32::MAX
+                }
+            };
             if live_count >= max {
                 let refusal = crate::tool::Refusal::Threshold {
                     name: "max_concurrent_subordinates".to_owned(),
