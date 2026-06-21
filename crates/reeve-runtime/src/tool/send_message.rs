@@ -9,7 +9,10 @@ use std::sync::Arc;
 
 use actix::{ActorContext, AsyncContext, Recipient};
 
-use super::{check_authority, check_blacklist, BlacklistHandle, InvokeTool, ToolResult};
+use super::{
+    check_authority, check_blacklist, emit_refusal_audit, AuditHandle, BlacklistHandle, InvokeTool,
+    ToolResult,
+};
 use crate::agent_registry::ValidatedAgentName;
 use crate::capability::{CapabilityProfile, ToolCategory};
 use crate::dispatcher::{SendFailed, SendMessage, SendResult};
@@ -98,6 +101,7 @@ pub struct SendMessageTool {
     dispatcher: Recipient<SendMessage>,
     profile: Option<Arc<CapabilityProfile>>,
     blacklist: Option<BlacklistHandle>,
+    audit: Option<AuditHandle>,
 }
 
 impl SendMessageTool {
@@ -111,7 +115,13 @@ impl SendMessageTool {
             dispatcher,
             profile,
             blacklist,
+            audit: None,
         }
+    }
+
+    pub fn with_audit(mut self, audit: AuditHandle) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Action descriptor for blacklist matching: `SendMessage(to=<name>)`.
@@ -179,6 +189,10 @@ impl actix::Actor for SendMessageTool {
 impl actix::Handler<InvokeTool> for SendMessageTool {
     type Result = ();
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "authority checks + validation + dispatch; each branch is short"
+    )]
     fn handle(&mut self, msg: InvokeTool, _ctx: &mut actix::Context<Self>) {
         let InvokeTool {
             tool_use_id,
@@ -188,11 +202,22 @@ impl actix::Handler<InvokeTool> for SendMessageTool {
             reply_to,
         } = msg;
 
+        let action_str =
+            Self::canonical_action(&input).unwrap_or_else(|| "send_message".to_owned());
+
         if let Err(refusal) = check_authority(
             self.profile.as_deref(),
             ToolCategory::MessagePeers,
             sender_id,
         ) {
+            emit_refusal_audit(
+                self.audit.as_ref(),
+                &refusal,
+                sender_id,
+                &action_str,
+                self.profile.as_deref(),
+                None,
+            );
             reply_to.do_send(ToolResult {
                 tool_use_id,
                 content: refusal.to_json(),
@@ -201,15 +226,27 @@ impl actix::Handler<InvokeTool> for SendMessageTool {
             return;
         }
 
-        if let Some(action) = Self::canonical_action(&input) {
-            if let Err(refusal) = check_blacklist(self.blacklist.as_ref(), &action) {
-                reply_to.do_send(ToolResult {
-                    tool_use_id,
-                    content: refusal.to_json(),
-                    is_error: true,
-                });
-                return;
-            }
+        if let Err(refusal) = check_blacklist(self.blacklist.as_ref(), &action_str) {
+            let bv = self.blacklist.as_ref().and_then(|h| {
+                h.read().map_or_else(
+                    |e| Some(e.into_inner().version_hash.clone()),
+                    |bl| Some(bl.version_hash.clone()),
+                )
+            });
+            emit_refusal_audit(
+                self.audit.as_ref(),
+                &refusal,
+                sender_id,
+                &action_str,
+                self.profile.as_deref(),
+                bv,
+            );
+            reply_to.do_send(ToolResult {
+                tool_use_id,
+                content: refusal.to_json(),
+                is_error: true,
+            });
+            return;
         }
 
         let Some(to_str) = input.get("to").and_then(|v| v.as_str()).map(str::trim) else {

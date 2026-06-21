@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use actix::{Actor, Context, Handler};
 use reeve_types::IdentityId;
 
-use super::{check_authority, InvokeTool, ToolResult};
+use super::{check_authority, emit_refusal_audit, AuditHandle, InvokeTool, ToolResult};
 use crate::capability::{CapabilityProfile, ToolCategory};
 use crate::identity_registry::IdentityRegistry;
 use std::sync::Arc;
@@ -26,13 +26,23 @@ use std::sync::Arc;
 pub struct WhoisTool {
     data_dir: PathBuf,
     profile: Option<Arc<CapabilityProfile>>,
+    audit: Option<AuditHandle>,
 }
 
 impl WhoisTool {
     /// Construct a [`WhoisTool`] rooted at the runtime's `data_dir`. The
     /// identity registry directory lives under this path.
     pub fn new(data_dir: PathBuf, profile: Option<Arc<CapabilityProfile>>) -> Self {
-        Self { data_dir, profile }
+        Self {
+            data_dir,
+            profile,
+            audit: None,
+        }
+    }
+
+    pub fn with_audit(mut self, audit: AuditHandle) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Adapter-facing tool descriptor for [`WhoisTool`].
@@ -144,6 +154,14 @@ impl Handler<InvokeTool> for WhoisTool {
         if let Err(refusal) =
             check_authority(self.profile.as_deref(), ToolCategory::ReadFiles, sender_id)
         {
+            emit_refusal_audit(
+                self.audit.as_ref(),
+                &refusal,
+                sender_id,
+                "whois",
+                self.profile.as_deref(),
+                None,
+            );
             reply_to.do_send(ToolResult {
                 tool_use_id,
                 content: refusal.to_json(),
