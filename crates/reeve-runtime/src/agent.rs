@@ -1058,6 +1058,17 @@ impl Agent {
             return;
         }
 
+        // When exiting, do not start another adapter call — transition to
+        // stopped instead. This cuts off additional tool-loop iterations after
+        // `max_task_duration` trips, preventing the threshold from being
+        // violated by an unbounded tool chain started before the tick fired.
+        if self.exiting {
+            self.in_flight = false;
+            self.tool_iteration = 0;
+            self.transition_to_stopped(ctx);
+            return;
+        }
+
         if self.check_cost_thresholds(ctx) {
             return;
         }
@@ -4375,6 +4386,128 @@ mod tests {
                 has_session_refusal,
                 "journal must contain a cost_per_session refusal system entry; entries: {lines:?}"
             );
+
+            actix::System::current().stop();
+        });
+    }
+
+    // CT3: When max_task_duration = 2s and the adapter takes 3 seconds,
+    // the 1-second tick fires mid-call and enters Exiting. After the adapter
+    // responds and the turn completes, the agent transitions to Stopped.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "slow adapter + dual deadline polling"
+    )]
+    #[test]
+    fn max_task_duration_enters_exiting_while_adapter_in_flight() {
+        struct SlowAdapter;
+        #[async_trait::async_trait]
+        impl reeve_adapter::Adapter for SlowAdapter {
+            fn id(&self) -> &'static str {
+                "slow@test"
+            }
+            fn capabilities(&self) -> reeve_adapter::Capabilities {
+                reeve_adapter::Capabilities::new()
+            }
+            async fn call(
+                &self,
+                _: &[reeve_adapter::Message],
+                _: &[reeve_adapter::Tool],
+                _: &reeve_adapter::Params,
+            ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                Ok(reeve_adapter::Response::new_text(
+                    vec![reeve_adapter::MessageContent::Text("done".to_owned())],
+                    reeve_adapter::TokenCounts::default(),
+                    reeve_adapter::CostEstimate::default(),
+                ))
+            }
+        }
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let dirs = AgentDirs::provision(&data_dir, "lead").unwrap();
+        let registry_path = data_dir.join("agents").join("registry.toml");
+
+        {
+            let mut reg =
+                crate::agent_registry::AgentRegistry::open(registry_path.clone()).unwrap();
+            reg.register(crate::agent_registry::AgentRecord {
+                name: crate::agent_registry::ValidatedAgentName::new("lead").unwrap(),
+                identity_id: IdentityId::new().unwrap(),
+                inbox_dir: dirs.inbox_root(),
+                persona_name: Some("lead".to_owned()),
+                spawned_at: time::OffsetDateTime::now_utc(),
+                status: crate::agent_registry::AgentStatus::Running,
+            })
+            .unwrap();
+        }
+
+        let registry_path2 = data_dir.join("agents").join("registry.toml");
+        let thresholds = crate::capability::Thresholds {
+            max_task_duration_secs: Some(2), // adapter takes 3s so tick fires mid-call
+            ..Default::default()
+        };
+        let agent = {
+            Agent::new(
+                Arc::new(SlowAdapter),
+                &dirs,
+                mock_snapshot(),
+                String::new(),
+                IdentityId::new().unwrap(),
+                reeve_types::Keypair::generate(),
+                Vec::new(),
+                thresholds,
+                None,
+                data_dir.clone(),
+                "lead".to_owned(),
+                registry_path,
+            )
+            .unwrap()
+        };
+
+        let status_path = dirs.status_path();
+        let sender_id = IdentityId::new().unwrap();
+
+        actix::System::new().block_on(async move {
+            let addr = Supervisor::start(move |_| agent);
+            addr.do_send(ProcessInbound {
+                message_id: "ct3-msg-1".to_owned(),
+                sender_id,
+                payload: "hello".to_owned(),
+            });
+
+            // The 2-second tick fires while the 3-second adapter call is in flight.
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                let status = std::fs::read_to_string(&status_path).unwrap_or_default();
+                if status.trim() == "exiting" {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for \'exiting\' status; got: {:?}",
+                    status.trim()
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+
+            // After the adapter call completes, the agent should transition to Stopped.
+            let deadline2 = std::time::Instant::now() + Duration::from_secs(4);
+            loop {
+                let reg =
+                    crate::agent_registry::AgentRegistry::open(registry_path2.clone()).unwrap();
+                if let Some(record) = reg.lookup("lead") {
+                    if matches!(record.status, crate::agent_registry::AgentStatus::Stopped) {
+                        break;
+                    }
+                }
+                assert!(
+                    std::time::Instant::now() < deadline2,
+                    "timed out waiting for Stopped registry status"
+                );
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
 
             actix::System::current().stop();
         });

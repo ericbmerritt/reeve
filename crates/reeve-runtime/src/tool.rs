@@ -29,6 +29,9 @@ use actix::Recipient;
 use reeve_types::IdentityId;
 use serde::Serialize;
 
+use time::OffsetDateTime;
+
+use crate::audit::{AuditEvent, AuditLog, AuthorityDisposition};
 use crate::blacklist::BlacklistRegistry;
 use crate::capability::{CapabilityProfile, ToolCategory};
 
@@ -212,6 +215,46 @@ pub fn check_blacklist(handle: Option<&BlacklistHandle>, action: &str) -> Result
         });
     }
     Ok(())
+}
+
+/// Shared handle to the audit log, cloned into each tool actor that needs to
+/// emit `authority.decision` events on refusal.
+pub type AuditHandle = Arc<AuditLog>;
+
+/// Emit an `authority.decision` audit event for a tool-actor refusal.
+///
+/// `profile` is the snapshotted capability profile of the invoking agent
+/// (provides `persona_name` and `profile_version`). `blacklist_version` is
+/// `Some` when the refusal came from the blacklist layer, `None` otherwise.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "audit emit needs all audit context fields; bundling into a struct trades clarity for indirection at the single call site"
+)]
+pub fn emit_refusal_audit(
+    audit: Option<&AuditHandle>,
+    refusal: &Refusal,
+    agent_id: IdentityId,
+    action: &str,
+    profile: Option<&CapabilityProfile>,
+    blacklist_version: Option<String>,
+) {
+    let Some(audit) = audit else { return };
+    let event = AuditEvent::AuthorityDecision {
+        agent_id,
+        // Use explicit sentinel values when no profile is present so audit
+        // consumers can distinguish "no profile snapshot" from a real v1 profile.
+        persona_name: profile
+            .map(|p| p.name.clone())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        profile_version: profile.map(|p| p.version).unwrap_or(0),
+        action: action.to_owned(),
+        disposition: AuthorityDisposition::Refuse,
+        layer: Some(refusal.layer().to_owned()),
+        rationale: Some(refusal.rationale().to_owned()),
+        blacklist_version,
+        at: OffsetDateTime::now_utc(),
+    };
+    let _ = audit.append(&event);
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
