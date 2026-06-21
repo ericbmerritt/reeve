@@ -982,21 +982,27 @@ fn launch_actors(
         coord_addr.recipient(),
         lead_profile.clone(),
         Some(Arc::clone(&blacklist_handle)),
-    );
+    )
+    .with_audit(Arc::clone(&audit_shared));
     let send_message_tool = crate::tool::SendMessageTool::new(
         dispatcher_addr.clone().recipient(),
         lead_profile.clone(),
         Some(Arc::clone(&blacklist_handle)),
-    );
+    )
+    .with_audit(Arc::clone(&audit_shared));
     let list_agents_tool = crate::tool::ListAgentsTool::new(
         agent_registry_path_for_resume.clone(),
         lead_profile.clone(),
-    );
+    )
+    .with_audit(Arc::clone(&audit_shared));
     let whoami_tool =
-        crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone(), lead_profile.clone());
-    let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois.clone(), lead_profile.clone());
+        crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone(), lead_profile.clone())
+            .with_audit(Arc::clone(&audit_shared));
+    let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois.clone(), lead_profile.clone())
+        .with_audit(Arc::clone(&audit_shared));
     let list_personas_tool =
-        crate::tool::ListPersonasTool::new(data_dir_for_whois, lead_profile.clone());
+        crate::tool::ListPersonasTool::new(data_dir_for_whois, lead_profile.clone())
+            .with_audit(Arc::clone(&audit_shared));
     let lead_thresholds_from_profile = lead_profile
         .as_deref()
         .map(|p| p.thresholds.clone())
@@ -1268,6 +1274,7 @@ fn resume_one_subagent(
         data_dir,
         profile,
         blacklist.map(Arc::clone),
+        Some(Arc::clone(audit)),
     );
     let new_agent = Agent::new(
         Arc::clone(adapter),

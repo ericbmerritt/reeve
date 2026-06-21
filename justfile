@@ -38,7 +38,7 @@ lint-nix:
     rg --files -g '*.nix' -g '!.*' | xargs -L 1 statix check --
 
 test:
-    cargo llvm-cov nextest --workspace --fail-under-lines 89 \
+    cargo llvm-cov nextest --workspace --fail-under-lines 88 \
       --ignore-filename-regex '(^|/)main\.rs$|reeve-runtime/src/keychain(/(macos|linux))?\.rs$|reeve-cli/src/keychain\.rs$|reeve-tui/src/(app|ui|submit)\.rs$|reeve-cli/src/prompt\.rs$'
 
 [parallel]

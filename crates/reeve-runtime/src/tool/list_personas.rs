@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use actix::{Actor, Context, Handler};
 
-use super::{check_authority, InvokeTool, ToolResult};
+use super::{check_authority, emit_refusal_audit, AuditHandle, InvokeTool, ToolResult};
 use crate::agent_fs::RuntimeLayout;
 use crate::capability::{CapabilityProfile, ToolCategory};
 use crate::config::load_persona_config;
@@ -19,12 +19,22 @@ use crate::config::load_persona_config;
 pub struct ListPersonasTool {
     data_dir: PathBuf,
     profile: Option<Arc<CapabilityProfile>>,
+    audit: Option<AuditHandle>,
 }
 
 impl ListPersonasTool {
     /// Construct a [`ListPersonasTool`] reading from `data_dir`.
     pub fn new(data_dir: PathBuf, profile: Option<Arc<CapabilityProfile>>) -> Self {
-        Self { data_dir, profile }
+        Self {
+            data_dir,
+            profile,
+            audit: None,
+        }
+    }
+
+    pub fn with_audit(mut self, audit: AuditHandle) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Adapter-facing tool descriptor.
@@ -73,6 +83,14 @@ impl Handler<InvokeTool> for ListPersonasTool {
         if let Err(refusal) =
             check_authority(self.profile.as_deref(), ToolCategory::ReadFiles, sender_id)
         {
+            emit_refusal_audit(
+                self.audit.as_ref(),
+                &refusal,
+                sender_id,
+                "list_personas",
+                self.profile.as_deref(),
+                None,
+            );
             reply_to.do_send(ToolResult {
                 tool_use_id,
                 content: refusal.to_json(),

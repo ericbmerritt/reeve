@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use actix::{Actor, Context, Handler};
 
-use super::{check_authority, InvokeTool, ToolResult};
+use super::{check_authority, emit_refusal_audit, AuditHandle, InvokeTool, ToolResult};
 use crate::agent_registry::AgentRegistry;
 use crate::capability::{CapabilityProfile, ToolCategory};
 use std::sync::Arc;
@@ -22,6 +22,7 @@ use std::sync::Arc;
 pub struct ListAgentsTool {
     agent_registry_path: PathBuf,
     profile: Option<Arc<CapabilityProfile>>,
+    audit: Option<AuditHandle>,
 }
 
 impl ListAgentsTool {
@@ -30,7 +31,13 @@ impl ListAgentsTool {
         Self {
             agent_registry_path,
             profile,
+            audit: None,
         }
+    }
+
+    pub fn with_audit(mut self, audit: AuditHandle) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Adapter-facing tool descriptor for [`ListAgentsTool`].
@@ -81,6 +88,14 @@ impl Handler<InvokeTool> for ListAgentsTool {
         if let Err(refusal) =
             check_authority(self.profile.as_deref(), ToolCategory::ReadFiles, sender_id)
         {
+            emit_refusal_audit(
+                self.audit.as_ref(),
+                &refusal,
+                sender_id,
+                "list_agents",
+                self.profile.as_deref(),
+                None,
+            );
             reply_to.do_send(ToolResult {
                 tool_use_id,
                 content: refusal.to_json(),

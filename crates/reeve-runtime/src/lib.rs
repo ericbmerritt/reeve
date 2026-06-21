@@ -63,8 +63,8 @@ pub use runtime_lock::{default_log_path, default_state_dir, RuntimeLock, Runtime
 pub use spawn_coordinator::{SpawnCoordinator, SpawnRequestError, SpawnResponse};
 pub use supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 pub use tool::{
-    check_authority, BlacklistHandle, InvokeTool, ListPersonasTool, Refusal, SendMessageTool,
-    SpawnAgentTool, ToolResult,
+    check_authority, AuditHandle, BlacklistHandle, InvokeTool, ListPersonasTool, Refusal,
+    SendMessageTool, SpawnAgentTool, ToolResult,
 };
 pub use verify::{
     emit_quarantine_audit, EnvelopeIds, QuarantineReason, Verdict, VerificationError,

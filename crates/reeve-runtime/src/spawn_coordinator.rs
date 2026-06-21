@@ -284,13 +284,41 @@ pub(crate) fn build_subagent_tools(
     data_dir: &Path,
     profile: Option<Arc<CapabilityProfile>>,
     blacklist: Option<BlacklistHandle>,
+    audit: Option<crate::tool::AuditHandle>,
 ) -> Vec<(reeve_adapter::Tool, actix::Recipient<InvokeTool>)> {
     use actix::Actor as _;
-    let send_message_tool = SendMessageTool::new(dispatcher, profile.clone(), blacklist.clone());
-    let list_agents_tool =
-        crate::tool::ListAgentsTool::new(agent_registry_path.clone(), profile.clone());
-    let whoami_tool = crate::tool::WhoamiTool::new(agent_registry_path, profile.clone());
-    let whois_tool = crate::tool::WhoisTool::new(data_dir.to_path_buf(), profile.clone());
+    let send_message_tool = {
+        let t = SendMessageTool::new(dispatcher, profile.clone(), blacklist.clone());
+        if let Some(a) = audit.clone() {
+            t.with_audit(a)
+        } else {
+            t
+        }
+    };
+    let list_agents_tool = {
+        let t = crate::tool::ListAgentsTool::new(agent_registry_path.clone(), profile.clone());
+        if let Some(a) = audit.clone() {
+            t.with_audit(a)
+        } else {
+            t
+        }
+    };
+    let whoami_tool = {
+        let t = crate::tool::WhoamiTool::new(agent_registry_path, profile.clone());
+        if let Some(a) = audit.clone() {
+            t.with_audit(a)
+        } else {
+            t
+        }
+    };
+    let whois_tool = {
+        let t = crate::tool::WhoisTool::new(data_dir.to_path_buf(), profile.clone());
+        if let Some(a) = audit.clone() {
+            t.with_audit(a)
+        } else {
+            t
+        }
+    };
     let mut tools = vec![
         (
             SendMessageTool::descriptor(),
@@ -310,7 +338,14 @@ pub(crate) fn build_subagent_tools(
         ),
     ];
     if let Some(coord) = coordinator {
-        let spawn_agent_tool = crate::tool::SpawnAgentTool::new(coord, profile, blacklist);
+        let spawn_agent_tool = {
+            let t = crate::tool::SpawnAgentTool::new(coord, profile, blacklist);
+            if let Some(a) = audit {
+                t.with_audit(a)
+            } else {
+                t
+            }
+        };
         tools.insert(
             0,
             (
@@ -415,25 +450,39 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             };
 
         // Concurrency check: refuse if the caller already has max_concurrent_subordinates
-        // live subordinates. All Running agents that are not the caller itself count.
+        // live agents that were created by the caller (identified via the identity
+        // registry's `created_by` field). Fail closed on any registry error.
         if let Some(max) = persona_profile
             .as_ref()
             .and_then(|p| p.thresholds.max_concurrent_subordinates)
         {
-            // Fail closed: if the registry can't be read, treat the count as
-            // at-limit (u32::MAX) so the threshold remains enforceable under
-            // transient FS errors rather than silently allowing the spawn.
-            let live_count: u32 = match AgentRegistry::open(self.agent_registry_path.clone()) {
-                Ok(reg) => reg
-                    .list()
-                    .filter(|r| {
-                        matches!(r.status, AgentStatus::Running) && r.identity_id != sender_id
-                    })
-                    .count()
-                    .try_into()
-                    .unwrap_or(u32::MAX),
-                Err(err) => {
+            let live_count: u32 = match (
+                AgentRegistry::open(self.agent_registry_path.clone()),
+                self.identity_registry.list(),
+            ) {
+                (Ok(agent_reg), Ok(identities)) => {
+                    // Build the set of identity IDs created by the caller.
+                    let subordinate_ids: std::collections::HashSet<IdentityId> = identities
+                        .into_iter()
+                        .filter(|s| s.identity().created_by == Some(sender_id))
+                        .map(|s| s.identity().identity_id)
+                        .collect();
+                    agent_reg
+                        .list()
+                        .filter(|r| {
+                            matches!(r.status, AgentStatus::Running)
+                                && subordinate_ids.contains(&r.identity_id)
+                        })
+                        .count()
+                        .try_into()
+                        .unwrap_or(u32::MAX)
+                }
+                (Err(err), _) => {
                     warn!(%err, "concurrency check: failed to open agent registry; treating as at-limit");
+                    u32::MAX
+                }
+                (_, Err(err)) => {
+                    warn!(%err, "concurrency check: failed to list identities; treating as at-limit");
                     u32::MAX
                 }
             };
@@ -602,6 +651,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             self.data_dir.as_path(),
             profile,
             self.blacklist.clone(),
+            Some(Arc::clone(&self.audit)),
         );
 
         let new_agent = match Agent::new(
@@ -743,7 +793,7 @@ mod tests {
             use actix::Actor as _;
             let dispatcher = NullDispatcher.start().recipient();
             let tools =
-                build_subagent_tools(None, dispatcher, registry_path, &data_dir, None, None);
+                build_subagent_tools(None, dispatcher, registry_path, &data_dir, None, None, None);
             let names: Vec<String> = tools.iter().map(|(t, _)| t.name.clone()).collect();
             assert!(
                 names.iter().any(|n| n == "send_message"),

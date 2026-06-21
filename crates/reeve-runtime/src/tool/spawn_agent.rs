@@ -8,7 +8,10 @@ use std::sync::Arc;
 
 use actix::{ActorContext, AsyncContext, Recipient};
 
-use super::{check_authority, check_blacklist, BlacklistHandle, InvokeTool, ToolResult};
+use super::{
+    check_authority, check_blacklist, emit_refusal_audit, AuditHandle, BlacklistHandle, InvokeTool,
+    ToolResult,
+};
 use crate::capability::{CapabilityProfile, ToolCategory};
 use crate::spawn_coordinator::{SpawnRequest, SpawnResponse};
 
@@ -91,6 +94,7 @@ pub struct SpawnAgentTool {
     coordinator: Recipient<SpawnRequest>,
     profile: Option<Arc<CapabilityProfile>>,
     blacklist: Option<BlacklistHandle>,
+    audit: Option<AuditHandle>,
 }
 
 impl SpawnAgentTool {
@@ -104,7 +108,13 @@ impl SpawnAgentTool {
             coordinator,
             profile,
             blacklist,
+            audit: None,
         }
+    }
+
+    pub fn with_audit(mut self, audit: AuditHandle) -> Self {
+        self.audit = Some(audit);
+        self
     }
 
     /// Action descriptor for blacklist matching: `SpawnAgent(persona=<name>)`.
@@ -200,11 +210,21 @@ impl actix::Handler<InvokeTool> for SpawnAgentTool {
             reply_to,
         } = msg;
 
+        let action_str = Self::canonical_action(&input).unwrap_or_else(|| "spawn_agent".to_owned());
+
         if let Err(refusal) = check_authority(
             self.profile.as_deref(),
             ToolCategory::SpawnAgents,
             sender_id,
         ) {
+            emit_refusal_audit(
+                self.audit.as_ref(),
+                &refusal,
+                sender_id,
+                &action_str,
+                self.profile.as_deref(),
+                None,
+            );
             reply_to.do_send(ToolResult {
                 tool_use_id,
                 content: refusal.to_json(),
@@ -215,15 +235,27 @@ impl actix::Handler<InvokeTool> for SpawnAgentTool {
 
         // Blacklist check uses the canonical action descriptor so the operator
         // can write patterns like `SpawnAgent(persona=untrusted)`.
-        if let Some(action) = Self::canonical_action(&input) {
-            if let Err(refusal) = check_blacklist(self.blacklist.as_ref(), &action) {
-                reply_to.do_send(ToolResult {
-                    tool_use_id,
-                    content: refusal.to_json(),
-                    is_error: true,
-                });
-                return;
-            }
+        if let Err(refusal) = check_blacklist(self.blacklist.as_ref(), &action_str) {
+            let bv = self.blacklist.as_ref().and_then(|h| {
+                h.read().map_or_else(
+                    |e| Some(e.into_inner().version_hash.clone()),
+                    |bl| Some(bl.version_hash.clone()),
+                )
+            });
+            emit_refusal_audit(
+                self.audit.as_ref(),
+                &refusal,
+                sender_id,
+                &action_str,
+                self.profile.as_deref(),
+                bv,
+            );
+            reply_to.do_send(ToolResult {
+                tool_use_id,
+                content: refusal.to_json(),
+                is_error: true,
+            });
+            return;
         }
 
         let Some(persona) = input.get("persona").and_then(|v| v.as_str()) else {
