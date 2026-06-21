@@ -1,10 +1,8 @@
-# reeve-authority — Ladder
-
 ## Phase 1: Capability profile schema, snapshot, tool-actor enforcement
 
-| Status      | Started | Completed |
-| ----------- | ------- | --------- |
-| not started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ✅ complete     | 2026-06-04 | 2026-06-04 |
 
 Tags: runtime, security, persona
 
@@ -89,38 +87,26 @@ Integration test that a persona without `profile.toml` causes
 - `profile.toml` written for the shipped `lead` and `worker` personas
 - `capability_profile: Option<String>` removed from `PersonaConfig`
 - `SpawnCoordinator` snapshots `profile.toml` to
-  `agents/<name>/profile.toml` at spawn; hard-errors on missing
-  persona profile
 - Tool actor's `Handler<InvokeTool>` runs the profile check first;
-  `spawn_agent` and `send_message` declare their categories
 - `authority.decision` audit entries for Allow and Refuse from the
-  tool-actor site
 
 #### Done When
 
 - Given a worker with `spawn_agents` disabled, when its model issues
-  a `spawn_agent` tool call, then the tool returns
-  `ToolResult { is_error: true }` with a `Refusal` body identifying
-  `layer="profile"`, `category="spawn_agents"`
 - Given the lead with full profile, when it issues either `spawn_agent`
-  or `send_message`, then the tool executes normally and an
-  `authority.decision` audit entry records `disposition="allow"`
 - Given a persona without `profile.toml`, when the operator attempts
-  to spawn an agent of that persona, then `SpawnError::ProfileMissing`
-  is returned and no agent is registered
 - `cargo test -p reeve-runtime` passes including the new profile parser
-  and integration tests
 - `just validate` passes
 
 #### Depends On
 
-- (none — this is the foundation phase for the ladder)
+- (none)
 
 ## Phase 2: Blacklist + tool-actor blacklist enforcement
 
-| Status      | Started | Completed |
-| ----------- | ------- | --------- |
-| not started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ✅ complete     | 2026-06-04 | 2026-06-10 |
 
 Tags: runtime, security
 
@@ -186,30 +172,17 @@ tries to send to worker.
 
 - `BlacklistRegistry` in `reeve-runtime` with TOML parser
 - `<data_dir>/blacklist.toml` schema + reload-on-edit + fail-closed
-  on malformed file
 - `canonical_action()` method on each shipped tool actor
 - Tool-actor `Handler<InvokeTool>` runs blacklist check after profile
 - `blacklist_version` (SHA-256 content hash) populated in every
-  `authority.decision` audit entry from this phase onward
 - `blacklist.reload_failed` audit event on parse failure
 
 #### Done When
 
 - Given a blacklist entry `SendMessage(to=worker)`, when the lead's
-  model issues a `send_message` to worker, then the tool returns
-  `is_error: true` with a `Refusal` body identifying
-  `layer="blacklist"`, `pattern="SendMessage(to=worker)"`, and the
-  entry's rationale
 - Given the operator edits `blacklist.toml` while the daemon is
-  running, when the change is saved, then the next tool invocation
-  sees the new entries (verified by appending an entry mid-test and
-  observing the refusal on the next attempt)
 - Given a `blacklist.toml` with a TOML parse error, when the runtime
-  attempts reload, then the last-good blacklist remains in effect, a
-  `blacklist.reload_failed` audit event is emitted, and the panopticon
-  shows the error banner
 - `blacklist_version` in every `authority.decision` entry equals the
-  SHA-256 of the active blacklist's canonical-serialized contents
 - `just validate` passes
 
 #### Depends On
@@ -218,9 +191,9 @@ tries to send to worker.
 
 ## Phase 3: Cost thresholds at the adapter call boundary
 
-| Status      | Started | Completed |
-| ----------- | ------- | --------- |
-| not started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ✅ complete     | 2026-06-10 | 2026-06-17 |
 
 Tags: runtime, adapter
 
@@ -282,22 +255,13 @@ threshold the next model call on either agent refuses.
 - `SessionCostMeter` in `reeve-runtime` walking the supervisor tree
 - `cost_per_session` threshold check at adapter-call boundary
 - `authority.decision` audit entries with `layer="threshold"` for
-  both threshold trips
 - System entries in conversation journals when a model call is refused
 
 #### Done When
 
 - Given an agent with `cost_per_agent = 0.01` USD, when its cost meter
-  crosses the threshold, then the next adapter call is refused, the
-  agent appends a system entry with the `Refusal` body, and the audit
-  log records `threshold="cost_per_agent"`, `current=<value>`,
-  `limit=0.01`
 - Given a multi-agent tree with `cost_per_session = 0.05` on the root,
-  when the aggregated session cost crosses the threshold, then the
-  next adapter call on **any** agent in the tree is refused with
-  `threshold="cost_per_session"`
 - `SessionCostMeter` correctly sums descendants — verified by a unit
-  test with a fixture tree of three agents and known cost-meter values
 - `just validate` passes
 
 #### Depends On
@@ -306,9 +270,9 @@ threshold the next model call on either agent refuses.
 
 ## Phase 4: Concurrency threshold + max_task_duration + Exiting state
 
-| Status      | Started | Completed |
-| ----------- | ------- | --------- |
-| not started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ✅ complete     | 2026-06-17 | 2026-06-20 |
 
 Tags: runtime, lifecycle
 
@@ -378,23 +342,14 @@ to `Stopped` with the named reason. Integration test for
 - Per-agent task clock in `AgentActor`
 - `max_task_duration` enforcement on a periodic check
 - New `Exiting` agent state with full lifecycle (Entry / In Exiting /
-  Exit to `Stopped` with `stopped_reason = "max_task_duration_exceeded"`)
 - Panopticon sigil for `Exiting` state
 - Audit-log entries for both threshold trips
 
 #### Done When
 
 - Given a lead with `max_concurrent_subordinates = 2`, when its model
-  attempts a third concurrent `spawn_agent`, then the tool returns
-  `is_error: true` with `Refusal` body identifying
-  `threshold="max_concurrent_subordinates"`, `current=2`, `limit=2`
 - Given an agent with `max_task_duration = 5s`, when it has been in
-  `Working` or `Idle` on a task for longer than the threshold, then
-  the agent transitions to `Exiting`, in-flight work runs to
-  completion, and the agent transitions to `Stopped` with
-  `stopped_reason = "max_task_duration_exceeded"`
 - The panopticon's agent table renders `Exiting` with a distinct
-  sigil — visible in the 80×24 smoke
 - Unit tests cover legal/illegal state transitions for `Exiting`
 - `just validate` passes
 
@@ -404,9 +359,9 @@ to `Stopped` with the named reason. Integration test for
 
 ## Phase 5: TUI surfacing — pending-decisions panel + Decisions tab
 
-| Status      | Started | Completed |
-| ----------- | ------- | --------- |
-| not started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| 🟡 in-progress  | 2026-06-26 |            |
 
 Tags: tui
 
@@ -463,22 +418,14 @@ a 50-entry fixture and verify columns/styling.
 - `AuthorityDecision` view-model in `reeve-tui`
 - Audit-log tail reader for `authority.decision` entries
 - Panopticon pending-decisions panel populated with recent refusals
-  + `▲ N` title-bar indicator
 - Per-agent inspect Decisions tab rendering the full decision history
-  for the focused agent (read-only)
 
 #### Done When
 
 - Given a refused tool call has been written to the audit log, when
-  the operator opens the panopticon, then the pending-decisions panel
-  shows the refusal with timestamp, agent, action, and reason
 - Given the operator presses Enter on an agent row and switches to
-  the Decisions tab, then the tab shows every `authority.decision`
-  entry for that agent in reverse chronological order
 - The `▲ N` title-bar indicator reflects the total refusal count in
-  the audit log tail; absent when count is zero
 - 80×24 NO_COLOR smoke passes with at least one refusal seeded into
-  the fixture
 - `just validate` passes
 
 #### Depends On
@@ -487,9 +434,9 @@ a 50-entry fixture and verify columns/styling.
 
 ## Phase 6: System-prompt source annotation + already-running-agent rehydration
 
-| Status      | Started | Completed |
-| ----------- | ------- | --------- |
-| not started |         |           |
+| Status         | Started    | Completed  |
+| -------------- | ---------- | ---------- |
+| ⬜ not-started  |            |            |
 
 Tags: runtime, security, lifecycle
 
@@ -563,34 +510,17 @@ with no persona profile, verify `stopped_reason = "profile_missing"`.
 
 - `system_prompt_source: IdentityId` field in `agents/<name>/agent.toml`
 - 8 KiB length cap on caller-supplied `system_prompt` at the
-  `SpawnCoordinator` boundary (configurable in team config)
 - Untrusted-typed input tagging in the spawned agent's context
-  assembly when source is a peer
 - Daemon-restart rehydration path synthesizes missing
-  `agents/<name>/profile.toml` from current persona profile
 - `stopped_reason = "profile_missing"` for agents whose persona has
-  no profile at rehydration time
 
 #### Done When
 
 - Given a peer agent invokes `spawn_agent`, when the new agent's
-  `agent.toml` is read, then `system_prompt_source` equals the
-  spawning peer's identity ID
 - Given the operator's lead inbound triggers a cold spawn of the
-  lead, when the lead's `agent.toml` is read, then
-  `system_prompt_source` equals the operator's identity ID
 - Given a `spawn_agent` invocation with `system_prompt` larger than
-  8 KiB, when the `SpawnCoordinator` receives it, then the call is
-  refused at the dispatch boundary with a structured error and no
-  agent is spawned
 - Given the daemon restarts and an agent's `profile.toml` is missing
-  but its persona's `profile.toml` exists, when rehydration runs,
-  then the agent's `profile.toml` is synthesized from the persona
-  and the agent resumes
 - Given the daemon restarts and both an agent's `profile.toml` and
-  its persona's `profile.toml` are missing, when rehydration runs,
-  then the agent is left in the registry as `Stopped` with
-  `stopped_reason = "profile_missing"`
 - `just validate` passes
 
 #### Depends On
