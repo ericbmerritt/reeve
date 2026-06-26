@@ -66,3 +66,22 @@ pub fn pad_right(s: &str, width: usize) -> String {
         out
     }
 }
+
+/// Truncate a string to at most `max_chars` display chars, appending an
+/// ellipsis when truncation actually fires. Shared by the dense single-line
+/// rows in the panopticon and inspect screens.
+#[must_use]
+pub fn truncate(s: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = s.chars().count();
+    if count <= max_chars {
+        return s.to_owned();
+    }
+    if max_chars == 1 {
+        return "\u{2026}".to_owned();
+    }
+    let prefix: String = s.chars().take(max_chars - 1).collect();
+    format!("{prefix}\u{2026}")
+}

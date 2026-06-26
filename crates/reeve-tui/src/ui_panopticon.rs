@@ -42,10 +42,10 @@ use ratatui::Frame;
 use time::{Duration, OffsetDateTime};
 
 use crate::panopticon::{
-    AgentRow, EventKind, PanopticonSnapshot, QueueCounts, RecentEvent, Source,
+    AgentRow, EventKind, PanopticonSnapshot, PendingDecision, QueueCounts, RecentEvent, Source,
 };
 use crate::state::AgentStatus;
-use crate::ui_common::{format_time_hhmm, no_color};
+use crate::ui_common::{format_time_hhmm, no_color, pad_right, truncate};
 
 // ── Layout constants ────────────────────────────────────────────────────────
 //
@@ -123,19 +123,49 @@ fn build_section_header(label: &str, width: u16) -> Line<'static> {
     crate::ui_common::build_section_header(label, width)
 }
 
-/// Build the pending-decisions header — explicit `── none ──` in Phase 6
-/// because the panel is rendered-but-empty. Saskia: "the operator builds
-/// muscle memory for where the panel is, and the queue counters gain a
-/// referent."
+/// Build the pending-decisions header. When refusals exist it shows the
+/// `▲ N` total-count indicator (`N` is every refusal in the audit-log tail,
+/// not just the rows that fit below); at zero it keeps the `── none ──`
+/// empty-state from ladder 2 so the operator's muscle memory for the panel's
+/// location survives.
 fn build_pending_header(count: usize, width: u16) -> Line<'static> {
     let label = if count == 0 {
         "\u{2500} pending decisions \u{2500}\u{2500}\u{2500}\u{2500} none ".to_owned()
     } else {
-        format!("\u{2500} pending decisions \u{2500}\u{2500}\u{2500}\u{2500} {count} ")
+        format!("\u{2500} pending decisions \u{2500}\u{2500}\u{2500}\u{2500} \u{25B2} {count} ")
     };
     let pad = usize::from(width).saturating_sub(label.chars().count());
     let rule: String = "\u{2500}".repeat(pad);
     Line::from(format!("{label}{rule}"))
+}
+
+/// Build one pending-decision row: `HH:MM  agent  action — rationale`,
+/// truncated to the width. Refusals are the actionable signal, so the row
+/// carries the attention colour (red with colour on, bold otherwise) rather
+/// than the dim styling the events panel uses for routine system lines.
+fn build_pending_row(decision: &PendingDecision, width: u16) -> Line<'static> {
+    let time = format_time_hhmm(decision.timestamp);
+    let agent = pad_right(&decision.agent_name, AGENT_COL_WIDTH);
+    let prefix = format!("{time}  ");
+    let body = if decision.rationale.is_empty() {
+        decision.action.clone()
+    } else {
+        format!("{} \u{2014} {}", decision.action, decision.rationale)
+    };
+    let body_budget = usize::from(width).saturating_sub(prefix.len() + AGENT_COL_WIDTH + 1);
+    let body = truncate(&body, body_budget);
+
+    let style = if no_color() {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Red)
+    };
+    Line::from(vec![
+        Span::raw(prefix),
+        styled_span(agent, None),
+        Span::raw(" "),
+        Span::styled(body, style),
+    ])
 }
 
 // ── Status sigil ────────────────────────────────────────────────────────────
@@ -341,20 +371,6 @@ fn build_agent_row(agent: &AgentRow, focused: bool, now: OffsetDateTime) -> Line
     Line::from(spans)
 }
 
-/// Truncate or right-pad a column value to `width` display chars. Naive on
-/// graphemes — agent names and persona names are ASCII-ish in practice; if
-/// that changes the renderer needs `unicode-width`.
-fn pad_right(s: &str, width: usize) -> String {
-    let actual = s.chars().count();
-    if actual >= width {
-        s.chars().take(width).collect()
-    } else {
-        let mut out = s.to_owned();
-        out.extend(std::iter::repeat_n(' ', width - actual));
-        out
-    }
-}
-
 // ── Recent events ───────────────────────────────────────────────────────────
 
 /// Build one recent-event row: `HH:MM  source       kind    summary`.
@@ -409,23 +425,6 @@ fn event_kind_color(kind: EventKind) -> Color {
     }
 }
 
-/// Truncate a string to at most `max_chars` display chars, appending an
-/// ellipsis when truncation actually fires.
-fn truncate(s: &str, max_chars: usize) -> String {
-    if max_chars == 0 {
-        return String::new();
-    }
-    let count = s.chars().count();
-    if count <= max_chars {
-        return s.to_owned();
-    }
-    if max_chars == 1 {
-        return "\u{2026}".to_owned();
-    }
-    let prefix: String = s.chars().take(max_chars - 1).collect();
-    format!("{prefix}\u{2026}")
-}
-
 // ── Queues strip ────────────────────────────────────────────────────────────
 
 /// `m N·c N·Q N·$ ok`. Separators are bare `·` (no surrounding spaces) so
@@ -477,6 +476,15 @@ pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
         .iter()
         .map(|e| build_event_row(e, width))
         .collect();
+    let pending_rows: Vec<Line<'static>> = snap
+        .pending_decisions
+        .iter()
+        .map(|d| build_pending_row(d, width))
+        .collect();
+    // The panel is capped at MAX_PENDING_DECISIONS rows upstream, so this
+    // region is small and bounded; it does not need the events panel's
+    // starvation guard.
+    let pending_height = u16::try_from(pending_rows.len()).unwrap_or(u16::MAX);
 
     // Region budgets:
     // - Agents region is content-sized BUT capped by the screen budget so
@@ -496,7 +504,7 @@ pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
     let raw_agents_height = u16::try_from(agent_rows.len()).unwrap_or(u16::MAX).max(1);
     let agents_height_cap = area
         .height
-        .saturating_sub(NON_AGENT_FIXED_ROWS + EVENT_PANEL_MIN_ROWS)
+        .saturating_sub(NON_AGENT_FIXED_ROWS + EVENT_PANEL_MIN_ROWS + pending_height)
         .max(1);
     let agents_height = raw_agents_height.min(agents_height_cap);
 
@@ -505,6 +513,7 @@ pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
         .constraints([
             Constraint::Length(1),                 // title bar
             Constraint::Length(1),                 // pending decisions header
+            Constraint::Length(pending_height),    // pending decision rows
             Constraint::Length(1),                 // agents section header
             Constraint::Length(agents_height),     // agent rows (capped)
             Constraint::Length(1),                 // recent events header
@@ -515,28 +524,32 @@ pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
         .split(area);
 
     frame.render_widget(Paragraph::new(build_title_bar(snap)), chunks[0]);
-    frame.render_widget(Paragraph::new(build_pending_header(0, width)), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(build_pending_header(snap.refusal_count, width)),
+        chunks[1],
+    );
+    frame.render_widget(Paragraph::new(Text::from(pending_rows)), chunks[2]);
     frame.render_widget(
         Paragraph::new(build_section_header("agents", width)),
-        chunks[2],
-    );
-    frame.render_widget(
-        Paragraph::new(Text::from(agent_rows)).wrap(Wrap { trim: false }),
         chunks[3],
     );
     frame.render_widget(
-        Paragraph::new(build_section_header("recent events", width)),
+        Paragraph::new(Text::from(agent_rows)).wrap(Wrap { trim: false }),
         chunks[4],
     );
     frame.render_widget(
-        Paragraph::new(Text::from(event_rows)).wrap(Wrap { trim: false }),
+        Paragraph::new(build_section_header("recent events", width)),
         chunks[5],
     );
     frame.render_widget(
-        Paragraph::new(build_queues_strip(snap.queue_counts)),
+        Paragraph::new(Text::from(event_rows)).wrap(Wrap { trim: false }),
         chunks[6],
     );
-    frame.render_widget(Paragraph::new(build_footer()), chunks[7]);
+    frame.render_widget(
+        Paragraph::new(build_queues_strip(snap.queue_counts)),
+        chunks[7],
+    );
+    frame.render_widget(Paragraph::new(build_footer()), chunks[8]);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -701,6 +714,51 @@ mod tests {
         );
     }
 
+    // U9b: with refusals present the header swaps the `none` empty-state for
+    // the `▲ N` total-count indicator.
+    #[test]
+    fn build_pending_header_shows_triangle_count_when_nonzero() {
+        let render = |count| -> String {
+            build_pending_header(count, 80)
+                .spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect()
+        };
+        let one = render(1);
+        assert!(one.contains("\u{25B2} 1"), "expected `▲ 1`: {one:?}");
+        let five = render(5);
+        assert!(five.contains("\u{25B2} 5"), "expected `▲ 5`: {five:?}");
+        assert!(!five.contains("none"), "non-zero header drops `none`");
+    }
+
+    // U9c: a pending row carries the agent, action, and rationale so the
+    // operator can triage the refusal without drilling in.
+    #[test]
+    fn build_pending_row_includes_agent_action_and_rationale() {
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        let decision = PendingDecision {
+            timestamp: now,
+            agent_name: "worker-x".to_owned(),
+            action: "SpawnAgent(persona=worker)".to_owned(),
+            rationale: "spawn_agents disabled".to_owned(),
+        };
+        let row: String = build_pending_row(&decision, 120)
+            .spans
+            .iter()
+            .map(|s| s.content.clone())
+            .collect();
+        assert!(row.contains("worker-x"), "agent missing: {row:?}");
+        assert!(
+            row.contains("SpawnAgent(persona=worker)"),
+            "action missing: {row:?}"
+        );
+        assert!(
+            row.contains("spawn_agents disabled"),
+            "rationale missing: {row:?}"
+        );
+    }
+
     // U10: the agent-rows builder inserts a `─ workers ─` separator
     // between the lead row and the first non-lead row, but not when there
     // are no non-lead agents.
@@ -709,6 +767,7 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
         let only_lead = build_snapshot(
             &[AgentInputs {
+                identity_id: reeve_types::IdentityId::new().unwrap(),
                 name: "lead".to_owned(),
                 persona_name: Some("lead".to_owned()),
                 status: AgentStatus::Idle,
@@ -719,6 +778,7 @@ mod tests {
                 state_changed_at: None,
                 conversation_tail: Vec::new(),
             }],
+            &[],
             0,
             None,
             now,
@@ -732,6 +792,7 @@ mod tests {
         let with_workers = build_snapshot(
             &[
                 AgentInputs {
+                    identity_id: reeve_types::IdentityId::new().unwrap(),
                     name: "lead".to_owned(),
                     persona_name: Some("lead".to_owned()),
                     status: AgentStatus::Idle,
@@ -743,6 +804,7 @@ mod tests {
                     conversation_tail: Vec::new(),
                 },
                 AgentInputs {
+                    identity_id: reeve_types::IdentityId::new().unwrap(),
                     name: "worker".to_owned(),
                     persona_name: Some("worker".to_owned()),
                     status: AgentStatus::Working,
@@ -754,6 +816,7 @@ mod tests {
                     conversation_tail: Vec::new(),
                 },
             ],
+            &[],
             0,
             None,
             now,
@@ -782,6 +845,7 @@ mod tests {
         let now = OffsetDateTime::from_unix_timestamp(1_700_000_100).unwrap();
         let inputs: Vec<AgentInputs> = (0..20)
             .map(|i| AgentInputs {
+                identity_id: reeve_types::IdentityId::new().unwrap(),
                 name: format!("worker-{i:02}"),
                 persona_name: Some("worker".to_owned()),
                 status: AgentStatus::Idle,
@@ -794,7 +858,7 @@ mod tests {
                 conversation_tail: Vec::new(),
             })
             .collect();
-        let snap = build_snapshot(&inputs, 0, None, now);
+        let snap = build_snapshot(&inputs, &[], 0, None, now);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -848,6 +912,7 @@ mod tests {
         let snap = build_snapshot(
             &[
                 AgentInputs {
+                    identity_id: reeve_types::IdentityId::new().unwrap(),
                     name: "lead".to_owned(),
                     persona_name: Some("lead".to_owned()),
                     status: AgentStatus::Idle,
@@ -859,6 +924,7 @@ mod tests {
                     conversation_tail: many_events,
                 },
                 AgentInputs {
+                    identity_id: reeve_types::IdentityId::new().unwrap(),
                     name: "worker-2e28aff5".to_owned(),
                     persona_name: Some("worker".to_owned()),
                     status: AgentStatus::Idle,
@@ -870,6 +936,7 @@ mod tests {
                     conversation_tail: Vec::new(),
                 },
             ],
+            &[],
             0,
             None,
             now,

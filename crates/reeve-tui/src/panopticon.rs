@@ -16,9 +16,10 @@
 //! On-disk format is defined by `reeve-runtime::agent_fs`. Errors are absorbed
 //! into safe defaults so the TUI always has something renderable.
 //!
-//! Pending decisions are **not** modeled in this phase — the renderer shows
-//! the pending-decisions panel but it is always empty. Capability enforcement
-//! (and therefore non-empty pending decisions) lands in a later ladder.
+//! Pending decisions surface the most recent authority *refusals*, read from
+//! the audit log's `authority.decision` entries. The log records the issuing
+//! agent by identity, not role name; [`build_snapshot`] joins each decision's
+//! `agent_id` against the registry-derived inputs to recover a display name.
 //!
 //! Sort and attribution choices come from the Phase 6 design review
 //! (Saskia's TUI panel): within the running group, agents rank by status
@@ -33,11 +34,13 @@ use std::time::SystemTime;
 
 use time::OffsetDateTime;
 
-use reeve_runtime::{AgentDirs, AgentRegistry};
+use reeve_runtime::{audit_log_path, AgentDirs, AgentRegistry};
 use reeve_types::IdentityId;
 
-use crate::reader::{read_conversation_tail, read_cost, read_status};
-use crate::state::{AgentStatus, EntryKind};
+use crate::reader::{
+    read_authority_decisions_tail, read_conversation_tail, read_cost, read_status,
+};
+use crate::state::{AgentStatus, AuthorityDecision, Disposition, EntryKind};
 
 /// Display label rendered for [`Source::Operator`] in the events stream.
 /// Pinned here so renderer and tests share one literal.
@@ -59,6 +62,20 @@ const PER_AGENT_TAIL: usize = 16;
 /// snapshot is therefore `O(N × CONVERSATION_TAIL_BYTES)` regardless of
 /// how long any individual conversation has grown.
 const CONVERSATION_TAIL_BYTES: u64 = 8 * 1024;
+
+/// Bytes of the audit log to tail-read per snapshot. 64 KiB holds on the
+/// order of 500 `authority.decision` entries — enough recent history for both
+/// the pending-decisions panel and the per-agent Decisions tab while keeping
+/// per-tick IO bounded as the log grows without limit. Shared with the
+/// inspect reload (`crate::app`) so both audit reads window the log
+/// identically.
+pub(crate) const AUDIT_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Maximum number of refusal rows rendered in the pending-decisions panel.
+/// The panel is a glanceable "what needs attention" strip, not a log; the
+/// full history lives in each agent's Decisions tab. The `▲ N` title count
+/// still reports the *total* refusals in the tail, not this cap.
+const MAX_PENDING_DECISIONS: usize = 5;
 
 // ── View-model types ──────────────────────────────────────────────────────────
 
@@ -178,6 +195,24 @@ pub struct QueueCounts {
     pub cost_ok: bool,
 }
 
+/// One row in the pending-decisions panel — a single authority refusal,
+/// resolved for display. Distinct from [`crate::state::AuthorityDecision`]
+/// (the raw parsed entry): the agent is named, allows are excluded, and only
+/// the fields the panel renders are kept.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDecision {
+    /// Time the decision was recorded.
+    pub timestamp: OffsetDateTime,
+    /// Display name of the refused agent: the role name when the `agent_id`
+    /// resolves against the registry, otherwise the persona name as a
+    /// fallback so a decision from an unregistered/stopped agent still reads.
+    pub agent_name: String,
+    /// The refused action descriptor (`Tool(specifier)` form).
+    pub action: String,
+    /// Operator-facing reason for the refusal.
+    pub rationale: String,
+}
+
 /// Everything the panopticon renderer needs in a single snapshot.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PanopticonSnapshot {
@@ -189,6 +224,12 @@ pub struct PanopticonSnapshot {
     /// Time since the oldest agent was spawned. Surfaced in the title bar as
     /// the session-elapsed indicator.
     pub session_elapsed: Option<time::Duration>,
+    /// Most recent refusals, newest first, capped at a small fixed count for
+    /// the pending-decisions panel.
+    pub pending_decisions: Vec<PendingDecision>,
+    /// Total refusals in the audit-log tail — the `▲ N` panel count. May
+    /// exceed `pending_decisions.len()` when more than the cap were refused.
+    pub refusal_count: usize,
 }
 
 // ── Pure builder ──────────────────────────────────────────────────────────────
@@ -198,6 +239,9 @@ pub struct PanopticonSnapshot {
 #[derive(Debug, Clone)]
 pub struct AgentInputs {
     pub name: String,
+    /// Identity of the agent, used to join audit-log authority decisions
+    /// (which key on identity, not role name) back to this row.
+    pub identity_id: IdentityId,
     pub persona_name: Option<String>,
     pub status: AgentStatus,
     pub is_running: bool,
@@ -228,9 +272,13 @@ pub struct AgentInputs {
 /// whose `sender_id` matches it surface as [`Source::Operator`] instead of
 /// [`Source::Agent`] with the recipient's name. Pass `None` when the
 /// operator is not yet known (builder falls back to per-agent attribution).
+/// `decisions` are the audit log's parsed authority decisions (allows and
+/// refuses); the builder keeps only refusals for the pending panel and joins
+/// each one's `agent_id` to a display name via `inputs`.
 #[must_use]
 pub fn build_snapshot(
     inputs: &[AgentInputs],
+    decisions: &[AuthorityDecision],
     quarantine_count: usize,
     operator_id: Option<IdentityId>,
     now: OffsetDateTime,
@@ -273,6 +321,25 @@ pub fn build_snapshot(
     events.sort_by_key(|e| std::cmp::Reverse(e.timestamp));
     events.truncate(MAX_RECENT_EVENTS);
 
+    // Join each decision's identity to a role name. The audit log keys on
+    // identity (role names are not stable across re-registration); the
+    // registry-derived inputs are the only place that mapping lives.
+    let name_by_id: std::collections::HashMap<IdentityId, &str> = inputs
+        .iter()
+        .map(|a| (a.identity_id, a.name.as_str()))
+        .collect();
+    let refusal_count = decisions
+        .iter()
+        .filter(|d| d.disposition == Disposition::Refuse)
+        .count();
+    let mut pending_decisions: Vec<PendingDecision> = decisions
+        .iter()
+        .filter(|d| d.disposition == Disposition::Refuse)
+        .filter_map(|d| build_pending_decision(d, &name_by_id))
+        .collect();
+    pending_decisions.sort_by_key(|d| std::cmp::Reverse(d.timestamp));
+    pending_decisions.truncate(MAX_PENDING_DECISIONS);
+
     PanopticonSnapshot {
         agents,
         recent_events: events,
@@ -284,6 +351,8 @@ pub fn build_snapshot(
         },
         total_cost_usd,
         session_elapsed,
+        pending_decisions,
+        refusal_count,
     }
 }
 
@@ -363,6 +432,29 @@ fn summarize_event(text: &str) -> String {
         .join(" \u{00B7} ")
 }
 
+/// Resolve a raw refusal into a pending-panel row, or `None` when it carries
+/// no timestamp (the panel sorts by time, so an undatable refusal cannot be
+/// placed — real audit entries always stamp `at`, so this drops only
+/// malformed lines). The agent label prefers the registry role name and falls
+/// back to the persona name when the `agent_id` is not in the current
+/// registry (e.g. a since-unregistered agent still in the log tail).
+fn build_pending_decision(
+    decision: &AuthorityDecision,
+    name_by_id: &std::collections::HashMap<IdentityId, &str>,
+) -> Option<PendingDecision> {
+    let timestamp = decision.timestamp?;
+    let agent_name = name_by_id
+        .get(&decision.agent_id)
+        .map(|name| (*name).to_owned())
+        .unwrap_or_else(|| decision.persona_name.clone());
+    Some(PendingDecision {
+        timestamp,
+        agent_name,
+        action: decision.action.clone(),
+        rationale: decision.rationale.clone().unwrap_or_default(),
+    })
+}
+
 // ── IO orchestrator ───────────────────────────────────────────────────────────
 
 /// Read a panopticon snapshot from the on-disk runtime data root.
@@ -390,7 +482,7 @@ pub fn read_snapshot(
     // stay renderable during transient outages or startup races. An empty
     // snapshot is the right "I don't know yet" presentation.
     let Ok(registry) = AgentRegistry::open(agent_registry_path.to_path_buf()) else {
-        return build_snapshot(&[], 0, operator_id, now);
+        return build_snapshot(&[], &[], 0, operator_id, now);
     };
 
     let mut inputs: Vec<AgentInputs> = Vec::new();
@@ -413,6 +505,7 @@ pub fn read_snapshot(
 
         inputs.push(AgentInputs {
             name: record.name.as_str().to_owned(),
+            identity_id: record.identity_id,
             persona_name: record.persona_name.clone(),
             status,
             is_running,
@@ -426,7 +519,11 @@ pub fn read_snapshot(
         quarantine_count += count_quarantine(&record.inbox_dir);
     }
 
-    build_snapshot(&inputs, quarantine_count, operator_id, now)
+    // One tail-read of the shared audit log per snapshot (the log is global,
+    // not per-agent), filtered to authority decisions by the reader.
+    let decisions = read_authority_decisions_tail(&audit_log_path(data_dir), AUDIT_TAIL_BYTES);
+
+    build_snapshot(&inputs, &decisions, quarantine_count, operator_id, now)
 }
 
 /// Read the status file's mtime as an approximate time-in-state anchor.
@@ -503,6 +600,7 @@ mod tests {
     ) -> AgentInputs {
         AgentInputs {
             name: name.to_owned(),
+            identity_id: IdentityId::new().unwrap(),
             persona_name: Some(name.to_owned()),
             status,
             is_running: running,
@@ -513,6 +611,104 @@ mod tests {
             state_changed_at: None,
             conversation_tail: Vec::new(),
         }
+    }
+
+    fn ts(secs: i64) -> OffsetDateTime {
+        OffsetDateTime::from_unix_timestamp(1_700_000_000 + secs).unwrap()
+    }
+
+    /// A refusal at `secs` past the fixture epoch. Persona/layer/rationale are
+    /// fixed; tests that need to vary them build the struct inline.
+    fn refusal(agent_id: IdentityId, action: &str, secs: i64) -> AuthorityDecision {
+        AuthorityDecision {
+            timestamp: Some(ts(secs)),
+            agent_id,
+            persona_name: "worker".to_owned(),
+            action: action.to_owned(),
+            disposition: Disposition::Refuse,
+            layer: Some("profile".to_owned()),
+            rationale: Some("refused".to_owned()),
+        }
+    }
+
+    // P_PENDING: build_snapshot keeps only refusals, resolves each one's
+    // agent_id to the registry role name, and orders the panel newest first.
+    #[test]
+    fn build_snapshot_surfaces_refusals_with_resolved_names() {
+        let now = now_at(1_700_100_000);
+        let worker_id = IdentityId::new().unwrap();
+        let mut worker = inputs("worker-abc", 100, true, 0.0);
+        worker.identity_id = worker_id;
+
+        let allow = AuthorityDecision {
+            disposition: Disposition::Allow,
+            layer: None,
+            rationale: None,
+            ..refusal(worker_id, "SendMessage(to=lead)", 3)
+        };
+        let decisions = vec![
+            refusal(worker_id, "SpawnAgent(persona=worker)", 2),
+            allow,
+            refusal(worker_id, "SendMessage(to=ops)", 5),
+        ];
+
+        let snap = build_snapshot(
+            &[inputs("lead", 0, true, 0.0), worker],
+            &decisions,
+            0,
+            None,
+            now,
+        );
+
+        assert_eq!(
+            snap.refusal_count, 2,
+            "the allow is excluded from the count"
+        );
+        assert_eq!(snap.pending_decisions.len(), 2);
+        // Newest first: ts(5) before ts(2).
+        assert_eq!(snap.pending_decisions[0].action, "SendMessage(to=ops)");
+        assert_eq!(
+            snap.pending_decisions[0].agent_name, "worker-abc",
+            "agent_id resolved to the registry role name"
+        );
+        assert_eq!(
+            snap.pending_decisions[1].action,
+            "SpawnAgent(persona=worker)"
+        );
+    }
+
+    // P_PENDING_FALLBACK: a refusal whose agent_id is not in the registry
+    // (a since-unregistered agent still in the log tail) falls back to its
+    // persona name rather than dropping out of the panel.
+    #[test]
+    fn build_snapshot_pending_decision_falls_back_to_persona() {
+        let now = now_at(1_700_100_000);
+        let stranger = IdentityId::new().unwrap();
+        let decisions = vec![AuthorityDecision {
+            persona_name: "ghost-persona".to_owned(),
+            ..refusal(stranger, "X()", 1)
+        }];
+
+        let snap = build_snapshot(&[], &decisions, 0, None, now);
+        assert_eq!(snap.pending_decisions.len(), 1);
+        assert_eq!(snap.pending_decisions[0].agent_name, "ghost-persona");
+    }
+
+    // P_PENDING_CAP: the panel caps displayed rows at MAX_PENDING_DECISIONS
+    // but the `▲ N` count reflects every refusal in the tail.
+    #[test]
+    fn build_snapshot_caps_pending_rows_but_counts_all_refusals() {
+        let now = now_at(1_700_100_000);
+        let id = IdentityId::new().unwrap();
+        let decisions: Vec<AuthorityDecision> = (0..8).map(|i| refusal(id, "X()", i)).collect();
+
+        let snap = build_snapshot(&[], &decisions, 0, None, now);
+        assert_eq!(snap.refusal_count, 8);
+        assert_eq!(
+            snap.pending_decisions.len(),
+            MAX_PENDING_DECISIONS,
+            "display capped even though all refusals are counted"
+        );
     }
 
     // P1: lead is pinned at row one; within running, Working sorts above
@@ -528,7 +724,7 @@ mod tests {
             inputs_with_status("lead", 30_000, true, 0.50, AgentStatus::Idle),
         ];
 
-        let snap = build_snapshot(&inputs, 0, None, now);
+        let snap = build_snapshot(&inputs, &[], 0, None, now);
 
         let order: Vec<&str> = snap.agents.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
@@ -548,7 +744,7 @@ mod tests {
             inputs_with_status("worker-old", 1_000, true, 0.20, AgentStatus::Working),
         ];
 
-        let snap = build_snapshot(&inputs, 0, None, now);
+        let snap = build_snapshot(&inputs, &[], 0, None, now);
         let order: Vec<&str> = snap.agents.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
             order,
@@ -568,7 +764,7 @@ mod tests {
             inputs("worker-b", 90_000, false, 0.05),
         ];
 
-        let snap = build_snapshot(&inputs, 0, None, now);
+        let snap = build_snapshot(&inputs, &[], 0, None, now);
         assert!((snap.total_cost_usd - 0.65).abs() < 1e-9);
         assert_eq!(
             snap.session_elapsed,
@@ -599,7 +795,7 @@ mod tests {
             },
         ];
 
-        let snap = build_snapshot(&[a, b], 0, None, now);
+        let snap = build_snapshot(&[a, b], &[], 0, None, now);
 
         let order: Vec<(&str, EventKind)> = snap
             .recent_events
@@ -643,7 +839,7 @@ mod tests {
             },
         ];
 
-        let snap = build_snapshot(&[worker], 0, Some(operator), now);
+        let snap = build_snapshot(&[worker], &[], 0, Some(operator), now);
 
         let attribution: Vec<(&str, &str)> = snap
             .recent_events
@@ -674,7 +870,7 @@ mod tests {
             sender_id: Some(op_id()),
         }];
 
-        let snap = build_snapshot(&[worker], 0, None, now);
+        let snap = build_snapshot(&[worker], &[], 0, None, now);
         assert_eq!(snap.recent_events.len(), 1);
         assert_eq!(
             snap.recent_events[0].source,
@@ -686,7 +882,7 @@ mod tests {
     #[test]
     fn build_snapshot_threads_quarantine_count() {
         let now = now_at(1_700_100_000);
-        let snap = build_snapshot(&[inputs("lead", 0, true, 0.0)], 7, None, now);
+        let snap = build_snapshot(&[inputs("lead", 0, true, 0.0)], &[], 7, None, now);
         assert_eq!(snap.queue_counts.quarantine, 7);
         assert_eq!(snap.queue_counts.memory, 0);
         assert_eq!(snap.queue_counts.config, 0);
@@ -701,7 +897,7 @@ mod tests {
         let changed = OffsetDateTime::from_unix_timestamp(1_700_099_988).unwrap();
         let mut row = inputs("lead", 0, true, 0.0);
         row.state_changed_at = Some(changed);
-        let snap = build_snapshot(&[row], 0, None, now);
+        let snap = build_snapshot(&[row], &[], 0, None, now);
         assert_eq!(snap.agents[0].state_changed_at, Some(changed));
     }
 

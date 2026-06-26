@@ -38,7 +38,7 @@ pub use agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentRegistryError, AgentStatus,
     ValidatedAgentName,
 };
-pub use audit::{AuditError, AuditEvent, AuditLog};
+pub use audit::{audit_log_path, AuditError, AuditEvent, AuditLog};
 pub use blacklist::{BlacklistError, BlacklistRegistry};
 pub use config::{
     install_defaults, load_persona_config, load_team_config, ConfigError, PersonaConfig,

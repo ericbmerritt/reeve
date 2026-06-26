@@ -72,6 +72,42 @@ fn short_id(id: IdentityId) -> String {
     s.split('-').next().unwrap_or(&s).to_owned()
 }
 
+// ── AuthorityDecision ───────────────────────────────────────────────────────
+
+/// Whether an authority check permitted or refused a tool invocation.
+///
+/// The TUI parses this from the audit log's `disposition` string rather than
+/// deserializing `reeve_runtime`'s write-side enum: the runtime's `AuditEvent`
+/// is intentionally `Serialize`-only, and the read side has no invariant to
+/// share — a string match is the same shape the conversation reader uses for
+/// its `type`/`kind` discriminators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Disposition {
+    Allow,
+    Refuse,
+}
+
+/// A single authority decision as the TUI surfaces it, parsed from one
+/// `authority.decision` entry in `<data_dir>/audit/log.jsonl`.
+///
+/// `agent_id` is the issuing agent's identity, not its role name — the audit
+/// log records identity (role names are not stable across re-registration).
+/// Callers that need a human-facing label join `agent_id` against the agent
+/// registry; see `panopticon::build_snapshot`.
+#[derive(Debug, Clone)]
+pub struct AuthorityDecision {
+    pub timestamp: Option<OffsetDateTime>,
+    pub agent_id: IdentityId,
+    pub persona_name: String,
+    pub action: String,
+    pub disposition: Disposition,
+    /// Enforcement layer that refused (`profile` | `blacklist` | `threshold`);
+    /// `None` on allow.
+    pub layer: Option<String>,
+    /// Operator-facing reason; `None` on allow.
+    pub rationale: Option<String>,
+}
+
 // ── AgentStatus ───────────────────────────────────────────────────────────────
 
 /// Observed runtime status of the lead agent.
@@ -286,6 +322,11 @@ pub struct AppState {
     /// True while the operator is typing a new value for a threshold field.
     /// The shared `input` buffer holds the current edit.
     pub inspect_model_editing: bool,
+    /// Authority decisions for the inspected agent, newest first, loaded from
+    /// the audit-log tail on every reload while the inspect screen is open.
+    /// Drives the Decisions tab. Empty when not inspecting or when the agent
+    /// has no recorded decisions in the tail window.
+    pub inspect_authority_decisions: Vec<AuthorityDecision>,
 }
 
 /// The four editable threshold fields in display order: label shown in the
@@ -364,6 +405,7 @@ impl Default for AppState {
             inspect_thresholds: reeve_runtime::capability::Thresholds::default(),
             inspect_model_field: 0,
             inspect_model_editing: false,
+            inspect_authority_decisions: Vec::new(),
         }
     }
 }

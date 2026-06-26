@@ -361,7 +361,7 @@ to `Stopped` with the named reason. Integration test for
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| 🟡 in-progress  | 2026-06-26 |            |
+| ✅ complete     | 2026-06-26 | 2026-06-26 |
 
 Tags: tui
 
