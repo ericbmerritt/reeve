@@ -35,12 +35,13 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use reeve_runtime::capability::{CapabilityProfile, Thresholds};
-use reeve_runtime::AgentDirs;
+use reeve_runtime::{audit_log_path, AgentDirs, AgentRegistry};
 
 use crate::panopticon::read_snapshot as read_panopticon_snapshot;
-use crate::reader::{read_conversation, read_cost, read_status};
+use crate::panopticon::AUDIT_TAIL_BYTES;
+use crate::reader::{read_authority_decisions_tail, read_conversation, read_cost, read_status};
 use crate::session::{self, Session};
-use crate::state::{AppState, InspectTab, Screen};
+use crate::state::{AppState, AuthorityDecision, InspectTab, Screen};
 use crate::submit::submit_message;
 use crate::watcher::watch_tree;
 
@@ -156,7 +157,7 @@ fn initial_screen_for_session(session: &Session, agent_registry_path: &Path) -> 
     let Some(name) = session.last_agent.as_deref() else {
         return Screen::Panopticon;
     };
-    let Ok(registry) = reeve_runtime::AgentRegistry::open(agent_registry_path.to_path_buf()) else {
+    let Ok(registry) = AgentRegistry::open(agent_registry_path.to_path_buf()) else {
         return Screen::Panopticon;
     };
     match registry.lookup(name) {
@@ -220,6 +221,8 @@ fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Pat
             }
         }
     }
+    state.inspect_authority_decisions =
+        load_inspect_decisions(state, data_dir, agent_registry_path);
     state.panopticon = read_panopticon_snapshot(data_dir, agent_registry_path, state.operator_id);
     // The quarantine snapshot is rebuilt on every reload so the
     // panopticon's queue count and the review screen's entry list stay
@@ -237,6 +240,42 @@ fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Pat
     } else if state.quarantine_focus >= entry_count {
         state.quarantine_focus = entry_count - 1;
     }
+}
+
+/// Load the inspected agent's authority decisions, newest first, from the
+/// audit-log tail.
+///
+/// Returns empty unless the inspect screen is open with a resolvable target:
+/// the Decisions tab is the only consumer, so every other screen skips the
+/// audit read entirely rather than paying it on every watcher tick. The
+/// audit log keys decisions on identity, so the agent's `identity_id` is
+/// looked up from the registry by role name and used as the filter; the
+/// chronological tail is reversed because the tab renders newest first.
+fn load_inspect_decisions(
+    state: &AppState,
+    data_dir: &Path,
+    agent_registry_path: &Path,
+) -> Vec<AuthorityDecision> {
+    if state.screen != Screen::Inspect {
+        return Vec::new();
+    }
+    let Some(name) = state.inspect_agent_name.as_deref() else {
+        return Vec::new();
+    };
+    let Ok(registry) = AgentRegistry::open(agent_registry_path.to_path_buf()) else {
+        return Vec::new();
+    };
+    let Some(record) = registry.lookup(name) else {
+        return Vec::new();
+    };
+    let agent_id = record.identity_id;
+    let mut decisions: Vec<AuthorityDecision> =
+        read_authority_decisions_tail(&audit_log_path(data_dir), AUDIT_TAIL_BYTES)
+            .into_iter()
+            .filter(|decision| decision.agent_id == agent_id)
+            .collect();
+    decisions.reverse();
+    decisions
 }
 
 /// Resolve the agent whose disk state should populate the per-agent
@@ -638,9 +677,7 @@ fn handle_key_panopticon(
         (KeyCode::Char('d'), KeyModifiers::NONE) => {
             if let Some(agent) = state.panopticon.agents.get(state.panopticon_focus) {
                 if agent.name != "lead" {
-                    if let Ok(mut reg) =
-                        reeve_runtime::AgentRegistry::open(agent_registry_path.to_path_buf())
-                    {
+                    if let Ok(mut reg) = AgentRegistry::open(agent_registry_path.to_path_buf()) {
                         let _ = reg.remove(&agent.name);
                     }
                 }
@@ -1177,6 +1214,8 @@ mod tests {
             queue_counts: crate::panopticon::QueueCounts::default(),
             total_cost_usd: 0.0,
             session_elapsed: Some(Duration::seconds(0)),
+            pending_decisions: Vec::new(),
+            refusal_count: 0,
         };
         state
     }

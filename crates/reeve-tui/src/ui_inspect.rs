@@ -21,8 +21,8 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::state::{AgentStatus, AppState, InspectTab};
-use crate::ui_common::no_color;
+use crate::state::{AgentStatus, AppState, AuthorityDecision, Disposition, InspectTab};
+use crate::ui_common::{format_time_hhmm_opt, no_color, pad_right, truncate};
 
 /// Render the inspect screen into `frame`.
 pub fn draw(frame: &mut Frame<'_>, state: &AppState) {
@@ -160,16 +160,15 @@ fn build_separator_line(width: u16) -> Line<'static> {
     Line::from("\u{2500}".repeat(usize::from(width)))
 }
 
-/// Body content for the active tab. The Thread tab renders the
-/// conversation journal; the other four render a "not yet available"
-/// placeholder so the layout is the same shape regardless of which tab
-/// the operator landed on.
+/// Body content for the active tab. Thread, Model, and Decisions render real
+/// content; Tools and Memory remain "not yet available" placeholders so the
+/// layout keeps the same shape regardless of which tab the operator landed on.
 fn build_body(state: &AppState, width: u16) -> Vec<Line<'static>> {
     match state.inspect_tab {
         InspectTab::Thread => build_thread_body(state, width),
         InspectTab::Tools => stub_body("Tools"),
         InspectTab::Model => build_model_body(state),
-        InspectTab::Decisions => stub_body("Decisions"),
+        InspectTab::Decisions => build_decisions_body(state, width),
         InspectTab::Memory => stub_body("Memory"),
     }
 }
@@ -185,7 +184,7 @@ fn build_thread_body(state: &AppState, width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for entry in &state.conversation {
         let label = entry.speaker_label(&state.persona_name, state.operator_id);
-        let ts = crate::ui_common::format_time_hhmm_opt(entry.timestamp);
+        let ts = format_time_hhmm_opt(entry.timestamp);
         let speaker_text = if ts.is_empty() {
             label
         } else {
@@ -334,6 +333,67 @@ fn build_model_body(state: &AppState) -> Vec<Line<'static>> {
     lines
 }
 
+/// Decisions tab body: the inspected agent's authority decisions, newest
+/// first (the reload orders them). Refusals carry the attention colour (red,
+/// or bold under `NO_COLOR`); allows are dim, since a permitted call is the
+/// routine, non-actionable case.
+fn build_decisions_body(state: &AppState, width: u16) -> Vec<Line<'static>> {
+    let dim = if no_color() {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    if state.inspect_authority_decisions.is_empty() {
+        return vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "  no authority decisions recorded yet".to_owned(),
+                dim,
+            )),
+        ];
+    }
+    state
+        .inspect_authority_decisions
+        .iter()
+        .map(|decision| build_decision_row(decision, width))
+        .collect()
+}
+
+/// Build one Decisions-tab row: `HH:MM  action  disposition  layer  rationale`.
+/// The rationale is truncated to the remaining width so each decision stays on
+/// one line.
+fn build_decision_row(decision: &AuthorityDecision, width: u16) -> Line<'static> {
+    const ACTION_COL: usize = 28;
+    const DISP_COL: usize = 7;
+    const LAYER_COL: usize = 10;
+
+    let time = pad_right(&format_time_hhmm_opt(decision.timestamp), 5);
+    let disposition = match decision.disposition {
+        Disposition::Allow => "allow",
+        Disposition::Refuse => "refuse",
+    };
+    // En-dash stands in for the absent layer/rationale on an allow.
+    let layer = decision.layer.as_deref().unwrap_or("\u{2013}");
+    let rationale = decision.rationale.as_deref().unwrap_or("");
+
+    let prefix = format!(
+        "  {time}  {}  {}  {}  ",
+        pad_right(&decision.action, ACTION_COL),
+        pad_right(disposition, DISP_COL),
+        pad_right(layer, LAYER_COL),
+    );
+    let rationale_budget = usize::from(width).saturating_sub(prefix.chars().count());
+    let row = format!("{prefix}{}", truncate(rationale, rationale_budget));
+
+    let style = match decision.disposition {
+        Disposition::Refuse if !no_color() => Style::default().fg(Color::Red),
+        Disposition::Refuse => Style::default().add_modifier(Modifier::BOLD),
+        Disposition::Allow if !no_color() => Style::default().add_modifier(Modifier::DIM),
+        Disposition::Allow => Style::default(),
+    };
+    Line::from(Span::styled(row, style))
+}
+
 /// Placeholder body for stub tabs. The operator should know what they're
 /// looking at and that the absence of data is by design, not a bug.
 fn stub_body(tab_name: &str) -> Vec<Line<'static>> {
@@ -415,6 +475,7 @@ mod tests {
     use crate::state::{AgentStatus, AppState, ConversationEntry, EntryKind, Screen};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+    use time::OffsetDateTime;
 
     fn state_for_inspect(name: &str) -> AppState {
         let mut state = AppState::default();
@@ -559,5 +620,63 @@ mod tests {
         assert!(rendered.contains("THREAD"), "tab bar missing");
         assert!(rendered.contains("h back"), "footer missing");
         assert!(rendered.contains("worker-x"), "title bar missing");
+    }
+
+    // I7: the Decisions tab renders one row per decision showing action,
+    // disposition, layer, and rationale; allows and refuses both appear.
+    #[test]
+    fn decisions_tab_renders_rows_with_columns() {
+        let mut state = state_for_inspect("worker-2e28aff5");
+        state.inspect_tab = InspectTab::Decisions;
+        let now = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
+        state.inspect_authority_decisions = vec![
+            AuthorityDecision {
+                timestamp: Some(now),
+                agent_id: reeve_types::IdentityId::new().unwrap(),
+                persona_name: "worker".to_owned(),
+                action: "SpawnAgent(persona=worker)".to_owned(),
+                disposition: Disposition::Refuse,
+                layer: Some("profile".to_owned()),
+                rationale: Some("spawn_agents disabled".to_owned()),
+            },
+            AuthorityDecision {
+                timestamp: Some(now),
+                agent_id: reeve_types::IdentityId::new().unwrap(),
+                persona_name: "worker".to_owned(),
+                action: "SendMessage(to=lead)".to_owned(),
+                disposition: Disposition::Allow,
+                layer: None,
+                rationale: None,
+            },
+        ];
+        let rendered = render(&state, 120, 12);
+        assert!(
+            rendered.contains("SpawnAgent(persona=worker)"),
+            "refuse action missing: {rendered}"
+        );
+        assert!(rendered.contains("refuse"), "refuse disposition missing");
+        assert!(rendered.contains("profile"), "refusal layer missing");
+        assert!(
+            rendered.contains("spawn_agents disabled"),
+            "rationale missing: {rendered}"
+        );
+        assert!(
+            rendered.contains("SendMessage(to=lead)"),
+            "allow action missing"
+        );
+        assert!(rendered.contains("allow"), "allow disposition missing");
+    }
+
+    // I8: the Decisions tab shows an empty-state line when the inspected
+    // agent has no recorded decisions in the tail.
+    #[test]
+    fn decisions_tab_renders_empty_state() {
+        let mut state = state_for_inspect("worker-x");
+        state.inspect_tab = InspectTab::Decisions;
+        let rendered = render(&state, 100, 10);
+        assert!(
+            rendered.contains("no authority decisions"),
+            "empty-state line missing: {rendered}"
+        );
     }
 }

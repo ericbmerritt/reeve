@@ -274,6 +274,18 @@ impl AuditError {
     }
 }
 
+/// Filesystem path to the audit log for a given data root:
+/// `<data_dir>/audit/log.jsonl`.
+///
+/// Exposed so out-of-process readers (the TUI tails this file to surface
+/// authority decisions) can locate the log without duplicating the
+/// `audit/log.jsonl` layout, which would silently drift if the layout
+/// constants here ever change.
+#[must_use]
+pub fn audit_log_path(data_dir: &Path) -> PathBuf {
+    data_dir.join(AUDIT_DIR_NAME).join(AUDIT_LOG_NAME)
+}
+
 /// Append-only audit log backed by a single file handle opened in `O_APPEND`
 /// mode. Concurrent callers within the same process are serialized by
 /// `Mutex<File>`; concurrent callers from different processes rely on POSIX
@@ -300,9 +312,10 @@ impl AuditLog {
     /// fixed. The log file is created with mode `0o600` on Unix if it does
     /// not already exist, then opened in append mode.
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self, AuditError> {
-        let audit_dir = data_dir.into().join(AUDIT_DIR_NAME);
+        let data_dir = data_dir.into();
+        let audit_dir = data_dir.join(AUDIT_DIR_NAME);
         ensure_directory(&audit_dir, AUDIT_DIR_MODE).map_err(AuditError::from_fs)?;
-        let path = audit_dir.join(AUDIT_LOG_NAME);
+        let path = audit_log_path(&data_dir);
         let file = open_log_file(&path)?;
         Ok(Self {
             path,

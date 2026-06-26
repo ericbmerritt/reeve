@@ -33,7 +33,7 @@ use ratatui::Terminal;
 use time::{Duration, OffsetDateTime};
 
 use reeve_tui::panopticon::{
-    AgentRow, EventKind, PanopticonSnapshot, QueueCounts, RecentEvent, Source,
+    AgentRow, EventKind, PanopticonSnapshot, PendingDecision, QueueCounts, RecentEvent, Source,
 };
 use reeve_tui::state::{AgentStatus, AppState, ConversationEntry, EntryKind, Screen};
 
@@ -182,5 +182,20 @@ fn sample_panopticon(now: OffsetDateTime) -> PanopticonSnapshot {
         },
         total_cost_usd: 0.40,
         session_elapsed: Some(Duration::seconds(7440)),
+        pending_decisions: vec![
+            PendingDecision {
+                timestamp: now - Duration::seconds(30),
+                agent_name: "worker-2e28aff5".to_owned(),
+                action: "SpawnAgent(persona=worker)".to_owned(),
+                rationale: "spawn_agents not enabled for worker profile".to_owned(),
+            },
+            PendingDecision {
+                timestamp: now - Duration::seconds(95),
+                agent_name: "worker-2e28aff5".to_owned(),
+                action: "SendMessage(to=ops)".to_owned(),
+                rationale: "blacklisted: SendMessage(to=ops)".to_owned(),
+            },
+        ],
+        refusal_count: 2,
     }
 }

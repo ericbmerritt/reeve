@@ -13,7 +13,7 @@ use std::path::Path;
 use serde_json::Value;
 use time::OffsetDateTime;
 
-use crate::state::{AgentStatus, ConversationEntry, EntryKind};
+use crate::state::{AgentStatus, AuthorityDecision, ConversationEntry, Disposition, EntryKind};
 
 // ── read_status ───────────────────────────────────────────────────────────────
 
@@ -80,39 +80,44 @@ pub fn read_conversation(conv_path: &Path) -> Vec<ConversationEntry> {
 /// filesystem hiccups.
 #[must_use]
 pub fn read_conversation_tail(conv_path: &Path, tail_bytes: u64) -> Vec<ConversationEntry> {
-    use std::io::{Read as _, Seek as _, SeekFrom};
-
-    let Ok(mut file) = std::fs::File::open(conv_path) else {
+    let Some(text) = read_tail_text(conv_path, tail_bytes) else {
         return Vec::new();
     };
-    let Ok(metadata) = file.metadata() else {
-        return Vec::new();
-    };
-    let len = metadata.len();
-    let offset = len.saturating_sub(tail_bytes);
-    if file.seek(SeekFrom::Start(offset)).is_err() {
-        return Vec::new();
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(tail_bytes.min(len)).unwrap_or(0));
-    if file.read_to_end(&mut bytes).is_err() {
-        return Vec::new();
-    }
-
-    // Drop the first (possibly partial) line when we did not start at the
-    // beginning of the file. If the file fit entirely in `tail_bytes`, the
-    // first line is complete and stays.
-    let slice: &[u8] = if offset == 0 {
-        &bytes
-    } else {
-        match bytes.iter().position(|b| *b == b'\n') {
-            Some(i) => &bytes[i + 1..],
-            None => return Vec::new(), // no complete line in the window
-        }
-    };
-    let text = String::from_utf8_lossy(slice);
     text.lines()
         .filter_map(|line| parse_conversation_line(line.trim()))
         .collect()
+}
+
+/// Read at most the last `tail_bytes` of `path` and return the text of the
+/// complete lines it contains.
+///
+/// When the window starts mid-file (a non-zero seek), the first — likely
+/// partial — line is dropped so callers only ever parse whole lines. When the
+/// file fits entirely in `tail_bytes`, every line is returned.
+///
+/// Returns `None` on any file-open/read error, and when the window contains no
+/// complete line — i.e. after dropping the partial first line nothing remains
+/// (no newline follows it, as when a single line is longer than the window).
+/// Both collapse to the empty-result contract every reader in this module
+/// honours, so the screen stays renderable during startup races and transient
+/// filesystem hiccups.
+fn read_tail_text(path: &Path, tail_bytes: u64) -> Option<String> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok()?.len();
+    let offset = len.saturating_sub(tail_bytes);
+    file.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::with_capacity(usize::try_from(tail_bytes.min(len)).unwrap_or(0));
+    file.read_to_end(&mut bytes).ok()?;
+
+    let slice: &[u8] = if offset == 0 {
+        &bytes
+    } else {
+        let newline = bytes.iter().position(|b| *b == b'\n')?;
+        &bytes[newline + 1..]
+    };
+    Some(String::from_utf8_lossy(slice).into_owned())
 }
 
 /// Parse one JSONL line into a [`ConversationEntry`], returning `None` to skip.
@@ -188,13 +193,93 @@ fn parse_sender_id(value: &Value) -> Option<reeve_types::IdentityId> {
     serde_json::from_value(raw.clone()).ok()
 }
 
-/// Extract `timestamp_utc` as an [`OffsetDateTime`] from a JSON entry.
+/// Extract `timestamp_utc` as an [`OffsetDateTime`] from a conversation entry.
+fn parse_timestamp(value: &Value) -> Option<OffsetDateTime> {
+    parse_rfc3339_field(value, "timestamp_utc")
+}
+
+/// Extract an RFC 3339 timestamp from `field` of a JSON object.
 ///
 /// Returns `None` when the field is absent, not a string, or not a valid
-/// RFC 3339 timestamp.
-fn parse_timestamp(value: &Value) -> Option<OffsetDateTime> {
-    let s = value.get("timestamp_utc")?.as_str()?;
+/// RFC 3339 timestamp. Shared by the conversation reader (`timestamp_utc`)
+/// and the audit reader (`at`), which name the same concept differently.
+fn parse_rfc3339_field(value: &Value, field: &str) -> Option<OffsetDateTime> {
+    let s = value.get(field)?.as_str()?;
     OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+}
+
+// ── read_authority_decisions ───────────────────────────────────────────────────
+
+/// Read at most the last `tail_bytes` of the audit log and parse the
+/// `authority.decision` entries found there, in file (chronological) order.
+///
+/// The audit log interleaves every event kind (`identity.*`, `transport.*`,
+/// `authority.decision`, …); this filters to authority decisions only. A
+/// 64 KiB tail holds on the order of 500 decisions — the same order of
+/// magnitude as [`read_conversation_tail`]'s window — so the Decisions tab
+/// and the panopticon's pending panel stay O(1) per tick regardless of how
+/// long the log grows.
+///
+/// File-open or read errors return an empty `Vec`, matching the safe-default
+/// contract of every other reader in this module.
+#[must_use]
+pub fn read_authority_decisions_tail(audit_path: &Path, tail_bytes: u64) -> Vec<AuthorityDecision> {
+    let Some(text) = read_tail_text(audit_path, tail_bytes) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| parse_authority_decision_line(line.trim()))
+        .collect()
+}
+
+/// Parse one JSONL line into an [`AuthorityDecision`], returning `None` to
+/// skip lines that are empty, unparseable, a non-`authority.decision` event,
+/// or missing a required field (`agent_id`, `disposition`).
+fn parse_authority_decision_line(line: &str) -> Option<AuthorityDecision> {
+    if line.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(line).ok()?;
+    if value.get("kind")?.as_str()? != "authority.decision" {
+        return None;
+    }
+    // Deserialize through `IdentityId`'s own impl so the UUIDv7 invariant is
+    // shared with the writer; a malformed id drops the row rather than
+    // surfacing a bogus decision.
+    let agent_id: reeve_types::IdentityId =
+        serde_json::from_value(value.get("agent_id")?.clone()).ok()?;
+    let disposition = match value.get("disposition")?.as_str()? {
+        "allow" => Disposition::Allow,
+        "refuse" => Disposition::Refuse,
+        _ => return None,
+    };
+    let persona_name = value
+        .get("persona_name")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let action = value
+        .get("action")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let layer = value
+        .get("layer")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let rationale = value
+        .get("rationale")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some(AuthorityDecision {
+        timestamp: parse_rfc3339_field(&value, "at"),
+        agent_id,
+        persona_name,
+        action,
+        disposition,
+        layer,
+        rationale,
+    })
 }
 
 // ── read_cost ─────────────────────────────────────────────────────────────────
@@ -492,5 +577,78 @@ mod tests {
         let path = tmp.path().join("does_not_exist.jsonl");
         let entries = read_conversation_tail(&path, 8192);
         assert!(entries.is_empty());
+    }
+
+    // R18: the audit reader extracts only `authority.decision` entries from a
+    // log that interleaves other kinds, and maps allow/refuse plus the
+    // refuse-only `layer`/`rationale` fields.
+    #[test]
+    fn read_authority_decisions_extracts_only_authority_entries() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        let agent = reeve_types::IdentityId::new().unwrap();
+        let jsonl = format!(
+            concat!(
+                r#"{{"kind":"transport.delivered","at":"2024-01-01T00:00:00Z"}}"#,
+                "\n",
+                r#"{{"kind":"authority.decision","agent_id":"{id}","persona_name":"worker","profile_version":1,"action":"SpawnAgent(persona=worker)","disposition":"refuse","layer":"profile","rationale":"spawn_agents disabled","blacklist_version":null,"at":"2024-01-01T00:00:01Z"}}"#,
+                "\n",
+                r#"{{"kind":"authority.decision","agent_id":"{id}","persona_name":"worker","profile_version":1,"action":"SendMessage(to=lead)","disposition":"allow","blacklist_version":null,"at":"2024-01-01T00:00:02Z"}}"#,
+                "\n",
+            ),
+            id = agent,
+        );
+        fs::write(&path, jsonl).unwrap();
+
+        let decisions = read_authority_decisions_tail(&path, 64 * 1024);
+        assert_eq!(decisions.len(), 2, "only authority.decision entries kept");
+
+        assert_eq!(decisions[0].disposition, Disposition::Refuse);
+        assert_eq!(decisions[0].agent_id, agent);
+        assert_eq!(decisions[0].action, "SpawnAgent(persona=worker)");
+        assert_eq!(decisions[0].layer.as_deref(), Some("profile"));
+        assert_eq!(
+            decisions[0].rationale.as_deref(),
+            Some("spawn_agents disabled")
+        );
+
+        assert_eq!(decisions[1].disposition, Disposition::Allow);
+        assert!(decisions[1].layer.is_none(), "allow carries no layer");
+        assert!(
+            decisions[1].rationale.is_none(),
+            "allow carries no rationale"
+        );
+    }
+
+    // R19: a missing audit log returns empty (safe-default contract).
+    #[test]
+    fn read_authority_decisions_missing_file_returns_empty() {
+        let tmp = tempdir().unwrap();
+        let decisions = read_authority_decisions_tail(&tmp.path().join("nope.jsonl"), 8192);
+        assert!(decisions.is_empty());
+    }
+
+    // R20: non-JSON lines and entries with an unparseable `agent_id` are
+    // dropped without poisoning the well-formed entries around them.
+    #[test]
+    fn read_authority_decisions_skips_malformed_lines() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        let agent = reeve_types::IdentityId::new().unwrap();
+        let jsonl = format!(
+            concat!(
+                "not json\n",
+                r#"{{"kind":"authority.decision","agent_id":"not-a-uuid","disposition":"refuse","at":"2024-01-01T00:00:01Z"}}"#,
+                "\n",
+                r#"{{"kind":"authority.decision","agent_id":"{id}","persona_name":"w","profile_version":1,"action":"X","disposition":"refuse","layer":"blacklist","rationale":"r","blacklist_version":null,"at":"2024-01-01T00:00:02Z"}}"#,
+                "\n",
+            ),
+            id = agent,
+        );
+        fs::write(&path, jsonl).unwrap();
+
+        let decisions = read_authority_decisions_tail(&path, 64 * 1024);
+        assert_eq!(decisions.len(), 1, "malformed id and non-json dropped");
+        assert_eq!(decisions[0].agent_id, agent);
     }
 }
