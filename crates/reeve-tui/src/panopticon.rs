@@ -982,6 +982,7 @@ mod tests {
                     persona_name: Some(name.to_owned()),
                     spawned_at: OffsetDateTime::now_utc(),
                     status: RuntimeAgentStatus::Running,
+                    stopped_reason: None,
                 })
                 .unwrap();
         }

@@ -436,7 +436,7 @@ a 50-entry fixture and verify columns/styling.
 
 | Status         | Started    | Completed  |
 | -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| ✅ complete     | 2026-06-27 | 2026-06-27 |
 
 Tags: runtime, security, lifecycle
 

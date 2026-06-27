@@ -1506,6 +1506,7 @@ mod tests {
             adapter_id: String::from("mock@test"),
             agent_id: String::new(),
             system_prompt: String::new(),
+            system_prompt_source: None,
         }
     }
 
@@ -3050,6 +3051,8 @@ mod tests {
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
                 None,
+                IdentityId::new().unwrap(),
+                crate::config::DEFAULT_MAX_SYSTEM_PROMPT_BYTES,
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
@@ -3213,6 +3216,8 @@ mod tests {
                 null_inbox.recipient(),
                 null_dispatcher.recipient(),
                 None,
+                IdentityId::new().unwrap(),
+                crate::config::DEFAULT_MAX_SYSTEM_PROMPT_BYTES,
             );
             let coord_addr = Supervisor::start(move |_| spawn_coordinator);
 
@@ -4477,6 +4482,7 @@ mod tests {
                 persona_name: Some("lead".to_owned()),
                 spawned_at: time::OffsetDateTime::now_utc(),
                 status: crate::agent_registry::AgentStatus::Running,
+                stopped_reason: None,
             })
             .unwrap();
         }

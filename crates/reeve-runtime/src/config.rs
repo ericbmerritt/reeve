@@ -160,6 +160,10 @@ pub struct TeamMember {
     pub role_label: String,
 }
 
+/// Default cap, in bytes, on the caller-supplied `system_prompt` of a
+/// `spawn_agent` invocation when the team config does not set one.
+pub const DEFAULT_MAX_SYSTEM_PROMPT_BYTES: usize = 8 * 1024;
+
 /// Team configuration loaded from TOML.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TeamConfig {
@@ -171,6 +175,21 @@ pub struct TeamConfig {
     pub lead_role: String,
     /// Ordered list of persona instantiations that make up this team.
     pub members: Vec<TeamMember>,
+    /// Cap, in bytes, on the caller-supplied `system_prompt` a `spawn_agent`
+    /// invocation may pass. `None` falls back to
+    /// [`DEFAULT_MAX_SYSTEM_PROMPT_BYTES`]. The spawn boundary is team-level,
+    /// so the cap lives here rather than on the persona.
+    #[serde(default)]
+    pub max_system_prompt_bytes: Option<usize>,
+}
+
+impl TeamConfig {
+    /// Resolved system-prompt byte cap: the configured value or the default.
+    #[must_use]
+    pub fn max_system_prompt_bytes(&self) -> usize {
+        self.max_system_prompt_bytes
+            .unwrap_or(DEFAULT_MAX_SYSTEM_PROMPT_BYTES)
+    }
 }
 
 // ── Public loaders ────────────────────────────────────────────────────────────
@@ -503,6 +522,38 @@ role_label = "reviewer"
         assert_eq!(cfg.members[0].persona_name, "architect");
         assert_eq!(cfg.members[1].count, 2);
         assert_eq!(cfg.members[1].role_label, "reviewer");
+        // Unset cap falls back to the default.
+        assert_eq!(cfg.max_system_prompt_bytes, None);
+        assert_eq!(
+            cfg.max_system_prompt_bytes(),
+            DEFAULT_MAX_SYSTEM_PROMPT_BYTES
+        );
+    }
+
+    // C-cap: an explicit max_system_prompt_bytes in the team config overrides
+    // the default.
+    #[test]
+    fn team_config_max_system_prompt_bytes_override() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("team.toml");
+        write_str(
+            &path,
+            r#"
+name = "core"
+version = 1
+lead_role = "lead"
+max_system_prompt_bytes = 256
+
+[[members]]
+persona_name = "lead"
+persona_version = 1
+count = 1
+role_label = "lead"
+"#,
+        );
+        let cfg = load_team_config(&path).unwrap();
+        assert_eq!(cfg.max_system_prompt_bytes, Some(256));
+        assert_eq!(cfg.max_system_prompt_bytes(), 256);
     }
 
     // C5: load_persona_config returns ConfigError::Io when the file is absent.

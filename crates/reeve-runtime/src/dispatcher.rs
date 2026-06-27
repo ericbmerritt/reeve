@@ -519,6 +519,7 @@ mod tests {
             persona_name: None,
             spawned_at: OffsetDateTime::now_utc(),
             status: AgentStatus::Running,
+            stopped_reason: None,
         };
         agent_registry.register(sender_record).unwrap();
 
@@ -549,6 +550,7 @@ mod tests {
             persona_name: None,
             spawned_at: OffsetDateTime::now_utc(),
             status: AgentStatus::Running,
+            stopped_reason: None,
         };
         agent_registry.register(recipient_record).unwrap();
 
@@ -692,6 +694,7 @@ mod tests {
                 persona_name: None,
                 spawned_at: OffsetDateTime::now_utc(),
                 status: AgentStatus::Running,
+                stopped_reason: None,
             })
             .unwrap();
         let _ = agent_registry; // dispatcher re-opens from disk
@@ -1045,6 +1048,7 @@ mod tests {
             persona_name: None,
             spawned_at: OffsetDateTime::now_utc(),
             status: AgentStatus::Running,
+            stopped_reason: None,
         };
         agent_registry.register(orphan_record).unwrap();
 
@@ -1179,6 +1183,7 @@ mod tests {
             persona_name: None,
             spawned_at: OffsetDateTime::now_utc(),
             status: AgentStatus::Running,
+            stopped_reason: None,
         };
         agent_registry.register(revoked_record).unwrap();
 
