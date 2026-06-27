@@ -181,6 +181,7 @@ mod tests {
                 persona_name: Some("worker".to_owned()),
                 spawned_at: OffsetDateTime::now_utc(),
                 status: AgentStatus::Running,
+                stopped_reason: None,
             })
             .unwrap();
 

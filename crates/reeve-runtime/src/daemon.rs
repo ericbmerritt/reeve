@@ -25,7 +25,7 @@ use crate::agent_registry::{
 };
 use crate::audit::AuditLog;
 use crate::blacklist::BlacklistRegistry;
-use crate::capability::load_capability_profile;
+use crate::capability::{load_capability_profile, write_capability_profile, ProfileError};
 use crate::config::{install_defaults, load_persona_config, load_team_config};
 use crate::dispatcher::{MessageDispatcher, SendMessage};
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
@@ -611,6 +611,11 @@ struct AgentStartup {
     watcher: Arc<Watcher>,
     data_dir: PathBuf,
     identity_registry: Arc<IdentityRegistry>,
+    /// The operator's identity, threaded to the spawn coordinator so it can
+    /// distinguish operator-sourced from peer-sourced spawns.
+    operator_id: reeve_types::IdentityId,
+    /// Team-config byte cap on caller-supplied `system_prompt` at spawn.
+    max_system_prompt_bytes: usize,
 }
 
 /// Fallible preparation: load configs, provision directories, resolve the
@@ -685,6 +690,31 @@ fn prepare_agent_startup(
             source: Box::new(e),
         })?;
 
+    // The operator identity anchors both a bootstrapped lead's `created_by`
+    // and the lead's system-prompt provenance. Resolve it once up front so it
+    // is available whether the lead is reused or freshly bootstrapped. The
+    // reeve-cli first-run flow refuses to start the daemon without an enrolled
+    // operator, so a miss here means the identity registry was tampered with
+    // between enrollment and daemon start.
+    let operator_id = {
+        let all_identities = identity_registry
+            .list()
+            .map_err(|e| DaemonError::Resource {
+                component: "identity registry list",
+                source: Box::new(e),
+            })?;
+        all_identities
+            .iter()
+            .find(|s| s.identity().identity_type == reeve_types::IdentityType::Operator)
+            .map(|s| s.identity().identity_id)
+            .ok_or_else(|| DaemonError::Resource {
+                component: "operator lookup",
+                source: Box::<dyn std::error::Error + Send + Sync>::from(
+                    "no operator identity enrolled; run `reeve identity enroll` before starting the daemon",
+                ),
+            })?
+    };
+
     let agent_id = if let Some(record) = agent_registry.lookup("lead") {
         let id = record.identity_id;
         agent_registry
@@ -736,28 +766,7 @@ fn prepare_agent_startup(
         debug!(agent_id = %id, "reusing existing lead identity");
         id
     } else {
-        // Bootstrap: lead agent record does not exist yet. The reeve-cli
-        // first-run flow refuses to start the daemon without an enrolled
-        // operator, so the operator lookup below is expected to succeed; a
-        // missing operator here means the on-disk identity registry was
-        // tampered with between enrollment and daemon start.
-        let all_identities = identity_registry
-            .list()
-            .map_err(|e| DaemonError::Resource {
-                component: "identity registry list",
-                source: Box::new(e),
-            })?;
-        let operator_id = all_identities
-            .iter()
-            .find(|s| s.identity().identity_type == reeve_types::IdentityType::Operator)
-            .map(|s| s.identity().identity_id)
-            .ok_or_else(|| DaemonError::Resource {
-                component: "operator lookup",
-                source: Box::<dyn std::error::Error + Send + Sync>::from(
-                    "no operator identity enrolled; run `reeve identity enroll` before starting the daemon",
-                ),
-            })?;
-
+        // Bootstrap: lead agent record does not exist yet.
         let identity =
             reeve_types::Identity::new_agent(lead_member.persona_name.clone(), operator_id)
                 .map_err(|e| DaemonError::Resource {
@@ -795,6 +804,7 @@ fn prepare_agent_startup(
                 persona_name: Some(lead_member.persona_name.clone()),
                 spawned_at: time::OffsetDateTime::now_utc(),
                 status: AgentStatus::Running,
+                stopped_reason: None,
             })
             .map_err(|e| DaemonError::Resource {
                 component: "agent registry register",
@@ -807,12 +817,15 @@ fn prepare_agent_startup(
     // 7. Resolve the model adapter against this persona's preferences.
     let adapter_refs: Vec<&dyn reeve_adapter::Adapter> =
         adapters.iter().map(std::ops::Deref::deref).collect();
-    let snapshot = resolve_model(&persona_config, &adapter_refs, agent_id).map_err(|e| {
+    let mut snapshot = resolve_model(&persona_config, &adapter_refs, agent_id).map_err(|e| {
         DaemonError::Resource {
             component: "model resolution",
             source: Box::new(e),
         }
     })?;
+    // The lead is a cold spawn: its system prompt is the operator-authored
+    // persona base, so the operator is its prompt source (trusted).
+    snapshot.system_prompt_source = Some(operator_id);
     debug!(adapter_id = %snapshot.adapter_id, "resolved adapter");
     let adapter = adapters
         .iter()
@@ -849,6 +862,8 @@ fn prepare_agent_startup(
         watcher,
         data_dir: data_dir.to_path_buf(),
         identity_registry: Arc::clone(identity_registry),
+        operator_id,
+        max_system_prompt_bytes: team.max_system_prompt_bytes(),
     })
 }
 
@@ -881,6 +896,8 @@ fn launch_actors(
         watcher,
         data_dir,
         identity_registry,
+        operator_id,
+        max_system_prompt_bytes,
     } = startup;
 
     // HeartbeatActor: touches the heartbeat file every second.
@@ -961,6 +978,8 @@ fn launch_actors(
         watcher_addr.clone().recipient(),
         dispatcher_addr.clone().recipient(),
         Some(Arc::clone(&blacklist_handle)),
+        operator_id,
+        max_system_prompt_bytes,
     );
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
 
@@ -1100,6 +1119,37 @@ fn launch_actors(
 /// spawn coordinator (build tools, construct Agent, supervise, register
 /// route, watch inbox) without redoing A–K (validation, mint identity,
 /// write snapshot) which already ran when the operator spawned the agent.
+/// Why a subagent could not be re-launched during the daemon-restart resume
+/// pass. `ProfileMissing` is distinguished because it has a defined operator
+/// recovery (write the persona profile, restart) and is recorded as the
+/// agent's `stopped_reason`; every other failure collapses to `Other`.
+enum ResumeError {
+    /// Neither the agent's profile snapshot nor the persona profile it would
+    /// be synthesized from exists. The agent is left `Stopped` with
+    /// `stopped_reason = "profile_missing"`.
+    ProfileMissing,
+    /// Any other resume failure (open dirs, key mismatch, parse, adapter, …).
+    Other(String),
+}
+
+impl std::fmt::Display for ResumeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ProfileMissing => f.write_str(
+                "agent profile.toml missing and persona profile.toml absent; \
+                 cannot synthesize a capability profile",
+            ),
+            Self::Other(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for ResumeError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
+}
+
 #[expect(
     clippy::too_many_arguments,
     reason = "the function wires together every piece of daemon state a \
@@ -1150,8 +1200,17 @@ fn resume_persisted_subagents(
             );
             // Mark the record stopped so the panopticon shows an accurate
             // status and the operator doesn't send messages to a dead inbox.
+            // A missing profile gets a named reason the operator can act on;
+            // other failures stop without a specific reason.
             if let Ok(mut reg) = AgentRegistry::open(agent_registry_path.to_path_buf()) {
-                let _ = reg.update_status(record.name.as_str(), AgentStatus::Stopped);
+                let _ = match err {
+                    ResumeError::ProfileMissing => {
+                        reg.update_stopped_with_reason(record.name.as_str(), "profile_missing")
+                    }
+                    ResumeError::Other(_) => {
+                        reg.update_status(record.name.as_str(), AgentStatus::Stopped)
+                    }
+                };
             }
         }
     }
@@ -1184,7 +1243,7 @@ fn resume_one_subagent(
     dispatcher: &actix::Recipient<SendMessage>,
     coordinator: Option<actix::Recipient<SpawnRequest>>,
     record: &AgentRecord,
-) -> Result<(), String> {
+) -> Result<(), ResumeError> {
     let dirs = AgentDirs::open(data_dir, record.name.as_str())
         .map_err(|e| format!("open agent dirs: {e}"))?;
 
@@ -1204,9 +1263,9 @@ fn resume_one_subagent(
         .ok_or_else(|| "stored identity has no key records".to_owned())?
         .public_key;
     if keypair.public() != stored_key {
-        return Err(
+        return Err(ResumeError::Other(
             "on-disk identity.key does not match stored public key for this agent".to_owned(),
-        );
+        ));
     }
 
     // Load the snapshot to recover the resolved adapter id and the composed
@@ -1248,19 +1307,55 @@ fn resume_one_subagent(
         snapshot.system_prompt.clone()
     };
 
-    // Load the snapshotted capability profile so resumed agents are gated
-    // identically to freshly-spawned ones. A missing snapshot (e.g. an agent
-    // spawned before Phase 1) is treated as unrestricted rather than refusing
-    // to resume — the operator can add profile.toml and restart to enforce.
+    // Recover the agent's capability profile. Prefer the immutable snapshot
+    // written at spawn. If it's absent (e.g. an agent that predates the
+    // per-agent snapshot), synthesize one from the persona's current profile
+    // — the single documented exception to "snapshot at spawn time" — and
+    // persist it so later restarts read a stable snapshot. If the persona
+    // profile is also absent, refuse the resume rather than running unenforced
+    // (no permissive fallback); the caller stops the agent with
+    // `stopped_reason = "profile_missing"`.
     let profile = match load_capability_profile(&dirs.profile_path()) {
         Ok(p) => Some(Arc::new(p)),
-        Err(err) => {
+        // Only a genuinely absent snapshot synthesizes from the persona (the
+        // one documented upgrade exception). A present-but-unreadable snapshot
+        // — parse error, bad permissions, unsupported version, symlink — is
+        // corruption we must not paper over by overwriting it: that would hide
+        // the corruption and could silently widen or alter enforcement if the
+        // persona profile has since diverged. Fail the resume instead.
+        Err(ProfileError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
+            let persona_name = record
+                .persona_name
+                .as_deref()
+                .unwrap_or(&snapshot.persona_name);
+            let persona_profile_path =
+                RuntimeLayout::new(data_dir).persona_profile_path(persona_name);
+            let synthesized = match load_capability_profile(&persona_profile_path) {
+                Ok(p) => p,
+                Err(ProfileError::Io { source, .. })
+                    if source.kind() == io::ErrorKind::NotFound =>
+                {
+                    return Err(ResumeError::ProfileMissing);
+                }
+                Err(err) => {
+                    return Err(ResumeError::Other(format!(
+                        "load persona profile for synthesis: {err}"
+                    )));
+                }
+            };
+            write_capability_profile(&dirs.profile_path(), &synthesized)
+                .map_err(|e| format!("write synthesized profile snapshot: {e}"))?;
             warn!(
                 agent_name = %record.name,
-                err = %err,
-                "resume: profile.toml missing or unreadable;                  agent tools run without capability enforcement"
+                persona = %persona_name,
+                "resume: agent profile.toml missing; synthesized snapshot from persona profile"
             );
-            None
+            Some(Arc::new(synthesized))
+        }
+        Err(err) => {
+            return Err(ResumeError::Other(format!(
+                "load agent profile snapshot: {err}"
+            )));
         }
     };
     let resume_thresholds = profile
@@ -1728,8 +1823,11 @@ mod tests {
 
         // Provision a persisted "worker" subagent as if a prior daemon spawn
         // had completed: identity in registry, agent record, agent.toml
-        // (SpawnSnapshot), keypair file, persona config.
+        // (SpawnSnapshot), keypair file, persona config + profile. The persona
+        // profile lets the resume path recover a capability profile (the agent
+        // snapshot below omits one, so resume synthesizes from the persona).
         crate::test_support::write_persona_config(&data_dir, "worker", "claude-opus-4-7");
+        crate::test_support::write_full_access_persona_profile(&data_dir, "worker");
         let worker_dirs = AgentDirs::provision(&data_dir, "worker").unwrap();
         let worker_keypair = generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
         let worker_id = reeve_types::IdentityId::new().unwrap();
@@ -1752,6 +1850,7 @@ mod tests {
             adapter_id: adapter.id().to_owned(),
             agent_id: worker_id.to_string(),
             system_prompt: "You are a worker. Reply with 'ack' to any inbound.".to_owned(),
+            system_prompt_source: None,
         };
         write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
 
@@ -1766,6 +1865,7 @@ mod tests {
                     persona_name: Some("worker".to_owned()),
                     spawned_at: time::OffsetDateTime::now_utc(),
                     status: AgentStatus::Running,
+                    stopped_reason: None,
                 })
                 .unwrap();
         }
@@ -1807,6 +1907,191 @@ mod tests {
         // System block, so a regression that registers on an inner clone
         // shows up.
         assert!(watcher_for_assert.has_route(worker_id));
+
+        // The agent had no profile snapshot, so the resume synthesized one
+        // from the persona profile and persisted it for future restarts.
+        assert!(
+            worker_dirs.profile_path().exists(),
+            "resume should synthesize agents/worker/profile.toml from the persona profile"
+        );
+    }
+
+    // R1b: when neither the agent's profile snapshot nor the persona profile
+    // exists, the resume refuses (no permissive fallback): the agent is not
+    // routable and is left Stopped with stopped_reason = "profile_missing".
+    #[test]
+    #[cfg(unix)]
+    fn resume_marks_profile_missing_when_no_profile_anywhere() {
+        use crate::test_support::{NullDispatcher, NullInboxStarter};
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let operator_id = enroll_test_operator(&identity_registry);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+
+        // Provision identity, keypair, snapshot, and record — but NO agent
+        // profile.toml and NO persona profile.toml.
+        let worker_dirs = AgentDirs::provision(&data_dir, "worker").unwrap();
+        let worker_keypair = generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
+        let worker_id = reeve_types::IdentityId::new().unwrap();
+        {
+            let mut identity =
+                reeve_types::Identity::new_agent("worker".to_owned(), operator_id).unwrap();
+            identity.identity_id = worker_id;
+            let key_record =
+                reeve_types::KeyRecord::new(worker_id, *worker_keypair.public()).unwrap();
+            let stored = StoredIdentity::new(identity, key_record).unwrap();
+            identity_registry.write(&stored).unwrap();
+        }
+        let snapshot = SpawnSnapshot {
+            persona_name: "worker".to_owned(),
+            persona_version: 1,
+            adapter_id: adapter.id().to_owned(),
+            agent_id: worker_id.to_string(),
+            system_prompt: "You are a worker.".to_owned(),
+            system_prompt_source: None,
+        };
+        write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
+        {
+            let mut agent_registry = AgentRegistry::open(agent_registry_path.clone()).unwrap();
+            agent_registry
+                .register(AgentRecord {
+                    name: ValidatedAgentName::new("worker").unwrap(),
+                    identity_id: worker_id,
+                    inbox_dir: worker_dirs.inbox_root(),
+                    persona_name: Some("worker".to_owned()),
+                    spawned_at: time::OffsetDateTime::now_utc(),
+                    status: AgentStatus::Running,
+                    stopped_reason: None,
+                })
+                .unwrap();
+        }
+
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let dispatcher = NullDispatcher.start().recipient();
+            let test_audit =
+                Arc::new(AuditLog::open(data_dir.clone()).expect("open audit log in test"));
+            resume_persisted_subagents(
+                &data_dir,
+                &agent_registry_path,
+                &identity_registry,
+                std::slice::from_ref(&adapter),
+                None,
+                &test_audit,
+                &watcher,
+                &inbox_starter,
+                &dispatcher,
+                None,
+            );
+
+            assert!(
+                !watcher.has_route(worker_id),
+                "an agent with no recoverable profile must not be routable"
+            );
+
+            let reg = AgentRegistry::open(agent_registry_path.clone()).unwrap();
+            let rec = reg.lookup("worker").expect("record present");
+            assert_eq!(rec.status, AgentStatus::Stopped);
+            assert_eq!(rec.stopped_reason.as_deref(), Some("profile_missing"));
+
+            actix::System::current().stop();
+        });
+    }
+
+    // R1c: a present-but-corrupt agent profile.toml is NOT synthesized over.
+    // Resume fails and leaves the corrupt snapshot untouched, surfacing the
+    // corruption rather than silently replacing it — even though a valid
+    // persona profile exists that synthesis could otherwise have used.
+    #[test]
+    #[cfg(unix)]
+    fn resume_does_not_synthesize_over_corrupt_agent_profile() {
+        use crate::test_support::{NullDispatcher, NullInboxStarter};
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let operator_id = enroll_test_operator(&identity_registry);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+
+        // A valid persona profile exists (synthesis could succeed) ...
+        crate::test_support::write_full_access_persona_profile(&data_dir, "worker");
+        let worker_dirs = AgentDirs::provision(&data_dir, "worker").unwrap();
+        // ... but the agent's own profile snapshot is present and corrupt.
+        let corrupt = "this is not valid profile toml ===";
+        fs::write(worker_dirs.profile_path(), corrupt).unwrap();
+
+        let worker_keypair = generate_or_load_keypair(&worker_dirs.identity_key_path()).unwrap();
+        let worker_id = reeve_types::IdentityId::new().unwrap();
+        {
+            let mut identity =
+                reeve_types::Identity::new_agent("worker".to_owned(), operator_id).unwrap();
+            identity.identity_id = worker_id;
+            let key_record =
+                reeve_types::KeyRecord::new(worker_id, *worker_keypair.public()).unwrap();
+            let stored = StoredIdentity::new(identity, key_record).unwrap();
+            identity_registry.write(&stored).unwrap();
+        }
+        let snapshot = SpawnSnapshot {
+            persona_name: "worker".to_owned(),
+            persona_version: 1,
+            adapter_id: adapter.id().to_owned(),
+            agent_id: worker_id.to_string(),
+            system_prompt: "You are a worker.".to_owned(),
+            system_prompt_source: None,
+        };
+        write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
+        {
+            let mut agent_registry = AgentRegistry::open(agent_registry_path.clone()).unwrap();
+            agent_registry
+                .register(AgentRecord {
+                    name: ValidatedAgentName::new("worker").unwrap(),
+                    identity_id: worker_id,
+                    inbox_dir: worker_dirs.inbox_root(),
+                    persona_name: Some("worker".to_owned()),
+                    spawned_at: time::OffsetDateTime::now_utc(),
+                    status: AgentStatus::Running,
+                    stopped_reason: None,
+                })
+                .unwrap();
+        }
+
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let dispatcher = NullDispatcher.start().recipient();
+            let test_audit =
+                Arc::new(AuditLog::open(data_dir.clone()).expect("open audit log in test"));
+            resume_persisted_subagents(
+                &data_dir,
+                &agent_registry_path,
+                &identity_registry,
+                std::slice::from_ref(&adapter),
+                None,
+                &test_audit,
+                &watcher,
+                &inbox_starter,
+                &dispatcher,
+                None,
+            );
+
+            assert!(
+                !watcher.has_route(worker_id),
+                "an agent with a corrupt profile snapshot must not be routable"
+            );
+            // The corrupt snapshot is preserved, not overwritten by synthesis.
+            let on_disk = fs::read_to_string(worker_dirs.profile_path()).unwrap();
+            assert_eq!(
+                on_disk, corrupt,
+                "a corrupt profile.toml must not be silently overwritten"
+            );
+
+            actix::System::current().stop();
+        });
     }
 
     // R2: A persisted subagent whose snapshot adapter_id does not match the
@@ -1845,6 +2130,7 @@ mod tests {
             adapter_id: "claude-opus-4-7@some-other-route".to_owned(),
             agent_id: worker_id.to_string(),
             system_prompt: String::from("ignored"),
+            system_prompt_source: None,
         };
         write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
 
@@ -1857,6 +2143,7 @@ mod tests {
                 persona_name: Some("worker".to_owned()),
                 spawned_at: time::OffsetDateTime::now_utc(),
                 status: AgentStatus::Running,
+                stopped_reason: None,
             })
             .unwrap();
 

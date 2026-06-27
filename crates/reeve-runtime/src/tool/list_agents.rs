@@ -185,6 +185,7 @@ mod tests {
                     persona_name: persona.map(str::to_owned),
                     spawned_at: OffsetDateTime::now_utc(),
                     status: *status,
+                    stopped_reason: None,
                 })
                 .unwrap();
         }

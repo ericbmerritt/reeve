@@ -294,6 +294,12 @@ pub struct AgentRecord {
     pub spawned_at: OffsetDateTime,
     /// Last-written lifecycle state.
     pub status: AgentStatus,
+    /// Machine-readable reason the agent is `Stopped`, when one applies (e.g.
+    /// `"profile_missing"` after a rehydration that could not recover a
+    /// capability profile). `None` for running agents and for stops with no
+    /// recorded reason. Absent in records written before this field existed.
+    #[serde(default)]
+    pub stopped_reason: Option<String>,
 }
 
 // ── Private TOML shape ────────────────────────────────────────────────────────
@@ -368,7 +374,8 @@ impl AgentRegistry {
         self.flush()
     }
 
-    /// Update the `status` field of the named agent and flush to disk.
+    /// Update the `status` field of the named agent and flush to disk,
+    /// clearing any previously recorded `stopped_reason`.
     ///
     /// Returns [`AgentRegistryError::NotFound`] when `name` is not in the
     /// registry.
@@ -377,6 +384,29 @@ impl AgentRegistry {
         name: &str,
         status: AgentStatus,
     ) -> Result<(), AgentRegistryError> {
+        self.set_status(name, status, None)
+    }
+
+    /// Mark the named agent `Stopped` with a machine-readable reason and flush
+    /// to disk. Used by the rehydration path to record why an agent could not
+    /// be re-launched (e.g. `"profile_missing"`).
+    ///
+    /// Returns [`AgentRegistryError::NotFound`] when `name` is not in the
+    /// registry.
+    pub fn update_stopped_with_reason(
+        &mut self,
+        name: &str,
+        reason: impl Into<String>,
+    ) -> Result<(), AgentRegistryError> {
+        self.set_status(name, AgentStatus::Stopped, Some(reason.into()))
+    }
+
+    fn set_status(
+        &mut self,
+        name: &str,
+        status: AgentStatus,
+        stopped_reason: Option<String>,
+    ) -> Result<(), AgentRegistryError> {
         let record = self
             .records
             .get_mut(name)
@@ -384,6 +414,7 @@ impl AgentRegistry {
                 name: name.to_owned(),
             })?;
         record.status = status;
+        record.stopped_reason = stopped_reason;
         self.flush()
     }
 
@@ -581,6 +612,7 @@ pub(crate) mod tests {
             persona_name: None,
             spawned_at: OffsetDateTime::now_utc(),
             status: AgentStatus::Running,
+            stopped_reason: None,
         }
     }
 
@@ -635,6 +667,28 @@ pub(crate) mod tests {
             registry.lookup("lead").unwrap().status,
             AgentStatus::Stopped,
         );
+    }
+
+    // T4b: update_stopped_with_reason records the reason; a later plain
+    // update_status clears it (a reasonless transition has no stale reason).
+    #[test]
+    fn update_stopped_with_reason_sets_and_clears() {
+        let (mut registry, _tmp) = registry_at();
+        registry.register(sample_record("lead")).unwrap();
+
+        registry
+            .update_stopped_with_reason("lead", "profile_missing")
+            .unwrap();
+        let rec = registry.lookup("lead").unwrap();
+        assert_eq!(rec.status, AgentStatus::Stopped);
+        assert_eq!(rec.stopped_reason.as_deref(), Some("profile_missing"));
+
+        registry
+            .update_status("lead", AgentStatus::Running)
+            .unwrap();
+        let rec = registry.lookup("lead").unwrap();
+        assert_eq!(rec.status, AgentStatus::Running);
+        assert_eq!(rec.stopped_reason, None, "plain update clears the reason");
     }
 
     // T5: update_status on missing name returns NotFound.

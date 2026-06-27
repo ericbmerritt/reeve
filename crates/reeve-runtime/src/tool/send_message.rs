@@ -830,6 +830,7 @@ mod tests {
             persona_name: None,
             spawned_at: OffsetDateTime::now_utc(),
             status: AgentStatus::Running,
+            stopped_reason: None,
         };
         agent_registry.register(record).unwrap();
 

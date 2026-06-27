@@ -29,7 +29,7 @@ use crate::config::load_persona_config;
 use crate::dispatcher::SendMessage;
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
-use crate::model_resolution::{resolve_model, write_spawn_snapshot};
+use crate::model_resolution::{compose_system_prompt, resolve_model, write_spawn_snapshot};
 use crate::supervisor::WatchInbox;
 use crate::tool::{BlacklistHandle, InvokeTool, SendMessageTool};
 use crate::watcher::Watcher;
@@ -215,6 +215,16 @@ pub struct SpawnCoordinator {
     /// Audit log for `authority.decision` events emitted when a spawned
     /// agent's cost thresholds trip.
     audit: Arc<crate::audit::AuditLog>,
+    /// The operator's identity. A spawn whose `sender_id` differs from this is
+    /// peer-sourced, so its caller-supplied `system_prompt` is tagged
+    /// untrusted at composition time.
+    operator_id: IdentityId,
+    /// Byte cap on the caller-supplied `system_prompt` of a `spawn_agent`
+    /// invocation (the persona base prompt is exempt). Over-cap requests are
+    /// refused at this dispatch boundary. Resolved from the team config's
+    /// `max_system_prompt_bytes`, defaulting to
+    /// [`crate::config::DEFAULT_MAX_SYSTEM_PROMPT_BYTES`].
+    max_system_prompt_bytes: usize,
 }
 
 impl SpawnCoordinator {
@@ -234,6 +244,8 @@ impl SpawnCoordinator {
         inbox_starter: actix::Recipient<WatchInbox>,
         dispatcher: actix::Recipient<SendMessage>,
         blacklist: Option<BlacklistHandle>,
+        operator_id: IdentityId,
+        max_system_prompt_bytes: usize,
     ) -> Self {
         Self {
             data_dir,
@@ -245,6 +257,8 @@ impl SpawnCoordinator {
             dispatcher,
             blacklist,
             audit,
+            operator_id,
+            max_system_prompt_bytes,
         }
     }
 }
@@ -381,6 +395,21 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             reply_to,
         } = msg;
         let persona_name_str = persona_name.as_str();
+
+        // Cap the caller-supplied system prompt at the dispatch boundary. The
+        // persona base prompt is operator-authored and exempt; only the
+        // caller's portion (already trimmed at validation) is measured.
+        if system_prompt.len() > self.max_system_prompt_bytes {
+            error_reply(
+                &reply_to,
+                format!(
+                    "system_prompt is {} bytes, exceeding the {}-byte cap",
+                    system_prompt.len(),
+                    self.max_system_prompt_bytes
+                ),
+            );
+            return;
+        }
 
         let mut suffix_bytes = [0u8; 4];
         OsRng.fill_bytes(&mut suffix_bytes);
@@ -590,12 +619,14 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             return;
         };
 
-        let final_system_prompt = if system_prompt.is_empty() {
-            persona_config.system_prompt.clone()
-        } else {
-            format!("{}\n\n{}", persona_config.system_prompt, system_prompt)
-        };
+        let final_system_prompt = compose_system_prompt(
+            &persona_config.system_prompt,
+            &system_prompt,
+            sender_id,
+            self.operator_id,
+        );
         snapshot.system_prompt.clone_from(&final_system_prompt);
+        snapshot.system_prompt_source = Some(sender_id);
 
         if let Err(err) = write_spawn_snapshot(&dirs, &snapshot) {
             error_reply(&reply_to, format!("failed to write spawn snapshot: {err}"));
@@ -629,6 +660,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             persona_name: Some(persona_name.as_str().to_owned()),
             spawned_at: OffsetDateTime::now_utc(),
             status: AgentStatus::Running,
+            stopped_reason: None,
         };
         if let Err(err) = AgentRegistry::open(self.agent_registry_path.clone())
             .and_then(|mut reg| reg.register(record))
@@ -763,6 +795,8 @@ mod tests {
             inbox_starter,
             dispatcher,
             None,
+            IdentityId::new().unwrap(),
+            crate::config::DEFAULT_MAX_SYSTEM_PROMPT_BYTES,
         )
     }
 
@@ -950,6 +984,109 @@ mod tests {
             watcher_outer.has_route(*agent_id),
             "spawned agent must be routable",
         );
+    }
+
+    // ── SC2b: over-cap system_prompt is refused at the dispatch boundary ───────
+
+    #[test]
+    fn over_cap_system_prompt_is_refused() {
+        let tmp: TempDir = secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        write_minimal_persona(&data_dir, "test");
+
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let sender_id = IdentityId::new().unwrap();
+        let response: Arc<Mutex<Option<SpawnResponse>>> = Arc::new(Mutex::new(None));
+        let response_outer = Arc::clone(&response);
+
+        // One byte over the default 8 KiB cap.
+        let oversized = "x".repeat(crate::config::DEFAULT_MAX_SYSTEM_PROMPT_BYTES + 1);
+
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let (tx, rx) = oneshot::channel();
+            let capture_addr = ResponseCapture { tx: Some(tx) }.start();
+            let coordinator = build_coordinator(
+                &data_dir,
+                identity_registry,
+                watcher,
+                agent_registry_path,
+                inbox_starter,
+            );
+            let coord_addr = coordinator.start();
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", &oversized, sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
+            let resp = collect_response(rx).await;
+            *response_outer.lock().unwrap() = Some(resp);
+            actix::System::current().stop();
+        });
+
+        let guard = response.lock().unwrap();
+        let SpawnResponse::Failure { message } = guard.as_ref().unwrap() else {
+            panic!("expected Failure for an over-cap system_prompt");
+        };
+        assert!(
+            message.contains("cap"),
+            "failure should mention the cap; got: {message}"
+        );
+    }
+
+    // ── SC2c: spawn records the caller as the system_prompt source and tags
+    // the peer-supplied prompt untrusted in the stored snapshot ───────────────
+
+    #[test]
+    fn spawn_records_peer_system_prompt_source_and_tags_untrusted() {
+        let tmp: TempDir = secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        write_minimal_persona(&data_dir, "test");
+
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let sender_id = IdentityId::new().unwrap();
+        let response: Arc<Mutex<Option<SpawnResponse>>> = Arc::new(Mutex::new(None));
+        let response_outer = Arc::clone(&response);
+        let data_dir_outer = data_dir.clone();
+
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let (tx, rx) = oneshot::channel();
+            let capture_addr = ResponseCapture { tx: Some(tx) }.start();
+            let coordinator = build_coordinator(
+                &data_dir,
+                identity_registry,
+                watcher,
+                agent_registry_path,
+                inbox_starter,
+            );
+            let coord_addr = coordinator.start();
+            coord_addr.do_send(SpawnRequest::new(
+                SpawnRequest::validate("test", "do the subtask", sender_id).unwrap(),
+                capture_addr.recipient(),
+            ));
+            let resp = collect_response(rx).await;
+            *response_outer.lock().unwrap() = Some(resp);
+            actix::System::current().stop();
+        });
+
+        let guard = response.lock().unwrap();
+        let SpawnResponse::Success { agent_name, .. } = guard.as_ref().unwrap() else {
+            panic!("expected Success");
+        };
+
+        // The written agent.toml records the caller as the prompt source and,
+        // because the caller is a peer (not the build_coordinator's operator),
+        // the caller portion is wrapped in untrusted markers.
+        let dirs = crate::agent_fs::AgentDirs::open(&data_dir_outer, agent_name).unwrap();
+        let text = std::fs::read_to_string(dirs.agent_toml_path()).unwrap();
+        let snapshot: crate::model_resolution::SpawnSnapshot = toml::from_str(&text).unwrap();
+        assert_eq!(snapshot.system_prompt_source, Some(sender_id));
+        assert!(
+            snapshot.system_prompt.contains("UNTRUSTED"),
+            "peer-supplied prompt should be tagged untrusted; got: {}",
+            snapshot.system_prompt
+        );
+        assert!(snapshot.system_prompt.contains("do the subtask"));
     }
 
     // ── SC3: two spawns with same persona produce distinct names ──────────────
@@ -1393,6 +1530,7 @@ mod tests {
                 persona_name: Some("worker".to_owned()),
                 spawned_at: time::OffsetDateTime::now_utc(),
                 status: AgentStatus::Running,
+                stopped_reason: None,
             })
             .unwrap();
         }
