@@ -304,9 +304,9 @@ to the lead via `send_message` in its own tool loop.
 
 ## Phase 5: reeve send CLI
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-23 | 2026-05-23 |
 
 Tags: cli
 
@@ -346,9 +346,9 @@ script" demo scenario from the ladder 2 roadmap entry.
 
 ## Phase 6: Panopticon as home screen
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-23 | 2026-05-25 |
 
 Tags: tui
 
@@ -428,9 +428,9 @@ agents' `quarantine/` directories. `Q` opens the quarantine review screen
 
 ## Phase 7: Per-agent inspect and reeve attach
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-26 | 2026-05-26 |
 
 Tags: tui, cli
 
@@ -478,9 +478,9 @@ opens that agent's chat screen directly. Looks up the agent in the on-disk
 
 ## Phase 8: Quarantine review screen
 
-| Status    | Started | Completed |
-| --------- | ------- | --------- |
-| not started |         |           |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-25 | 2026-05-26 |
 
 Tags: tui
 
@@ -532,9 +532,9 @@ deleted — it remains as the audit record. The new message's envelope has a fre
 
 ## Phase 9: Documentation
 
-| Status         | Started    | Completed  |
-| -------------- | ---------- | ---------- |
-| ⬜ not-started  |            |            |
+| Status      | Started    | Completed  |
+| ----------- | ---------- | ---------- |
+| ✅ complete | 2026-05-26 | 2026-05-26 |
 
 Tags: docs
 
