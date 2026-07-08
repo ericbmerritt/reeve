@@ -28,27 +28,32 @@ are needed for its demo.
 
 ## Sequence
 
-| #   | Ladder                    | What's new                                                                                                                                                                                   | Demo at end                                                                                                      | Touches specs                                             |
-| --- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
-| 1   | `reeve-walking-skeleton`  | Workspace, supervisor + actor runtime, Claude adapter, agent FS layout, signed maildir transport with key registry + verification + trust tiers + quarantine, TUI lead chat, detach/reattach | Talk to lead from TUI; close, reopen, conversation persists; tampered message goes to quarantine                 | domain-model, transport-security, tui-design, tui-screens |
-| 2   | `reeve-multi-agent`       | Lead spawns subordinates, each with own keypair and inbox, peer messaging falls out, `reeve send` CLI, panopticon screen, per-agent inspect, quarantine review screen                        | Ask lead to delegate; agents work in parallel; dispatch from a shell script; observe quarantine on bad signature | domain-model, transport-security, tui-design, tui-screens |
-| 3   | `reeve-authority`         | Capability profile per persona, blacklist, classifier-passthrough scaffold, audit-log surfacing of decisions                                                                                 | Persona without `git_commit` refuses; blacklisted force-push hard-refused                                        | domain-model, tui-design                                  |
-| 4   | `reeve-gatekeeper`        | Content classifier at promotion boundaries, pass/flag/block disposition, gatekeeper events in audit log                                                                                      | Prompt-injection in a file read gets flagged in the panopticon                                                   | gatekeeper-model, tui-design, tui-screens                 |
-| 5   | `reeve-memory`            | Project, persona, operator memory scopes; cold-start core; queryable store; memory review screen; reference observability                                                                    | Add a note to a persona; next-spawned agent picks it up; see which entries are referenced                        | domain-model, tui-design, tui-screens                     |
-| 6   | `reeve-skills-versioning` | Skill bundles, persona / skill / memory versioning, version attribution on every event, config revision review screen                                                                        | Edit persona → version bumps → next spawn uses new version; running agents stay on old                           | domain-model, tui-design, tui-screens                     |
-| 7   | `reeve-shipped-teams`     | Default working team and forge team, seed memories, first-run experience                                                                                                                     | Fresh install boots with a working team; forge team self-improves from observability data                        | shipped-teams                                             |
+| #   | Ladder                    | What's new                                                                                                                                                                                                                 | Demo at end                                                                                                                                        | Touches specs                                             |
+| --- | ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| 1   | `reeve-walking-skeleton`  | Workspace, supervisor + actor runtime, Claude adapter, agent FS layout, signed maildir transport with key registry + verification + trust tiers + quarantine, TUI lead chat, detach/reattach                               | Talk to lead from TUI; close, reopen, conversation persists; tampered message goes to quarantine                                                   | domain-model, transport-security, tui-design, tui-screens |
+| 2   | `reeve-multi-agent`       | Lead spawns subordinates, each with own keypair and inbox, peer messaging falls out, `reeve send` CLI, panopticon screen, per-agent inspect, quarantine review screen                                                      | Ask lead to delegate; agents work in parallel; dispatch from a shell script; observe quarantine on bad signature                                   | domain-model, transport-security, tui-design, tui-screens |
+| 3   | `reeve-authority`         | Capability profile per persona, blacklist, classifier-passthrough scaffold, audit-log surfacing of decisions                                                                                                               | Persona without `git_commit` refuses; blacklisted force-push hard-refused                                                                          | domain-model, tui-design                                  |
+| 4   | `reeve-effectors`         | File, shell, and web effectors (`read_file`, `write_file`, `edit`, `shell`, `web_fetch`) wired through the ladder-3 capability + blacklist gates; working-root jail over the file effectors; default-deny egress allowlist | Ask the lead to fix a failing test — it reads, edits, and runs the suite; force-push is hard-refused; a fetch to a non-allowlisted host is blocked | domain-model, authority, transport-security               |
+| 5   | `reeve-gatekeeper`        | Content classifier at promotion boundaries, pass/flag/block disposition, gatekeeper events in audit log                                                                                                                    | Prompt-injection in a file read gets flagged in the panopticon                                                                                     | gatekeeper-model, tui-design, tui-screens                 |
+| 6   | `reeve-memory`            | Project, persona, operator memory scopes; cold-start core; queryable store; memory review screen; reference observability                                                                                                  | Add a note to a persona; next-spawned agent picks it up; see which entries are referenced                                                          | domain-model, tui-design, tui-screens                     |
+| 7   | `reeve-skills-versioning` | Skill bundles, persona / skill / memory versioning, version attribution on every event, config revision review screen                                                                                                      | Edit persona → version bumps → next spawn uses new version; running agents stay on old                                                             | domain-model, tui-design, tui-screens                     |
+| 8   | `reeve-shipped-teams`     | Default working team and forge team, seed memories, first-run experience                                                                                                                                                   | Fresh install boots with a working team; forge team self-improves from observability data                                                          | shipped-teams                                             |
 
 ## Status
 
-| Ladder                    | Status      |
-| ------------------------- | ----------- |
-| `reeve-walking-skeleton`  | in planning |
-| `reeve-multi-agent`       | not started |
-| `reeve-authority`         | not started |
-| `reeve-gatekeeper`        | not started |
-| `reeve-memory`            | not started |
-| `reeve-skills-versioning` | not started |
-| `reeve-shipped-teams`     | not started |
+Completed ladders are moved to `specs/completed/`; that directory is the
+canonical record of what has shipped. This table is a coarse index only.
+
+| Ladder                    | Status                           |
+| ------------------------- | -------------------------------- |
+| `reeve-walking-skeleton`  | ✅ complete (`specs/completed/`) |
+| `reeve-multi-agent`       | ✅ complete (`specs/completed/`) |
+| `reeve-authority`         | ✅ complete (`specs/completed/`) |
+| `reeve-effectors`         | 📝 spec written (ladder 4)       |
+| `reeve-gatekeeper`        | not started                      |
+| `reeve-memory`            | not started                      |
+| `reeve-skills-versioning` | not started                      |
+| `reeve-shipped-teams`     | not started                      |
 
 ## Key Decisions
 
@@ -81,6 +86,13 @@ are needed for its demo.
   Debuggable on disk, ed25519-dalek pairs cleanly, schema evolution is
   straightforward. CBOR is the runner-up if compactness ever matters; for
   workstation use it does not.
+
+- **Effectors precede memory.** Memory compounds a runtime that already
+  produces artifacts; until agents can act on the world, there is nothing worth
+  remembering. Effectors become ladder 4; memory moves to ladder 6. Shipping
+  web access also raises the gatekeeper's priority — fetched content is the
+  canonical prompt-injection surface — so the gatekeeper stays immediately
+  after effectors at ladder 5.
 
 ## Non-Goals For This Roadmap
 
