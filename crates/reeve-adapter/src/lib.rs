@@ -22,14 +22,23 @@
 //!   Messages API with rustls TLS, no system OpenSSL dependency.
 //! - [`DeepSeekR1OpenRouter`] — `deepseek/deepseek-r1-0528@openrouter`:
 //!   `DeepSeek` R1 0528 via `OpenRouter`'s OpenAI-compatible endpoint.
+//! - [`Glm52OpenRouter`] — `z-ai/glm-5.2@openrouter`: Zhipu/Z.ai GLM-5.2 via
+//!   `OpenRouter`, preferring fp8 hosts (Novita, `GMICloud`).
+//!
+//! The OpenRouter-routed adapters share an internal `openrouter` module for the
+//! client policy, endpoint, and status→error mapping; only model ID,
+//! capabilities, cost, and provider preference differ per adapter.
 
 mod anthropic;
 mod claude_opus_47;
 mod deepseek_r1_openrouter;
+mod glm_5_2_openrouter;
 mod openai_compat;
+mod openrouter;
 
 pub use claude_opus_47::ClaudeOpus47;
 pub use deepseek_r1_openrouter::DeepSeekR1OpenRouter;
+pub use glm_5_2_openrouter::Glm52OpenRouter;
 
 use std::collections::HashSet;
 use std::fmt;

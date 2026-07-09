@@ -65,6 +65,32 @@ model_preferences = ["deepseek/deepseek-r1-0528"]
 display_name = "DeepSeek R1"
 "#;
 
+/// Default GLM-5.2 persona written to
+/// `{data_dir}/personas/glm-5.2/config.toml` if absent.
+///
+/// Backed by the `z-ai/glm-5.2@openrouter` adapter, so it requires
+/// `reeve adapter set-key-openrouter` before the daemon can spawn agents from
+/// it (the `OpenRouter` key must be in the keychain).
+const DEFAULT_GLM_5_2_PERSONA_TOML: &str = r#"name = "glm-5.2"
+system_prompt = """
+You are a subordinate AI agent in the Reeve multi-agent runtime. You were \
+spawned by a lead agent to carry out a specific task. GLM-5.2 is a strong \
+coding and agentic model; you are well-suited to implementation, refactoring, \
+and codebase-analysis work.
+
+Respond directly in text. Do not use tools unless the task explicitly \
+requires them. Do not use send_message to reply to whoever sent you a \
+message — your text response IS the reply and will be delivered \
+automatically.
+
+Use tools only when the task requires taking an action (spawning another \
+agent, sending a message to a peer, etc.). When your task is complete, \
+write a clear summary of what you did and what you found.
+"""
+model_preferences = ["z-ai/glm-5.2"]
+display_name = "GLM-5.2"
+"#;
+
 /// Default team TOML written to `{data_dir}/teams/default.toml` if absent.
 const DEFAULT_TEAM_TOML: &str = r#"name = "default"
 version = 1
@@ -280,6 +306,7 @@ pub fn load_team_config(path: &Path) -> Result<TeamConfig, ConfigError> {
 /// Paths written:
 /// - `{data_dir}/personas/lead/config.toml`
 /// - `{data_dir}/personas/deepseek-r1/config.toml`
+/// - `{data_dir}/personas/glm-5.2/config.toml`
 /// - `{data_dir}/teams/default.toml`
 ///
 /// Idempotent: existing files are never overwritten. Parent directories are
@@ -288,10 +315,12 @@ pub fn install_defaults(data_dir: &Path) -> Result<(), ConfigError> {
     let layout = RuntimeLayout::new(data_dir);
     let persona_path = layout.persona_config_path("lead");
     let deepseek_persona_path = layout.persona_config_path("deepseek-r1");
+    let glm_persona_path = layout.persona_config_path("glm-5.2");
     let team_path = layout.team_config_path("default");
 
     write_if_absent(&persona_path, DEFAULT_PERSONA_TOML)?;
     write_if_absent(&deepseek_persona_path, DEFAULT_DEEPSEEK_R1_PERSONA_TOML)?;
+    write_if_absent(&glm_persona_path, DEFAULT_GLM_5_2_PERSONA_TOML)?;
     write_if_absent(&team_path, DEFAULT_TEAM_TOML)?;
 
     Ok(())
@@ -434,6 +463,15 @@ mod tests {
 
         let persona_content = fs::read_to_string(&persona_path).unwrap();
         assert_eq!(persona_content, DEFAULT_PERSONA_TOML);
+
+        let glm_persona_path = tmp
+            .path()
+            .join("personas")
+            .join("glm-5.2")
+            .join("config.toml");
+        assert!(glm_persona_path.is_file(), "glm-5.2 persona config missing");
+        let glm_content = fs::read_to_string(&glm_persona_path).unwrap();
+        assert_eq!(glm_content, DEFAULT_GLM_5_2_PERSONA_TOML);
 
         let team_content = fs::read_to_string(&team_path).unwrap();
         assert_eq!(team_content, DEFAULT_TEAM_TOML);
