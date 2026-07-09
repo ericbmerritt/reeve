@@ -268,7 +268,9 @@ fn preload_adapter_key() -> Result<(), Box<dyn std::error::Error>> {
 /// Build all available adapters from keychain secrets or pre-loaded env vars.
 ///
 /// Always includes the `ClaudeOpus47` adapter (Anthropic key is required).
-/// Adds `DeepSeekR1OpenRouter` when an `OpenRouter` key is available.
+/// Adds the OpenRouter-routed adapters (`DeepSeekR1OpenRouter`,
+/// `Glm52OpenRouter`) when an `OpenRouter` key is available — both share the
+/// one `OpenRouter` key.
 fn build_adapters_for_daemon(
 ) -> Result<Vec<Arc<dyn reeve_adapter::Adapter>>, Box<dyn std::error::Error>> {
     let mut adapters: Vec<Arc<dyn reeve_adapter::Adapter>> = Vec::new();
@@ -292,7 +294,10 @@ fn build_adapters_for_daemon(
         store.retrieve_secret(labels::OPENROUTER_API_KEY).ok()
     };
     if let Some(key) = openrouter_key {
-        adapters.push(Arc::new(reeve_adapter::DeepSeekR1OpenRouter::new(key)));
+        adapters.push(Arc::new(reeve_adapter::DeepSeekR1OpenRouter::new(
+            key.clone(),
+        )));
+        adapters.push(Arc::new(reeve_adapter::Glm52OpenRouter::new(key)));
     }
 
     Ok(adapters)

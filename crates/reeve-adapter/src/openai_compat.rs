@@ -18,6 +18,26 @@ pub(crate) struct ChatRequest<'a> {
     pub(crate) messages: Vec<ChatRequestMessage<'a>>,
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub(crate) tools: Vec<ChatRequestTool<'a>>,
+    /// `OpenRouter` provider-routing preferences. Skipped on the wire when
+    /// `None`; other OpenAI-compatible endpoints ignore the field when present.
+    /// [`build_request`] leaves this `None`; `OpenRouter` adapters that pin a
+    /// provider order set it after building.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) provider: Option<ProviderPreferences<'a>>,
+}
+
+/// `OpenRouter` provider-routing preferences, serialized as the request's
+/// `provider` object. See <https://openrouter.ai/docs/features/provider-routing>.
+///
+/// `allow_fallbacks` keeps `order` a *preference* — try these hosts first, then
+/// any other host serving the model — rather than a hard restriction, so a
+/// single provider's outage does not fail the call. Only meaningful on the
+/// `OpenRouter` route.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ProviderPreferences<'a> {
+    #[serde(skip_serializing_if = "<[_]>::is_empty")]
+    pub(crate) order: Vec<&'a str>,
+    pub(crate) allow_fallbacks: bool,
 }
 
 /// One message in the request.
@@ -275,6 +295,7 @@ pub(crate) fn build_request<'a>(
         temperature: params.temperature.map(crate::Temperature::value),
         messages: wire_messages,
         tools: wire_tools,
+        provider: None,
     }
 }
 

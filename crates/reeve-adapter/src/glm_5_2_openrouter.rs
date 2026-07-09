@@ -1,13 +1,24 @@
-//! `DeepSeekR1OpenRouter` adapter on the `openrouter` route.
+//! `Glm52OpenRouter` adapter on the `openrouter` route.
 //!
-//! Translates Reeve's internal protocol to `OpenRouter`'s OpenAI-compatible
-//! chat completions API (`POST /v1/chat/completions`) and back.
+//! Serves Zhipu/Z.ai's GLM-5.2 through `OpenRouter`'s OpenAI-compatible chat
+//! completions API. Shares the route machinery in [`crate::openrouter`] with
+//! the `DeepSeek` adapter; the GLM-specific pieces are the wire model ID, the
+//! declared capabilities, the cost rates, and a pinned provider-routing
+//! preference.
+//!
+//! # Provider routing
+//!
+//! GLM-5.2 is served by ~20 hosts on `OpenRouter` at different price, latency,
+//! and quantization (fp8 vs fp4) points. This adapter pins an fp8-favouring
+//! order (Novita, then `GMICloud`) with fallbacks allowed, so those hosts are
+//! preferred but a single provider outage does not fail the call. See ADR 004
+//! for the deferred cross-provider *failover* design; this is provider
+//! *preference* within one `OpenRouter` request, not runtime failover.
 //!
 //! # Security
 //!
 //! The API key is wrapped in [`secrecy::SecretString`] and never included in
-//! error messages, log output, or `Debug` formatting. Only `OpenRouter`'s
-//! documented stable `error.type` tokens are forwarded to callers.
+//! error messages, log output, or `Debug` formatting (see [`crate::openrouter`]).
 
 use crate::{
     openai_compat, openrouter, Adapter, AdapterError, Capabilities, Capability, CostEstimate,
@@ -17,55 +28,65 @@ use crate::{
 // ── Route constants ────────────────────────────────────────────────────────────
 
 /// Model string sent to `OpenRouter` on the wire.
-const MODEL_ID: &str = "deepseek/deepseek-r1-0528";
+const MODEL_ID: &str = "z-ai/glm-5.2";
 
 /// Adapter identifier returned by [`Adapter::id`].
-const ADAPTER_ID: &str = "deepseek/deepseek-r1-0528@openrouter";
+const ADAPTER_ID: &str = "z-ai/glm-5.2@openrouter";
+
+/// Preferred `OpenRouter` provider order for GLM-5.2 (fp8 hosts first). Combined
+/// with `allow_fallbacks: true`, so these are tried first but any other host
+/// serving the model can still take the request.
+const PROVIDER_ORDER: &[&str] = &["novita", "gmicloud"];
 
 // ── Cost rates ─────────────────────────────────────────────────────────────────
 
-/// Per-token cost rates for `deepseek/deepseek-r1-0528` on `OpenRouter`, in
-/// microdollars (1 USD = `1_000_000` µ$).
+/// Per-token cost rates for `z-ai/glm-5.2` on `OpenRouter`, in microdollars
+/// (1 USD = `1_000_000` µ$).
 ///
-/// Rates are adapter-local snapshots; `OpenRouter` pricing may change.
-/// Approximate as of 2026-05: ~$0.55/M input, ~$2.19/M output.
-pub(crate) struct DeepSeekR1Rates;
+/// Rates are adapter-local snapshots and coarse (the µ$/token integer model has
+/// $1/M granularity). Approximate as of 2026-07 for the fp8 hosts this adapter
+/// prefers: ~$0.5/M input, ~$2/M output. This is a best-effort estimate, not an
+/// authoritative bill — the actual host (and its quantization/price) is chosen
+/// by `OpenRouter` per request.
+struct Glm52Rates;
 
-impl DeepSeekR1Rates {
-    /// $0.55 / M input tokens → 1 µ$/token (rounded from 0.55).
-    pub(crate) const INPUT_MICRODOLLARS_PER_TOKEN: u64 = 1;
-    /// $2.19 / M output tokens → 2 µ$/token (rounded from 2.19).
-    pub(crate) const OUTPUT_MICRODOLLARS_PER_TOKEN: u64 = 2;
+impl Glm52Rates {
+    /// ~$0.5 / M input tokens → 1 µ$/token (rounded up from 0.5).
+    const INPUT_MICRODOLLARS_PER_TOKEN: u64 = 1;
+    /// ~$2 / M output tokens → 2 µ$/token.
+    const OUTPUT_MICRODOLLARS_PER_TOKEN: u64 = 2;
 }
 
 /// Compute the cost estimate for a single call from its [`TokenCounts`].
-pub(crate) fn compute_cost(tokens: TokenCounts) -> CostEstimate {
-    let micro: u64 = u64::from(tokens.input) * DeepSeekR1Rates::INPUT_MICRODOLLARS_PER_TOKEN
-        + u64::from(tokens.output) * DeepSeekR1Rates::OUTPUT_MICRODOLLARS_PER_TOKEN;
+fn compute_cost(tokens: TokenCounts) -> CostEstimate {
+    let micro: u64 = u64::from(tokens.input) * Glm52Rates::INPUT_MICRODOLLARS_PER_TOKEN
+        + u64::from(tokens.output) * Glm52Rates::OUTPUT_MICRODOLLARS_PER_TOKEN;
     CostEstimate {
         microdollars: micro,
     }
 }
 
-// ── DeepSeekR1OpenRouter ──────────────────────────────────────────────────────
+// ── Glm52OpenRouter ─────────────────────────────────────────────────────────────
 
-/// The `deepseek/deepseek-r1-0528@openrouter` adapter.
+/// The `z-ai/glm-5.2@openrouter` adapter.
 ///
-/// Routes through `OpenRouter`'s OpenAI-compatible chat completions endpoint.
-/// Construct with [`DeepSeekR1OpenRouter::new`] for production use.
-pub struct DeepSeekR1OpenRouter {
+/// Routes through `OpenRouter`'s OpenAI-compatible chat completions endpoint,
+/// preferring fp8 hosts. Construct with [`Glm52OpenRouter::new`] for production
+/// use.
+pub struct Glm52OpenRouter {
     client: reqwest::Client,
     api_key: secrecy::SecretString,
     base_url: String,
     capabilities: Capabilities,
 }
 
-impl DeepSeekR1OpenRouter {
+impl Glm52OpenRouter {
     fn declared_capabilities() -> Capabilities {
         Capabilities::new()
             .with(Capability::ToolCalling)
-            .with(Capability::StructuredOutput)
             .with(Capability::ParallelToolCalls)
+            .with(Capability::StructuredOutput)
+            .with(Capability::Reasoning)
     }
 
     /// Construct a new adapter with the given `OpenRouter` API key.
@@ -75,7 +96,7 @@ impl DeepSeekR1OpenRouter {
 
     /// Construct an adapter with an explicit base URL.
     ///
-    /// **Internal — production callers MUST use [`DeepSeekR1OpenRouter::new`].**
+    /// **Internal — production callers MUST use [`Glm52OpenRouter::new`].**
     /// Tests call this with a wiremock server URL. Never accept a base URL
     /// from outside this crate; `with_base_url` does not validate the scheme.
     pub(crate) fn with_base_url(api_key: secrecy::SecretString, base_url: String) -> Self {
@@ -89,7 +110,7 @@ impl DeepSeekR1OpenRouter {
 }
 
 #[async_trait::async_trait]
-impl Adapter for DeepSeekR1OpenRouter {
+impl Adapter for Glm52OpenRouter {
     fn id(&self) -> &str {
         ADAPTER_ID
     }
@@ -104,7 +125,11 @@ impl Adapter for DeepSeekR1OpenRouter {
         tools: &[Tool],
         params: &Params,
     ) -> Result<Response, AdapterError> {
-        let wire_req = openai_compat::build_request(messages, tools, params, MODEL_ID);
+        let mut wire_req = openai_compat::build_request(messages, tools, params, MODEL_ID);
+        wire_req.provider = Some(openai_compat::ProviderPreferences {
+            order: PROVIDER_ORDER.to_vec(),
+            allow_fallbacks: true,
+        });
         let (body, latency) =
             openrouter::post_completion(&self.client, &self.base_url, &self.api_key, &wire_req)
                 .await?;
@@ -128,15 +153,15 @@ impl Adapter for DeepSeekR1OpenRouter {
 mod tests {
     use super::*;
     use crate::openrouter::COMPLETIONS_ENDPOINT;
-    use crate::{AuthKind, Capability, Message, MessageContent, Params, Role, TokenCounts};
+    use crate::{Capability, Message, MessageContent, Params, Role, TokenCounts};
     use secrecy::SecretString;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    const TEST_KEY: &str = "sk-or-test-SECRET_DO_NOT_LEAK_12345";
+    const TEST_KEY: &str = "sk-or-test-SECRET_DO_NOT_LEAK_GLM_12345";
 
-    fn make_adapter(base_url: &str) -> DeepSeekR1OpenRouter {
-        DeepSeekR1OpenRouter::with_base_url(SecretString::from(TEST_KEY), base_url.to_owned())
+    fn make_adapter(base_url: &str) -> Glm52OpenRouter {
+        Glm52OpenRouter::with_base_url(SecretString::from(TEST_KEY), base_url.to_owned())
     }
 
     fn user_message(text: &str) -> Message {
@@ -155,13 +180,13 @@ mod tests {
 
     fn ok_body() -> serde_json::Value {
         serde_json::json!({
-            "id": "chatcmpl-abc",
+            "id": "chatcmpl-glm",
             "object": "chat.completion",
             "choices": [{
                 "index": 0,
                 "message": {
                     "role": "assistant",
-                    "content": "Hello from DeepSeek!"
+                    "content": "Hello from GLM-5.2!"
                 },
                 "finish_reason": "stop"
             }],
@@ -190,47 +215,43 @@ mod tests {
             .await;
     }
 
-    // OR9: compute_cost for known token counts
+    // GLM1: compute_cost for known token counts
     #[test]
-    fn or9_compute_cost_known_tokens() {
+    fn glm1_compute_cost_known_tokens() {
         let tokens = TokenCounts {
             input: 1000,
             output: 500,
             cached: 0,
         };
-        // 1000 * 1 + 500 * 2 = 1000 + 1000 = 2000
-        let cost = compute_cost(tokens);
-        assert_eq!(cost.microdollars, 2000);
+        // 1000 * 1 + 500 * 2 = 2000
+        assert_eq!(compute_cost(tokens).microdollars, 2000);
     }
 
     #[test]
-    fn or9b_compute_cost_zero_tokens() {
-        let cost = compute_cost(TokenCounts::default());
-        assert_eq!(cost.microdollars, 0);
+    fn glm1b_compute_cost_zero_tokens() {
+        assert_eq!(compute_cost(TokenCounts::default()).microdollars, 0);
     }
 
-    // OR10: capabilities are well-formed
+    // GLM2: capabilities are well-formed and include reasoning + tool calling
     #[test]
-    fn or10_capabilities_are_well_formed() {
-        let adapter = DeepSeekR1OpenRouter::new(SecretString::from("dummy"));
+    fn glm2_capabilities_are_well_formed() {
+        let adapter = Glm52OpenRouter::new(SecretString::from("dummy"));
         let caps = adapter.capabilities();
         assert!(caps.is_well_formed());
         assert!(caps.contains(Capability::ToolCalling));
-        assert!(caps.contains(Capability::StructuredOutput));
         assert!(caps.contains(Capability::ParallelToolCalls));
+        assert!(caps.contains(Capability::StructuredOutput));
+        assert!(caps.contains(Capability::Reasoning));
         assert!(!caps.contains(Capability::Vision));
-        assert!(!caps.contains(Capability::Reasoning));
-        assert!(!caps.contains(Capability::PromptCaching));
     }
 
-    // OR11: 401 maps to auth invalid credential
+    // GLM3: HTTP status mapping (same contract as every OpenRouter adapter)
     #[tokio::test]
-    async fn or11_401_maps_to_auth_invalid_credential() {
+    async fn glm3_401_maps_to_auth_invalid_credential() {
         let server = MockServer::start().await;
         mount_mock(&server, 401, error_body("invalid_api_key")).await;
 
-        let adapter = make_adapter(&server.uri());
-        let err = adapter
+        let err = make_adapter(&server.uri())
             .call(&[user_message("hi")], &[], &base_params())
             .await
             .expect_err("should fail");
@@ -239,7 +260,7 @@ mod tests {
             matches!(
                 err,
                 AdapterError::Auth {
-                    kind: AuthKind::InvalidCredential
+                    kind: crate::AuthKind::InvalidCredential
                 }
             ),
             "got: {err}"
@@ -247,29 +268,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn or11_403_maps_to_auth_forbidden() {
-        let server = MockServer::start().await;
-        mount_mock(&server, 403, error_body("permission_denied")).await;
-
-        let adapter = make_adapter(&server.uri());
-        let err = adapter
-            .call(&[user_message("hi")], &[], &base_params())
-            .await
-            .expect_err("should fail");
-
-        assert!(
-            matches!(
-                err,
-                AdapterError::Auth {
-                    kind: AuthKind::Forbidden
-                }
-            ),
-            "got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn or11_429_maps_to_rate_limit() {
+    async fn glm3_429_maps_to_rate_limit() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(COMPLETIONS_ENDPOINT))
@@ -281,8 +280,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adapter = make_adapter(&server.uri());
-        let err = adapter
+        let err = make_adapter(&server.uri())
             .call(&[user_message("hi")], &[], &base_params())
             .await
             .expect_err("should fail");
@@ -299,12 +297,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn or11_500_maps_to_provider_error() {
+    async fn glm3_500_maps_to_provider_error() {
         let server = MockServer::start().await;
         mount_mock(&server, 500, error_body("server_error")).await;
 
-        let adapter = make_adapter(&server.uri());
-        let err = adapter
+        let err = make_adapter(&server.uri())
             .call(&[user_message("hi")], &[], &base_params())
             .await
             .expect_err("should fail");
@@ -315,9 +312,9 @@ mod tests {
         );
     }
 
-    // OR12: round-trip 200 response
+    // GLM4: round-trip 200 response with correct cost and text
     #[tokio::test]
-    async fn or12_round_trip_200_response() {
+    async fn glm4_round_trip_200_response() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(COMPLETIONS_ENDPOINT))
@@ -329,32 +326,52 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adapter = make_adapter(&server.uri());
-        let response = adapter
+        let response = make_adapter(&server.uri())
             .call(&[user_message("hello")], &[], &base_params())
             .await
             .expect("should succeed");
 
-        assert_eq!(response.content.len(), 1);
         assert!(
-            matches!(&response.content[0], MessageContent::Text(t) if t == "Hello from DeepSeek!")
+            matches!(&response.content[0], MessageContent::Text(t) if t == "Hello from GLM-5.2!")
         );
-        assert!(response.tool_calls.is_empty());
-        assert_eq!(response.finish_reason, crate::FinishReason::EndTurn);
         assert_eq!(response.tokens.input, 10);
         assert_eq!(response.tokens.output, 5);
         // 10*1 + 5*2 = 20 µ$
         assert_eq!(response.cost.microdollars, 20);
     }
 
-    // OR13: SECURITY — API key not in errors
+    // GLM5: the pinned provider order lands in the request body
     #[tokio::test]
-    async fn or13_no_api_key_in_error_display() {
+    async fn glm5_provider_order_in_request_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(COMPLETIONS_ENDPOINT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(ok_body()))
+            .mount(&server)
+            .await;
+
+        let _ = make_adapter(&server.uri())
+            .call(&[user_message("hi")], &[], &base_params())
+            .await
+            .expect("should succeed");
+
+        let received = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&received[0].body).unwrap();
+        assert_eq!(body["model"], "z-ai/glm-5.2");
+        assert_eq!(
+            body["provider"]["order"],
+            serde_json::json!(["novita", "gmicloud"])
+        );
+        assert_eq!(body["provider"]["allow_fallbacks"], serde_json::json!(true));
+    }
+
+    // GLM6: SECURITY — API key never appears in error output
+    #[tokio::test]
+    async fn glm6_no_api_key_in_error_display() {
         let server = MockServer::start().await;
         mount_mock(&server, 401, error_body("invalid_api_key")).await;
 
-        let adapter = make_adapter(&server.uri());
-        let err = adapter
+        let err = make_adapter(&server.uri())
             .call(&[user_message("hi")], &[], &base_params())
             .await
             .expect_err("should fail");
@@ -367,12 +384,11 @@ mod tests {
         );
         assert!(!debug.contains(TEST_KEY), "key leaked in Debug: {debug}");
         assert!(!display.contains("sk-or"), "key prefix leaked: {display}");
-        assert!(!debug.contains("sk-or"), "key prefix leaked: {debug}");
     }
 
-    // OR14: SECURITY — redirects not followed
+    // GLM7: SECURITY — redirects are not followed (no-redirect client policy)
     #[tokio::test]
-    async fn or14_redirect_not_followed() {
+    async fn glm7_redirect_not_followed() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path(COMPLETIONS_ENDPOINT))
@@ -383,8 +399,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let adapter = make_adapter(&server.uri());
-        let err = adapter
+        let err = make_adapter(&server.uri())
             .call(&[user_message("hi")], &[], &base_params())
             .await
             .expect_err("302 should be surfaced as an error");
@@ -398,36 +413,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn or14b_redirect_sends_exactly_one_request() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path(COMPLETIONS_ENDPOINT))
-            .respond_with(
-                ResponseTemplate::new(302)
-                    .append_header("location", "http://attacker.example.com/leak"),
-            )
-            .mount(&server)
-            .await;
-
-        let adapter = make_adapter(&server.uri());
-        let _ = adapter
-            .call(&[user_message("hi")], &[], &base_params())
-            .await;
-
-        let received = server.received_requests().await.unwrap();
-        assert_eq!(
-            received.len(),
-            1,
-            "redirect must NOT trigger a second request; got {} requests",
-            received.len()
-        );
-    }
-
-    // Additional: adapter id is stable
+    // GLM8: adapter id is stable
     #[test]
-    fn adapter_id_is_stable() {
-        let adapter = DeepSeekR1OpenRouter::new(SecretString::from("dummy"));
-        assert_eq!(adapter.id(), "deepseek/deepseek-r1-0528@openrouter");
+    fn glm8_adapter_id_is_stable() {
+        let adapter = Glm52OpenRouter::new(SecretString::from("dummy"));
+        assert_eq!(adapter.id(), "z-ai/glm-5.2@openrouter");
     }
 }
