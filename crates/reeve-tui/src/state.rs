@@ -327,6 +327,34 @@ pub struct AppState {
     /// Drives the Decisions tab. Empty when not inspecting or when the agent
     /// has no recorded decisions in the tail window.
     pub inspect_authority_decisions: Vec<AuthorityDecision>,
+    /// Transient one-line notice shown in the chat footer (e.g. a
+    /// slash-command usage error). Never placed in `input` — the input
+    /// buffer stays the operator's text. Cleared on the next keystroke.
+    pub notice: Option<String>,
+    /// An engagement operation sent from the chat slash-command that is
+    /// awaiting its audited outcome. Resolved by the reload loop tailing
+    /// the audit log; independent of `notice` so a keystroke that clears
+    /// the "sent" notice does not swallow the eventual confirmation.
+    pub pending_engagement: Option<PendingEngagementOp>,
+    /// Live completion candidates for the current slash-command input,
+    /// recomputed after every keystroke while the chat input starts with
+    /// `/`. Rendered as a footer hint; `Tab` completes. Empty when the
+    /// input is not a slash command.
+    pub slash_suggestions: Vec<String>,
+}
+
+/// See [`AppState::pending_engagement`].
+#[derive(Debug, Clone)]
+pub struct PendingEngagementOp {
+    /// Operation verb (`open-engagement`, …) for display.
+    pub verb: &'static str,
+    /// Target engagement name; outcome events are matched on it.
+    pub name: String,
+    /// Wall-clock send time; audit events older than this belong to
+    /// previous operations on the same name.
+    pub sent_at: OffsetDateTime,
+    /// When to stop waiting and tell the operator to check the audit log.
+    pub deadline: std::time::Instant,
 }
 
 /// The four editable threshold fields in display order: label shown in the
@@ -406,6 +434,9 @@ impl Default for AppState {
             inspect_model_field: 0,
             inspect_model_editing: false,
             inspect_authority_decisions: Vec::new(),
+            notice: None,
+            pending_engagement: None,
+            slash_suggestions: Vec::new(),
         }
     }
 }

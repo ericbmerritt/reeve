@@ -589,12 +589,14 @@ fn resolve_default_data_dir(
     xdg_data_home: Option<&OsStr>,
     home: Option<&OsStr>,
 ) -> Result<PathBuf, RegistryError> {
-    crate::fs_util::resolve_reeve_data_root(xdg_data_home, home).map_err(|e| match e {
-        XdgBaseError::MissingHome => RegistryError::MissingHome,
-        XdgBaseError::RelativeDir { var_name, path } => {
-            RegistryError::RelativeDataDir { var_name, path }
-        }
-    })
+    crate::fs_util::resolve_reeve_data_root(xdg_data_home, home)
+        .map(|root| root.join("identities"))
+        .map_err(|e| match e {
+            XdgBaseError::MissingHome => RegistryError::MissingHome,
+            XdgBaseError::RelativeDir { var_name, path } => {
+                RegistryError::RelativeDataDir { var_name, path }
+            }
+        })
 }
 
 /// Case-sensitive: registry files are lowercase `.toml` by convention;

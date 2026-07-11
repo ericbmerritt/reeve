@@ -282,6 +282,69 @@ fn parse_authority_decision_line(line: &str) -> Option<AuthorityDecision> {
     })
 }
 
+// ── read_engagement_outcome_tail ──────────────────────────────────────────────
+
+/// The audited outcome of an engagement operation, recovered from the
+/// audit-log tail: either one of the success kinds
+/// (`engagement.opened/closed/reopened`) or a refusal with its reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngagementOutcome {
+    /// The audit `kind` string, e.g. `engagement.opened`.
+    pub kind: String,
+    /// Refusal reason token when `kind` is `engagement.op_refused`.
+    pub reason: Option<String>,
+}
+
+/// Scan the audit-log tail for the newest `engagement.*` event naming
+/// `name` with a timestamp at or after `since` (minus a small tolerance for
+/// same-host clock reads). Returns `None` while no such event has landed —
+/// the caller polls again on the next reload tick.
+///
+/// The audit log is the single source of truth here deliberately: the
+/// coordinator writes exactly one `engagement.*` event per operation, so
+/// tailing it cannot confuse a pre-existing record with the operation's
+/// own effect (e.g. a refused reopen of an already-open engagement).
+pub fn read_engagement_outcome_tail(
+    audit_path: &Path,
+    tail_bytes: u64,
+    name: &str,
+    since: OffsetDateTime,
+) -> Option<EngagementOutcome> {
+    let text = read_tail_text(audit_path, tail_bytes)?;
+    let tolerance = time::Duration::seconds(2);
+    text.lines()
+        .filter_map(|line| parse_engagement_event_line(line.trim(), name, since - tolerance))
+        .next_back()
+}
+
+fn parse_engagement_event_line(
+    line: &str,
+    name: &str,
+    since: OffsetDateTime,
+) -> Option<EngagementOutcome> {
+    if line.is_empty() {
+        return None;
+    }
+    let value: Value = serde_json::from_str(line).ok()?;
+    let kind = value.get("kind")?.as_str()?;
+    if !kind.starts_with("engagement.") {
+        return None;
+    }
+    if value.get("name").and_then(Value::as_str) != Some(name) {
+        return None;
+    }
+    if parse_rfc3339_field(&value, "at")? < since {
+        return None;
+    }
+    Some(EngagementOutcome {
+        kind: kind.to_owned(),
+        reason: value
+            .get("reason")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
 // ── read_cost ─────────────────────────────────────────────────────────────────
 
 /// Read `agents/lead/cost` and parse it as a cumulative USD cost.
@@ -314,6 +377,69 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    fn ts(s: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn engagement_outcome_tail_matches_name_kind_and_recency() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                // Older op on the same name: must be ignored via `since`.
+                r#"{"kind":"engagement.opened","name":"billing","at":"2026-01-01T00:00:00Z"}"#,
+                "\n",
+                // Different name: must be ignored.
+                r#"{"kind":"engagement.opened","name":"other","at":"2026-01-02T00:00:10Z"}"#,
+                "\n",
+                // Non-engagement kind: must be ignored.
+                r#"{"kind":"authority.decision","name":"billing","at":"2026-01-02T00:00:10Z"}"#,
+                "\n",
+                // The outcome for this operation.
+                r#"{"kind":"engagement.op_refused","name":"billing","reason":"name_taken","at":"2026-01-02T00:00:10Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let since = ts("2026-01-02T00:00:00Z");
+        let outcome = read_engagement_outcome_tail(&path, 64 * 1024, "billing", since)
+            .expect("refusal must be found");
+        assert_eq!(outcome.kind, "engagement.op_refused");
+        assert_eq!(outcome.reason.as_deref(), Some("name_taken"));
+
+        assert!(
+            read_engagement_outcome_tail(&path, 64 * 1024, "billing", ts("2026-01-03T00:00:00Z"))
+                .is_none(),
+            "events older than `since` must not resolve a newer operation"
+        );
+        assert!(
+            read_engagement_outcome_tail(&path, 64 * 1024, "missing", since).is_none(),
+            "no event for this name"
+        );
+    }
+
+    #[test]
+    fn engagement_outcome_tail_success_kind_has_no_reason() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("log.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"kind":"engagement.opened","name":"billing","root":"/w","at":"2026-01-02T00:00:10Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let outcome =
+            read_engagement_outcome_tail(&path, 64 * 1024, "billing", ts("2026-01-02T00:00:00Z"))
+                .expect("opened event must be found");
+        assert_eq!(outcome.kind, "engagement.opened");
+        assert_eq!(outcome.reason, None);
+    }
 
     // R1: read_status returns Idle for "idle" content.
     #[test]

@@ -240,6 +240,48 @@ fn reload_state(state: &mut AppState, data_dir: &Path, agent_registry_path: &Pat
     } else if state.quarantine_focus >= entry_count {
         state.quarantine_focus = entry_count - 1;
     }
+    resolve_pending_engagement(state, data_dir);
+}
+
+/// Resolve a pending `/engagement` operation against the audit log.
+///
+/// The coordinator writes exactly one `engagement.*` event per operation
+/// (success or refusal), so the audit tail is the confirmation channel —
+/// polling the engagement record instead could mistake a pre-existing
+/// record for the operation's own effect. Runs on every reload tick; the
+/// daemon's processing of the envelope itself generates filesystem events
+/// under `agents/`, so the resolving reload usually fires immediately
+/// after the operation lands.
+fn resolve_pending_engagement(state: &mut AppState, data_dir: &Path) {
+    let Some(pending) = state.pending_engagement.clone() else {
+        return;
+    };
+    let outcome = crate::reader::read_engagement_outcome_tail(
+        &audit_log_path(data_dir),
+        AUDIT_TAIL_BYTES,
+        &pending.name,
+        pending.sent_at,
+    );
+    if let Some(outcome) = outcome {
+        state.notice = Some(match outcome.kind.as_str() {
+            "engagement.opened" => format!("engagement opened: {}", pending.name),
+            "engagement.closed" => format!("engagement closed: {}", pending.name),
+            "engagement.reopened" => format!("engagement reopened: {}", pending.name),
+            _ => format!(
+                "engagement {} {} refused: {}",
+                pending.verb,
+                pending.name,
+                outcome.reason.as_deref().unwrap_or("unknown"),
+            ),
+        });
+        state.pending_engagement = None;
+    } else if std::time::Instant::now() >= pending.deadline {
+        state.notice = Some(format!(
+            "no confirmation for {} {} — check `reeve engagement list` and the audit log",
+            pending.verb, pending.name,
+        ));
+        state.pending_engagement = None;
+    }
 }
 
 /// Load the inspected agent's authority decisions, newest first, from the
@@ -454,6 +496,7 @@ pub fn run(
                         record_exit_to_session(session_path, &state);
                         return Ok(());
                     }
+                    update_slash_suggestions(&mut state, data_dir);
                     // Force a fresh panopticon read only on the *transition*
                     // into the panopticon screen, so the operator's first
                     // frame shows current state. Refreshing on every
@@ -538,6 +581,9 @@ fn handle_key(
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<bool, TuiError> {
+    // Any keystroke dismisses the transient footer notice; whatever the
+    // operator does next supersedes it.
+    state.notice = None;
     match (key.code, key.modifiers) {
         (KeyCode::Char('q'), KeyModifiers::NONE) => return Ok(true),
         (KeyCode::Tab, _) => {
@@ -546,7 +592,12 @@ fn handle_key(
             // conceptual parent screen). On Inspect, Tab is screen-local
             // — it cycles tabs across the top of the inspect view — so
             // the global Tab handler defers to handle_key_inspect.
+            // On Chat with a slash-command in the input, Tab is completion
+            // — the operator is mid-command, not navigating.
             match state.screen {
+                Screen::Chat if state.input.trim_start().starts_with('/') => {
+                    complete_slash_command(state, data_dir);
+                }
                 Screen::Chat | Screen::Panopticon => state.toggle_screen(),
                 // Tab from Quarantine/QuarantineCompose pops back to
                 // panopticon. QuarantineCompose is a modal; Tab cancels
@@ -1020,6 +1071,9 @@ fn submit_input(
     registry: &IdentityRegistry,
     keystore: &dyn OperatorKeyStore,
 ) -> Result<(), TuiError> {
+    if is_engagement_command(&state.input) {
+        return submit_engagement_command(state, data_dir, registry, keystore);
+    }
     submit_to_agent(
         state,
         data_dir,
@@ -1027,6 +1081,247 @@ fn submit_input(
         registry,
         keystore,
     )
+}
+
+/// True only when the first whitespace-delimited token is exactly
+/// `/engagement` — a prefix match would also swallow chat messages like
+/// `/engagements …` that merely share the spelling.
+fn is_engagement_command(input: &str) -> bool {
+    input.split_whitespace().next() == Some("/engagement")
+}
+
+/// Handle a `/engagement <verb> …` chat command by signing an operator
+/// operation envelope to the estate coordinator — the same payload and
+/// transport the `reeve engagement` CLI uses, so the audit trail is
+/// identical regardless of front door.
+///
+/// Grammar (whitespace-separated):
+/// - `/engagement open <name> <purpose…>` — root resolves like the CLI:
+///   the VCS toplevel of the TUI's working directory.
+/// - `/engagement close <name>`
+/// - `/engagement reopen <name>`
+///
+/// Parse and lookup errors are recoverable: they surface as a transient
+/// footer notice while the operator's typed command stays in the input
+/// buffer for correction — the input is never overwritten with error text
+/// (which would also risk sending that text to the lead as chat).
+fn submit_engagement_command(
+    state: &mut AppState,
+    data_dir: &Path,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<(), TuiError> {
+    let input = state.input.trim().to_owned();
+    let op = match parse_engagement_command(&input) {
+        Ok(op) => op,
+        Err(msg) => {
+            state.notice = Some(msg);
+            return Ok(());
+        }
+    };
+
+    let agent_registry_path = reeve_runtime::RuntimeLayout::new(data_dir).agent_registry_path();
+    let estate_record = AgentRegistry::open(agent_registry_path)
+        .ok()
+        .and_then(|r| r.lookup(reeve_runtime::ESTATE_AGENT_NAME).cloned());
+    let Some(estate_record) = estate_record else {
+        state.notice = Some("estate coordinator not registered; is the daemon running?".to_owned());
+        return Ok(());
+    };
+
+    let payload = serde_json::to_string(&op)
+        .map_err(|e| TuiError::Submit(crate::submit::SubmitError::Serialize(e)))?;
+    crate::submit::submit_payload_to(
+        &payload,
+        estate_record.identity_id,
+        &estate_record.inbox_dir,
+        registry,
+        keystore,
+    )
+    .map_err(TuiError::Submit)?;
+    state.notice = Some(format!(
+        "engagement operation sent: {} {} — awaiting confirmation",
+        op.verb(),
+        op.name()
+    ));
+    state.pending_engagement = Some(crate::state::PendingEngagementOp {
+        verb: op.verb(),
+        name: op.name().to_owned(),
+        sent_at: time::OffsetDateTime::now_utc(),
+        deadline: std::time::Instant::now() + Duration::from_secs(10),
+    });
+    state.set_input(String::new());
+    Ok(())
+}
+
+// ── Slash-command completion ──────────────────────────────────────────────────
+
+const SLASH_COMMANDS: &[&str] = &["/engagement"];
+const ENGAGEMENT_VERBS: &[&str] = &["open", "close", "reopen"];
+
+/// Compute completion candidates for the token currently being typed.
+///
+/// `open_names` / `closed_names` feed name completion for `close` and
+/// `reopen` respectively (`open` takes a fresh name, which cannot be
+/// completed). A trailing space means the operator is starting the next
+/// token, so every candidate for that position matches. Engagement names
+/// containing spaces do not complete cleanly — tokenization is
+/// whitespace-based — which degrades to no suggestion, never a wrong one.
+fn slash_completion_candidates(
+    input: &str,
+    open_names: &[String],
+    closed_names: &[String],
+) -> Vec<String> {
+    let trimmed = input.trim_start();
+    if !trimmed.starts_with('/') {
+        return Vec::new();
+    }
+    let starting_next_token = input.ends_with(char::is_whitespace);
+    let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+    // Index of the token being completed and the prefix already typed.
+    let (position, prefix) = if starting_next_token {
+        (tokens.len(), "")
+    } else {
+        (tokens.len() - 1, *tokens.last().unwrap_or(&""))
+    };
+    let matches = |pool: &[&str]| -> Vec<String> {
+        pool.iter()
+            .filter(|c| c.starts_with(prefix) && **c != prefix)
+            .map(|c| (*c).to_owned())
+            .collect()
+    };
+    match position {
+        0 => matches(SLASH_COMMANDS),
+        1 if tokens[0] == "/engagement" => matches(ENGAGEMENT_VERBS),
+        2 if tokens[0] == "/engagement" => {
+            let pool: Vec<&str> = match tokens[1] {
+                "close" => open_names.iter().map(String::as_str).collect(),
+                "reopen" => closed_names.iter().map(String::as_str).collect(),
+                _ => return Vec::new(),
+            };
+            matches(&pool)
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Replace the token being typed with `candidate` (or append it when the
+/// input ends at a token boundary), leaving a trailing space so the
+/// operator flows straight into the next token.
+fn apply_completion(input: &str, candidate: &str) -> String {
+    if input.ends_with(char::is_whitespace) || input.is_empty() {
+        format!("{input}{candidate} ")
+    } else {
+        let boundary = input.rfind(char::is_whitespace).map_or(0, |pos| {
+            pos + input[pos..].chars().next().map_or(1, char::len_utf8)
+        });
+        format!("{}{candidate} ", &input[..boundary])
+    }
+}
+
+/// Longest common prefix of the candidates (for multi-candidate Tab).
+fn common_prefix(candidates: &[String]) -> String {
+    let Some(first) = candidates.first() else {
+        return String::new();
+    };
+    let mut prefix = first.clone();
+    for c in &candidates[1..] {
+        while !c.starts_with(&prefix) {
+            prefix.pop();
+        }
+    }
+    prefix
+}
+
+/// Load engagement names partitioned by state for name completion. Errors
+/// degrade to empty pools — completion is a convenience, never a gate.
+fn engagement_name_pools(data_dir: &Path) -> (Vec<String>, Vec<String>) {
+    let root = reeve_runtime::RuntimeLayout::new(data_dir).engagements_root();
+    let Ok(registry) = reeve_runtime::EngagementRegistry::open(root) else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(records) = registry.list() else {
+        return (Vec::new(), Vec::new());
+    };
+    let (open, closed): (Vec<_>, Vec<_>) = records
+        .into_iter()
+        .partition(|r| r.state == reeve_runtime::EngagementState::Open);
+    (
+        open.into_iter().map(|r| r.name).collect(),
+        closed.into_iter().map(|r| r.name).collect(),
+    )
+}
+
+/// Recompute [`AppState::slash_suggestions`] from the current input.
+fn update_slash_suggestions(state: &mut AppState, data_dir: &Path) {
+    if state.screen != Screen::Chat || !state.input.trim_start().starts_with('/') {
+        state.slash_suggestions.clear();
+        return;
+    }
+    let (open_names, closed_names) = engagement_name_pools(data_dir);
+    state.slash_suggestions = slash_completion_candidates(&state.input, &open_names, &closed_names);
+}
+
+/// Tab-complete the slash command in the chat input: a unique candidate
+/// completes fully; multiple candidates extend to their longest common
+/// prefix (the footer hint shows the remaining choices).
+fn complete_slash_command(state: &mut AppState, data_dir: &Path) {
+    update_slash_suggestions(state, data_dir);
+    match state.slash_suggestions.as_slice() {
+        [] => {}
+        [only] => {
+            let completed = apply_completion(&state.input, &only.clone());
+            state.set_input(completed);
+        }
+        many => {
+            let prefix = common_prefix(many);
+            let last = state
+                .input
+                .split_whitespace()
+                .next_back()
+                .unwrap_or("")
+                .to_owned();
+            if prefix.len() > last.len() && !state.input.ends_with(char::is_whitespace) {
+                let boundary = state.input.len() - last.len();
+                let completed = format!("{}{prefix}", &state.input[..boundary]);
+                state.set_input(completed);
+            }
+        }
+    }
+    update_slash_suggestions(state, data_dir);
+}
+
+/// Parse the chat slash-command grammar into an [`reeve_runtime::EstateOp`].
+fn parse_engagement_command(input: &str) -> Result<reeve_runtime::EstateOp, String> {
+    const USAGE: &str = "usage: /engagement open <name> <purpose…> | close <name> | reopen <name>";
+    let mut tokens = input.split_whitespace();
+    let _command = tokens.next();
+    let verb = tokens.next().ok_or(USAGE)?;
+    let name = tokens.next().ok_or(USAGE)?.to_owned();
+    let rest: Vec<&str> = tokens.collect();
+    match verb {
+        "open" => {
+            if rest.is_empty() {
+                return Err(
+                    "open requires a purpose: /engagement open <name> <purpose…>".to_owned(),
+                );
+            }
+            let root = std::env::current_dir()
+                .map_err(|e| format!("cannot resolve working directory: {e}"))
+                .and_then(|cwd| {
+                    reeve_runtime::engagement::resolve_vcs_toplevel(&cwd)
+                        .map_err(|e| format!("cannot resolve VCS toplevel: {e}"))
+                })?;
+            Ok(reeve_runtime::EstateOp::OpenEngagement {
+                name,
+                purpose: rest.join(" "),
+                root: Some(root),
+            })
+        }
+        "close" if rest.is_empty() => Ok(reeve_runtime::EstateOp::CloseEngagement { name }),
+        "reopen" if rest.is_empty() => Ok(reeve_runtime::EstateOp::ReopenEngagement { name }),
+        _ => Err(USAGE.to_owned()),
+    }
 }
 
 fn submit_inspect_input(
@@ -1192,6 +1487,131 @@ mod tests {
 
     fn key(code: KeyCode) -> event::KeyEvent {
         event::KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn engagement_command_matches_exact_first_token_only() {
+        assert!(is_engagement_command("/engagement open n purpose"));
+        assert!(is_engagement_command("  /engagement close n"));
+        assert!(!is_engagement_command("/engagements are fun"));
+        assert!(!is_engagement_command("/engagementX open n p"));
+        assert!(!is_engagement_command("tell me about /engagement"));
+    }
+
+    #[test]
+    fn slash_completion_walks_command_verb_and_name_positions() {
+        let open = vec!["billing".to_owned(), "docs".to_owned()];
+        let closed = vec!["archive-2025".to_owned()];
+
+        assert_eq!(
+            slash_completion_candidates("/eng", &open, &closed),
+            vec!["/engagement"]
+        );
+        assert_eq!(
+            slash_completion_candidates("/engagement ", &open, &closed),
+            vec!["open", "close", "reopen"]
+        );
+        assert_eq!(
+            slash_completion_candidates("/engagement re", &open, &closed),
+            vec!["reopen"]
+        );
+        // close completes against OPEN engagements only.
+        assert_eq!(
+            slash_completion_candidates("/engagement close ", &open, &closed),
+            vec!["billing", "docs"]
+        );
+        assert_eq!(
+            slash_completion_candidates("/engagement close b", &open, &closed),
+            vec!["billing"]
+        );
+        // reopen completes against CLOSED engagements only.
+        assert_eq!(
+            slash_completion_candidates("/engagement reopen ", &open, &closed),
+            vec!["archive-2025"]
+        );
+        // open takes a fresh name: nothing to complete.
+        assert!(slash_completion_candidates("/engagement open ", &open, &closed).is_empty());
+        // Past the name position there is nothing to complete.
+        assert!(
+            slash_completion_candidates("/engagement close billing ", &open, &closed).is_empty()
+        );
+        // Non-slash input never suggests.
+        assert!(slash_completion_candidates("hello /engagement", &open, &closed).is_empty());
+        // A token that already equals the only candidate suggests nothing.
+        assert!(slash_completion_candidates("/engagement", &open, &closed).is_empty());
+    }
+
+    #[test]
+    fn apply_completion_replaces_partial_token_and_appends_at_boundary() {
+        assert_eq!(apply_completion("/eng", "/engagement"), "/engagement ");
+        assert_eq!(
+            apply_completion("/engagement re", "reopen"),
+            "/engagement reopen "
+        );
+        assert_eq!(
+            apply_completion("/engagement close ", "billing"),
+            "/engagement close billing "
+        );
+    }
+
+    #[test]
+    fn tab_in_chat_completes_slash_command_instead_of_toggling_screens() {
+        let mut state = AppState::default();
+        state.screen = Screen::Chat;
+        state.set_input("/eng".to_owned());
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let was_exit = handle_key(
+            key(KeyCode::Tab),
+            &mut state,
+            tmp.path(),
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!was_exit);
+        assert_eq!(
+            state.screen,
+            Screen::Chat,
+            "Tab mid-command must not navigate"
+        );
+        assert_eq!(state.input, "/engagement ");
+        assert_eq!(
+            state.slash_suggestions,
+            vec!["open", "close", "reopen"],
+            "post-completion suggestions show the next position"
+        );
+
+        // Tab with multiple candidates extends nothing (no common prefix
+        // growth from empty) but leaves the input intact.
+        let was_exit = handle_key(
+            key(KeyCode::Tab),
+            &mut state,
+            tmp.path(),
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!was_exit);
+        assert_eq!(state.input, "/engagement ");
+    }
+
+    #[test]
+    fn engagement_parse_rejects_bad_grammar_and_accepts_verbs() {
+        assert!(parse_engagement_command("/engagement").is_err());
+        assert!(parse_engagement_command("/engagement open onlyname").is_err());
+        assert!(parse_engagement_command("/engagement close n extra").is_err());
+        assert!(parse_engagement_command("/engagement bogus n").is_err());
+        assert!(matches!(
+            parse_engagement_command("/engagement close billing"),
+            Ok(reeve_runtime::EstateOp::CloseEngagement { name }) if name == "billing"
+        ));
+        assert!(matches!(
+            parse_engagement_command("/engagement reopen billing"),
+            Ok(reeve_runtime::EstateOp::ReopenEngagement { name }) if name == "billing"
+        ));
     }
 
     fn state_with_agents(count: usize) -> AppState {
@@ -1808,6 +2228,103 @@ mod tests {
         assert!(!was_exit, "Esc from inspect must not exit the TUI");
         assert_eq!(state.screen, Screen::Panopticon);
         assert_eq!(state.panopticon_focus, 2);
+    }
+
+    // A malformed /engagement command surfaces its error as a footer
+    // notice and leaves the operator's typed text in the input buffer —
+    // stuffing the error into the input both destroys the command the
+    // operator was editing and risks sending the error text to the lead
+    // as chat on the next Enter.
+    #[test]
+    fn engagement_parse_error_sets_notice_and_preserves_input() {
+        let mut state = AppState::default();
+        state.screen = Screen::Chat;
+        state.set_input("/engagement open onlyname".to_owned());
+        let (registry, keystore) = test_registry_and_keystore();
+        let tmp = tempfile::tempdir().unwrap();
+        let was_exit = handle_key(
+            key(KeyCode::Enter),
+            &mut state,
+            tmp.path(),
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(!was_exit);
+        assert_eq!(
+            state.input, "/engagement open onlyname",
+            "the typed command must survive a parse error"
+        );
+        let notice = state
+            .notice
+            .as_deref()
+            .expect("parse error must set notice");
+        assert!(notice.contains("purpose"), "notice: {notice}");
+
+        // The next keystroke dismisses the notice.
+        let _ = handle_key(
+            key(KeyCode::Char('x')),
+            &mut state,
+            tmp.path(),
+            tmp.path(),
+            &registry,
+            &keystore,
+        )
+        .unwrap();
+        assert!(state.notice.is_none(), "any keystroke clears the notice");
+    }
+
+    // A pending engagement op resolves from the audit tail: refusals
+    // surface their reason, and resolution survives an intervening
+    // keystroke that cleared the "sent" notice.
+    #[test]
+    fn pending_engagement_resolves_from_audit_refusal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_dir = tmp.path().join("audit");
+        std::fs::create_dir_all(&audit_dir).unwrap();
+        std::fs::write(
+            audit_dir.join("log.jsonl"),
+            concat!(
+                r#"{"kind":"engagement.op_refused","name":"billing","reason":"name_taken","at":"2030-01-01T00:00:10Z"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut state = AppState::default();
+        state.notice = None; // "sent" notice already dismissed by a keystroke
+        state.pending_engagement = Some(crate::state::PendingEngagementOp {
+            verb: "open-engagement",
+            name: "billing".to_owned(),
+            sent_at: OffsetDateTime::from_unix_timestamp(1_893_456_000).unwrap(), // 2030-01-01T00:00:00Z
+            deadline: std::time::Instant::now() + std::time::Duration::from_mins(1),
+        });
+
+        resolve_pending_engagement(&mut state, tmp.path());
+
+        let notice = state.notice.as_deref().expect("refusal must set a notice");
+        assert!(notice.contains("refused"), "notice: {notice}");
+        assert!(notice.contains("name_taken"), "notice: {notice}");
+        assert!(state.pending_engagement.is_none());
+    }
+
+    #[test]
+    fn pending_engagement_times_out_with_a_pointer_to_the_audit_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut state = AppState::default();
+        state.pending_engagement = Some(crate::state::PendingEngagementOp {
+            verb: "close-engagement",
+            name: "billing".to_owned(),
+            sent_at: OffsetDateTime::now_utc(),
+            deadline: std::time::Instant::now(), // already expired
+        });
+
+        resolve_pending_engagement(&mut state, tmp.path());
+
+        let notice = state.notice.as_deref().expect("timeout must set a notice");
+        assert!(notice.contains("no confirmation"), "notice: {notice}");
+        assert!(state.pending_engagement.is_none());
     }
 
     // IK6: Tab on the inspect screen is screen-local — it cycles tabs,

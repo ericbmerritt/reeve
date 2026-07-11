@@ -134,7 +134,28 @@ pub fn submit_message(
     let recipient_id = snapshot
         .agent_identity_id()
         .ok_or(SubmitError::AgentIdMissing)?;
+    submit_payload_to(
+        payload,
+        recipient_id,
+        &dirs.inbox_root(),
+        registry,
+        keystore,
+    )
+}
 
+/// Write `payload` to an explicit recipient's inbox as a signed envelope.
+///
+/// The snapshot-free variant of [`submit_message`], for recipients that are
+/// not model-backed agents and therefore have no spawn snapshot — the estate
+/// coordinator's operation envelopes take this path. Same signing key, same
+/// tmp → rename deposit, same watcher verification on the other side.
+pub fn submit_payload_to(
+    payload: &str,
+    recipient_id: reeve_types::IdentityId,
+    inbox_root: &std::path::Path,
+    registry: &IdentityRegistry,
+    keystore: &dyn OperatorKeyStore,
+) -> Result<(), SubmitError> {
     let stored = registry.list().map_err(SubmitError::Registry)?;
     let operator = find_operator(&stored).ok_or(SubmitError::NoOperatorEnrolled)?;
     let operator_key = operator
@@ -179,8 +200,8 @@ pub fn submit_message(
     let json = serde_json::to_string(&envelope).map_err(SubmitError::Serialize)?;
 
     let filename = format!("{message_id}.json");
-    let new_path = dirs.inbox_root().join("new").join(&filename);
-    let tmp_dir = dirs.inbox_root().join("tmp");
+    let new_path = inbox_root.join("new").join(&filename);
+    let tmp_dir = inbox_root.join("tmp");
 
     let mut tmp = NamedTempFile::new_in(&tmp_dir).map_err(|source| SubmitError::Io {
         path: tmp_dir.clone(),

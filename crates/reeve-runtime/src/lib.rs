@@ -15,6 +15,8 @@ pub mod cost_meter;
 pub mod daemon;
 pub mod delivery;
 pub mod dispatcher;
+pub mod engagement;
+pub mod estate;
 pub(crate) mod fs_util;
 pub mod identity_registry;
 pub mod inbox;
@@ -32,7 +34,8 @@ pub mod watcher;
 
 pub use agent::{Agent, AgentError, ProcessInbound, QuarantineEvent};
 pub use agent_fs::{
-    AgentDirs, AgentFsError, AtomicFileWriter, ConversationEntry, ConversationThread, RuntimeLayout,
+    default_data_root, migrate_legacy_identities_nesting, AgentDirs, AgentFsError,
+    AtomicFileWriter, ConversationEntry, ConversationThread, DataRootError, RuntimeLayout,
 };
 pub use agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentRegistryError, AgentStatus,
@@ -50,6 +53,8 @@ pub use daemon::{
 };
 pub use delivery::{deposit_envelope, DepositError};
 pub use dispatcher::{MessageDispatcher, SendError, SendFailed, SendMessage, SendResult};
+pub use engagement::{EngagementError, EngagementRecord, EngagementRegistry, EngagementState};
+pub use estate::{EstateCoordinator, EstateOp, ESTATE_AGENT_NAME};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{

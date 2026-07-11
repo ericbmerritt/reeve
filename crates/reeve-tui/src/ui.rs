@@ -309,7 +309,31 @@ fn build_input_line(state: &AppState) -> Line<'static> {
 /// share a glance-level view of session spend, so the format follows. The
 /// old `${:.4} USD` (four decimal places, with currency suffix) was an
 /// outlier inherited from the walking-skeleton stub.
+///
+/// A transient [`AppState::notice`] (slash-command feedback) replaces the
+/// nav text until the next keystroke — the input buffer is never used for
+/// feedback, so the operator's typed text survives an error.
 fn build_footer(state: &AppState) -> Line<'static> {
+    if let Some(notice) = &state.notice {
+        let style = if no_color() {
+            Style::default()
+        } else {
+            Style::default().fg(Color::Yellow)
+        };
+        return Line::from(Span::styled(notice.clone(), style));
+    }
+    if !state.slash_suggestions.is_empty() {
+        let style = if no_color() {
+            Style::default()
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let hint = format!(
+            "{} \u{2500}\u{2500}\u{2500} Tab completes",
+            state.slash_suggestions.join(" \u{00B7} ")
+        );
+        return Line::from(Span::styled(hint, style));
+    }
     let nav = "PgUp/PgDn scroll \u{00B7} End bottom \u{00B7} q quit \u{2500}\u{2500}\u{2500} ";
     let cost = format!("${:.2}", state.cost_usd);
     Line::from(format!("{nav}{cost}"))

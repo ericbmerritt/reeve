@@ -424,6 +424,18 @@ pub fn daemon_run(
 ) -> Result<(), DaemonError> {
     info!(pid = std::process::id(), "daemon starting");
     let _lock = acquire_lock(state_dir.clone())?;
+    match crate::agent_fs::migrate_legacy_identities_nesting(data_dir) {
+        Ok(moved) if !moved.is_empty() => {
+            info!(?moved, "migrated legacy identities/ nesting to data root");
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Err(DaemonError::Resource {
+                component: "data-root layout migration",
+                source: Box::new(e),
+            });
+        }
+    }
     let (registry, replay, delivery, audit) = open_resources(data_dir)?;
     let agent_registry_path =
         AgentRegistry::default_registry_path().map_err(|e| DaemonError::Resource {
@@ -460,12 +472,16 @@ fn acquire_lock(state_dir: PathBuf) -> Result<RuntimeLock, DaemonError> {
     })
 }
 
-/// Open all persistent resources needed by the daemon.
+/// Open all persistent resources needed by the daemon. `data_dir` is the
+/// reeve data root; identity TOMLs live in its `identities/` subdirectory,
+/// the ledgers and audit log at the root itself.
 fn open_resources(data_dir: &Path) -> Result<Resources, DaemonError> {
     let registry =
-        IdentityRegistry::open(data_dir.to_path_buf()).map_err(|e| DaemonError::Resource {
-            component: "identity registry",
-            source: Box::new(e),
+        IdentityRegistry::open(RuntimeLayout::new(data_dir).identities_root()).map_err(|e| {
+            DaemonError::Resource {
+                component: "identity registry",
+                source: Box::new(e),
+            }
         })?;
     let replay = ReplayLedger::open(data_dir.to_path_buf()).map_err(|e| DaemonError::Resource {
         component: "replay ledger",
@@ -577,12 +593,14 @@ fn run_actor_system(
         }
     }
 
-    // On clean shutdown, mark the lead agent as Stopped. Failure here is
-    // non-fatal: the registry will show Running at next startup and be
-    // corrected then.
+    // On clean shutdown, mark the daemon's own actors as Stopped. Failure
+    // here is non-fatal: the registry will show Running at next startup and
+    // be corrected then.
     if let Ok(mut registry) = AgentRegistry::open(agent_registry_path) {
-        if let Err(err) = registry.update_status("lead", AgentStatus::Stopped) {
-            tracing::warn!(err = %err, "failed to mark lead agent as Stopped on shutdown");
+        for name in ["lead", crate::estate::ESTATE_AGENT_NAME] {
+            if let Err(err) = registry.update_status(name, AgentStatus::Stopped) {
+                tracing::warn!(err = %err, name, "failed to mark agent as Stopped on shutdown");
+            }
         }
     }
 
@@ -616,6 +634,134 @@ struct AgentStartup {
     operator_id: reeve_types::IdentityId,
     /// Team-config byte cap on caller-supplied `system_prompt` at spawn.
     max_system_prompt_bytes: usize,
+    /// The estate coordinator's durable identity.
+    estate_id: reeve_types::IdentityId,
+    /// Inbox handle for the estate coordinator's provisioned maildir.
+    estate_inbox: AgentInbox,
+}
+
+/// Look up a named agent identity in the agent registry, verifying the
+/// on-disk keypair against the identity registry; bootstrap a fresh identity
+/// and register both records when the name is unseen. Shared by the lead and
+/// the estate coordinator — the two identities the daemon itself owns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the function threads two registries plus the identity fields; \
+              bundling into a struct trades clarity for indirection at the \
+              two call sites"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "linear sequence of verification guards; splitting on line count \
+              would fragment the reuse-vs-bootstrap decision"
+)]
+fn ensure_named_agent_identity(
+    name: &str,
+    identity_display_name: &str,
+    persona_name: Option<String>,
+    inbox_dir: PathBuf,
+    keypair: &reeve_types::Keypair,
+    agent_registry: &mut AgentRegistry,
+    identity_registry: &IdentityRegistry,
+    operator_id: reeve_types::IdentityId,
+) -> Result<reeve_types::IdentityId, DaemonError> {
+    if let Some(record) = agent_registry.lookup(name) {
+        let id = record.identity_id;
+        agent_registry
+            .update_status(name, AgentStatus::Running)
+            .map_err(|e| DaemonError::Resource {
+                component: "agent registry update",
+                source: Box::new(e),
+            })?;
+        // Halt if the key file was replaced without updating the registry —
+        // proceeding would produce envelopes that fail signature verification
+        // at every counterparty.
+        match identity_registry.lookup(id) {
+            Ok(Some(stored)) => {
+                let key_records = stored.key_records();
+                let stored_key = &key_records
+                    .first()
+                    .ok_or_else(|| DaemonError::Resource {
+                        component: "identity registry lookup",
+                        source: Box::new(io::Error::other(
+                            "stored identity has no key records; registry may be corrupt",
+                        )),
+                    })?
+                    .public_key;
+                if keypair.public() != stored_key {
+                    return Err(DaemonError::Resource {
+                        component: "keypair mismatch",
+                        source: Box::new(io::Error::other(
+                            "on-disk identity.key does not match stored public key; \
+                             restore the correct key file or re-register the agent",
+                        )),
+                    });
+                }
+            }
+            Ok(None) => {
+                return Err(DaemonError::Resource {
+                    component: "identity registry lookup",
+                    source: Box::new(io::Error::other(
+                        "agent_id found in agent registry but no entry in identity registry",
+                    )),
+                });
+            }
+            Err(err) => {
+                return Err(DaemonError::Resource {
+                    component: "identity registry lookup",
+                    source: Box::new(err),
+                });
+            }
+        }
+        debug!(agent_id = %id, name, "reusing existing identity");
+        Ok(id)
+    } else {
+        let identity =
+            reeve_types::Identity::new_agent(identity_display_name.to_owned(), operator_id)
+                .map_err(|e| DaemonError::Resource {
+                    component: "agent identity",
+                    source: Box::new(e),
+                })?;
+        let agent_id = identity.identity_id;
+        let public_key = *keypair.public();
+        let key_record = reeve_types::KeyRecord::new(agent_id, public_key).map_err(|e| {
+            DaemonError::Resource {
+                component: "key record",
+                source: Box::new(e),
+            }
+        })?;
+        let stored =
+            StoredIdentity::new(identity, key_record).map_err(|e| DaemonError::Resource {
+                component: "stored identity",
+                source: Box::new(e),
+            })?;
+        identity_registry
+            .write(&stored)
+            .map_err(|e| DaemonError::Resource {
+                component: "identity registry write",
+                source: Box::new(e),
+            })?;
+        let validated_name = ValidatedAgentName::new(name).map_err(|e| DaemonError::Resource {
+            component: "agent name",
+            source: Box::new(e),
+        })?;
+        agent_registry
+            .register(AgentRecord {
+                name: validated_name,
+                identity_id: agent_id,
+                inbox_dir,
+                persona_name,
+                spawned_at: time::OffsetDateTime::now_utc(),
+                status: AgentStatus::Running,
+                stopped_reason: None,
+            })
+            .map_err(|e| DaemonError::Resource {
+                component: "agent registry register",
+                source: Box::new(e),
+            })?;
+        debug!(agent_id = %agent_id, name, "registered new identity");
+        Ok(agent_id)
+    }
 }
 
 /// Fallible preparation: load configs, provision directories, resolve the
@@ -715,104 +861,47 @@ fn prepare_agent_startup(
             })?
     };
 
-    let agent_id = if let Some(record) = agent_registry.lookup("lead") {
-        let id = record.identity_id;
-        agent_registry
-            .update_status("lead", AgentStatus::Running)
-            .map_err(|e| DaemonError::Resource {
-                component: "agent registry update",
-                source: Box::new(e),
-            })?;
-        // Halt if the key file was replaced without updating the registry —
-        // proceeding would produce envelopes that fail signature verification
-        // at every counterparty.
-        match identity_registry.lookup(id) {
-            Ok(Some(stored)) => {
-                let key_records = stored.key_records();
-                let stored_key = &key_records
-                    .first()
-                    .ok_or_else(|| DaemonError::Resource {
-                        component: "identity registry lookup",
-                        source: Box::new(io::Error::other(
-                            "stored identity has no key records; registry may be corrupt",
-                        )),
-                    })?
-                    .public_key;
-                if keypair.public() != stored_key {
-                    return Err(DaemonError::Resource {
-                        component: "keypair mismatch",
-                        source: Box::new(io::Error::other(
-                            "on-disk identity.key does not match stored public key; \
-                             restore the correct key file or re-register the agent",
-                        )),
-                    });
-                }
-            }
-            Ok(None) => {
-                return Err(DaemonError::Resource {
-                    component: "identity registry lookup",
-                    source: Box::new(io::Error::other(
-                        "agent_id found in agent registry but no entry in identity registry",
-                    )),
-                });
-            }
-            Err(err) => {
-                return Err(DaemonError::Resource {
-                    component: "identity registry lookup",
-                    source: Box::new(err),
-                });
-            }
-        }
-        debug!(agent_id = %id, "reusing existing lead identity");
-        id
-    } else {
-        // Bootstrap: lead agent record does not exist yet.
-        let identity =
-            reeve_types::Identity::new_agent(lead_member.persona_name.clone(), operator_id)
-                .map_err(|e| DaemonError::Resource {
-                    component: "agent identity",
-                    source: Box::new(e),
-                })?;
-        let agent_id = identity.identity_id;
-        let public_key = *keypair.public();
-        let key_record = reeve_types::KeyRecord::new(agent_id, public_key).map_err(|e| {
+    let agent_id = ensure_named_agent_identity(
+        "lead",
+        &lead_member.persona_name,
+        Some(lead_member.persona_name.clone()),
+        dirs.inbox_root(),
+        &keypair,
+        &mut agent_registry,
+        identity_registry,
+        operator_id,
+    )?;
+
+    // The estate coordinator is addressable exactly like an agent — reserved
+    // name, provisioned inbox, durable identity — so the CLI and TUI resolve
+    // it with the same registry lookup they use for anything else. It is not
+    // model-backed: the resume pass skips it and launch_actors starts the
+    // coordinator actor on this inbox instead of an Agent.
+    let estate_dirs =
+        AgentDirs::provision(data_dir, crate::estate::ESTATE_AGENT_NAME).map_err(|e| {
             DaemonError::Resource {
-                component: "key record",
+                component: "estate dirs",
                 source: Box::new(e),
             }
         })?;
-        let stored =
-            StoredIdentity::new(identity, key_record).map_err(|e| DaemonError::Resource {
-                component: "stored identity",
+    let estate_keypair =
+        generate_or_load_keypair(&estate_dirs.identity_key_path()).map_err(|e| {
+            DaemonError::Resource {
+                component: "estate keypair",
                 source: Box::new(e),
-            })?;
-        identity_registry
-            .write(&stored)
-            .map_err(|e| DaemonError::Resource {
-                component: "identity registry write",
-                source: Box::new(e),
-            })?;
-        let lead_name = ValidatedAgentName::new("lead").map_err(|e| DaemonError::Resource {
-            component: "lead agent name",
-            source: Box::new(e),
+            }
         })?;
-        agent_registry
-            .register(AgentRecord {
-                name: lead_name,
-                identity_id: agent_id,
-                inbox_dir: dirs.inbox_root(),
-                persona_name: Some(lead_member.persona_name.clone()),
-                spawned_at: time::OffsetDateTime::now_utc(),
-                status: AgentStatus::Running,
-                stopped_reason: None,
-            })
-            .map_err(|e| DaemonError::Resource {
-                component: "agent registry register",
-                source: Box::new(e),
-            })?;
-        debug!(agent_id = %agent_id, "registered new lead identity");
-        agent_id
-    };
+    let estate_id = ensure_named_agent_identity(
+        crate::estate::ESTATE_AGENT_NAME,
+        crate::estate::ESTATE_AGENT_NAME,
+        None,
+        estate_dirs.inbox_root(),
+        &estate_keypair,
+        &mut agent_registry,
+        identity_registry,
+        operator_id,
+    )?;
+    let estate_inbox = AgentInbox::from_path(estate_dirs.inbox_root());
 
     // 7. Resolve the model adapter against this persona's preferences.
     let adapter_refs: Vec<&dyn reeve_adapter::Adapter> =
@@ -864,6 +953,8 @@ fn prepare_agent_startup(
         identity_registry: Arc::clone(identity_registry),
         operator_id,
         max_system_prompt_bytes: team.max_system_prompt_bytes(),
+        estate_id,
+        estate_inbox,
     })
 }
 
@@ -898,6 +989,8 @@ fn launch_actors(
         identity_registry,
         operator_id,
         max_system_prompt_bytes,
+        estate_id,
+        estate_inbox,
     } = startup;
 
     // HeartbeatActor: touches the heartbeat file every second.
@@ -937,6 +1030,26 @@ fn launch_actors(
             blacklist_handle_for_watcher,
             audit_for_watcher,
         )
+    });
+
+    // EstateCoordinator: operator-tier organizational operations arriving as
+    // signed envelopes on the reserved `estate` inbox.
+    let engagements = crate::engagement::EngagementRegistry::open(
+        RuntimeLayout::new(&data_dir).engagements_root(),
+    )
+    .map_err(|e| DaemonError::Resource {
+        component: "engagement registry",
+        source: Box::new(e),
+    })?;
+    let estate_audit = Arc::clone(&audit_shared);
+    let estate_addr = actix::Supervisor::start(move |_| {
+        crate::estate::EstateCoordinator::new(operator_id, engagements, estate_audit)
+    });
+    watcher_addr.do_send(WatchInbox {
+        agent_id: estate_id,
+        inbox: estate_inbox,
+        on_quarantine: None,
+        recipient: estate_addr.recipient(),
     });
 
     // The dispatcher re-opens the agent registry on every dispatch so it
@@ -1177,7 +1290,12 @@ fn resume_persisted_subagents(
     };
 
     for record in registry.list() {
-        if record.name.as_str() == "lead" {
+        // The lead and the estate coordinator are the daemon's own actors,
+        // launched directly by launch_actors — neither is a resumable
+        // model-backed subagent.
+        if record.name.as_str() == "lead"
+            || record.name.as_str() == crate::estate::ESTATE_AGENT_NAME
+        {
             continue;
         }
         if let Err(err) = resume_one_subagent(
@@ -1709,9 +1827,15 @@ mod tests {
             "keypair public key must be stable across restarts"
         );
 
-        // The identity registry must contain exactly one entry for the lead
-        // agent after the second call — no duplication on the second bootstrap.
-        // (The other entry is the test operator enrolled before the first call.)
+        assert_eq!(
+            first.estate_id, second.estate_id,
+            "estate coordinator identity must be stable across restarts"
+        );
+
+        // The identity registry must contain exactly two Agent-typed entries
+        // after the second call — the lead and the estate coordinator, with
+        // no duplication on the second bootstrap. (The remaining entry is
+        // the test operator enrolled before the first call.)
         let stored = identity_registry2
             .lookup(second.agent_id)
             .expect("identity registry lookup must not fail")
@@ -1730,9 +1854,9 @@ mod tests {
             .collect();
         assert_eq!(
             agents.len(),
-            1,
-            "identity registry must contain exactly one Agent-typed entry (the lead), \
-             not duplicated; got: {agents:?}"
+            2,
+            "identity registry must contain exactly two Agent-typed entries \
+             (lead + estate), not duplicated; got: {agents:?}"
         );
 
         // The agent registry must show the lead record with status Running
