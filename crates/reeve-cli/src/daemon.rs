@@ -11,7 +11,7 @@ use clap::Subcommand;
 use reeve_runtime::runtime_lock::{default_log_path, default_state_dir};
 use reeve_runtime::{
     daemon_run, daemon_spawn, daemon_status, daemon_stop, keychain::labels, DaemonError,
-    DaemonStatus, IdentityRegistry, KeychainError, OperatorSecretStore,
+    DaemonStatus, KeychainError, OperatorSecretStore,
 };
 use secrecy::ExposeSecret as _;
 
@@ -244,7 +244,7 @@ fn cmd_run_internal() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let state_dir = default_state_dir()?;
-    let data_dir = IdentityRegistry::default_data_dir()?;
+    let data_dir = reeve_runtime::default_data_root()?;
     let adapters = build_adapters_for_daemon()?;
     daemon_run(state_dir, &data_dir, &adapters).map_err(Into::into)
 }

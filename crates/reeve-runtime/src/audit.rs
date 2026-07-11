@@ -192,6 +192,62 @@ pub enum AuditEvent {
         #[serde(with = "time::serde::rfc3339")]
         at: OffsetDateTime,
     },
+
+    /// An engagement was opened by the operator.
+    ///
+    /// `root` is the resolved working root recorded as the engagement's
+    /// context (already canonicalized by the coordinator), or `null` for
+    /// rootless work. Recording it here makes the context-resolution
+    /// decision auditable — the effectors ladder will enforce this exact
+    /// path as the file jail.
+    #[serde(rename = "engagement.opened")]
+    EngagementOpened {
+        /// Operator identity that issued the operation.
+        sender_id: IdentityId,
+        name: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        root: Option<PathBuf>,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// An engagement was closed. The record and its directory persist;
+    /// the name is never reused.
+    #[serde(rename = "engagement.closed")]
+    EngagementClosed {
+        sender_id: IdentityId,
+        name: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// A closed engagement was reopened. Context is restored exactly as
+    /// recorded at open — reopening never rewrites it.
+    #[serde(rename = "engagement.reopened")]
+    EngagementReopened {
+        sender_id: IdentityId,
+        name: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// An estate operation was refused. `reason` is a short machine-readable
+    /// token (e.g. `"not_operator"`, `"name_taken"`, `"wrong_state"`,
+    /// `"invalid_payload"`); refusals are audited so an attempted operation
+    /// is never a forensic blind spot.
+    #[serde(rename = "engagement.op_refused")]
+    EngagementOpRefused {
+        /// Sender identity where known; a malformed envelope may not carry one.
+        sender_id: Option<IdentityId>,
+        /// Operation verb as received (e.g. `"open-engagement"`).
+        op: String,
+        /// Engagement name the operation targeted, where one was parseable.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        reason: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
 }
 
 /// Disposition field for `authority.decision` audit entries.
@@ -746,6 +802,29 @@ mod tests {
             AuditEvent::TransportFilenameRejected {
                 agent_id: recipient_id,
                 reason: FilenameError::NotUtf8,
+                at: at(),
+            },
+            AuditEvent::EngagementOpened {
+                sender_id,
+                name: "n".repeat(255),
+                root: Some(PathBuf::from(format!("/{}", "p".repeat(1024)))),
+                at: at(),
+            },
+            AuditEvent::EngagementClosed {
+                sender_id,
+                name: "n".repeat(255),
+                at: at(),
+            },
+            AuditEvent::EngagementReopened {
+                sender_id,
+                name: "n".repeat(255),
+                at: at(),
+            },
+            AuditEvent::EngagementOpRefused {
+                sender_id: Some(sender_id),
+                op: "open-engagement".to_owned(),
+                name: Some("n".repeat(255)),
+                reason: "name_taken".to_owned(),
                 at: at(),
             },
         ];

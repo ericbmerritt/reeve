@@ -42,10 +42,12 @@ const AGENT_DIR_MODE: u32 = 0o700;
 ///
 /// ```text
 /// <root>/
+///   identities/<uuid>.toml         ← IdentityRegistry
 ///   personas/<name>/config.toml
 ///   personas/<name>/profile.toml
 ///   agents/<name>/…                ← see AgentDirs
 ///   teams/<name>.toml
+///   engagements/<name>/record.toml
 ///   blacklist.toml
 /// ```
 #[derive(Debug, Clone)]
@@ -98,6 +100,11 @@ impl RuntimeLayout {
         self.root.join("agents")
     }
 
+    /// Agent registry file: `<root>/agents/registry.toml`.
+    pub fn agent_registry_path(&self) -> PathBuf {
+        self.agents_root().join("registry.toml")
+    }
+
     /// Open an [`AgentDirs`] handle for the named agent.
     ///
     /// This is a path-construction call only — no I/O. Returns
@@ -113,6 +120,36 @@ impl RuntimeLayout {
         self.root.join("teams").join(name).with_extension("toml")
     }
 
+    // ── Engagements ───────────────────────────────────────────────────────────
+
+    /// Root of the engagements subtree: `<root>/engagements/`.
+    ///
+    /// Each subdirectory is a named engagement; directories persist after
+    /// close (names are never reused), so directory existence doubles as
+    /// the name-permanence check.
+    pub fn engagements_root(&self) -> PathBuf {
+        self.root.join("engagements")
+    }
+
+    /// Directory for a named engagement: `<root>/engagements/<name>/`.
+    pub fn engagement_dir(&self, name: &str) -> PathBuf {
+        self.engagements_root().join(name)
+    }
+
+    /// Engagement record file: `<root>/engagements/<name>/record.toml`.
+    pub fn engagement_record_path(&self, name: &str) -> PathBuf {
+        self.engagement_dir(name).join("record.toml")
+    }
+
+    // ── Identities ────────────────────────────────────────────────────────────
+
+    /// Directory holding identity TOML files: `<root>/identities/`.
+    ///
+    /// This is the directory `IdentityRegistry::open` expects.
+    pub fn identities_root(&self) -> PathBuf {
+        self.root.join("identities")
+    }
+
     // ── Blacklist ─────────────────────────────────────────────────────────────
 
     /// Global blacklist file: `<root>/blacklist.toml`.
@@ -123,6 +160,119 @@ impl RuntimeLayout {
     pub fn blacklist_path(&self) -> PathBuf {
         self.root.join("blacklist.toml")
     }
+}
+
+/// Error resolving the default reeve data root from the environment.
+#[derive(Debug)]
+pub enum DataRootError {
+    /// Neither `$HOME` nor `$XDG_DATA_HOME` was set (or both were empty).
+    MissingHome,
+    /// The environment variable held a relative path, which would silently
+    /// resolve against the process cwd.
+    RelativeDir {
+        var_name: &'static str,
+        path: PathBuf,
+    },
+}
+
+impl fmt::Display for DataRootError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingHome => {
+                f.write_str("resolving the reeve data root requires HOME or XDG_DATA_HOME")
+            }
+            Self::RelativeDir { var_name, path } => {
+                write!(f, "{var_name} must be absolute, got {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for DataRootError {}
+
+/// Resolve the default reeve data root (`$XDG_DATA_HOME/reeve`, falling back
+/// to `$HOME/.local/share/reeve`) — the directory every other on-disk path
+/// hangs off. Identity TOMLs live in its `identities/` subdirectory; see
+/// [`RuntimeLayout`] for the full tree.
+pub fn default_data_root() -> Result<PathBuf, DataRootError> {
+    crate::fs_util::resolve_reeve_data_root(
+        std::env::var_os("XDG_DATA_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )
+    .map_err(|e| match e {
+        crate::fs_util::XdgBaseError::MissingHome => DataRootError::MissingHome,
+        crate::fs_util::XdgBaseError::RelativeDir { var_name, path } => {
+            DataRootError::RelativeDir { var_name, path }
+        }
+    })
+}
+
+/// Entries that pre-engagement layouts nested under `identities/` and that
+/// now live at the data root.
+const LEGACY_NESTED_ENTRIES: &[&str] = &[
+    "agents",
+    "personas",
+    "teams",
+    "audit",
+    "blacklist.toml",
+    "replay-ledger.jsonl",
+    "delivery-ledger.jsonl",
+];
+
+/// Move state that older layouts nested under `<root>/identities/` up to
+/// `<root>/`. Identity TOML files stay where they are — `identities/` was
+/// always their correct home; everything else had accumulated there.
+///
+/// Idempotent and conservative: an entry moves only when it exists at the
+/// legacy path and nothing occupies the destination; a populated destination
+/// wins and the legacy entry is left in place for the operator to reconcile.
+/// Returns the entry names that were moved (for startup logging).
+///
+/// Agent registry records store absolute `inbox_dir` paths, so moving
+/// `agents/` also rewrites any record whose `inbox_dir` still points under
+/// the legacy root — otherwise every dispatch path that resolves an inbox
+/// through the registry would deliver to directories that no longer exist.
+pub fn migrate_legacy_identities_nesting(root: &Path) -> io::Result<Vec<&'static str>> {
+    let legacy_root = root.join("identities");
+    let mut moved = Vec::new();
+    for entry in LEGACY_NESTED_ENTRIES {
+        let from = legacy_root.join(entry);
+        let to = root.join(entry);
+        if from.symlink_metadata().is_ok() && to.symlink_metadata().is_err() {
+            std::fs::rename(&from, &to)?;
+            moved.push(*entry);
+        }
+    }
+    if moved.contains(&"agents") {
+        rewrite_legacy_inbox_dirs(root, &legacy_root)?;
+    }
+    Ok(moved)
+}
+
+/// Rewrite `inbox_dir` fields in the migrated agent registry that still
+/// point under the legacy `identities/` root.
+fn rewrite_legacy_inbox_dirs(root: &Path, legacy_root: &Path) -> io::Result<()> {
+    let registry_path = RuntimeLayout::new(root).agent_registry_path();
+    if registry_path.symlink_metadata().is_err() {
+        return Ok(());
+    }
+    let mut registry = crate::agent_registry::AgentRegistry::open(registry_path)
+        .map_err(|e| io::Error::other(format!("open agent registry for migration: {e}")))?;
+    let stale: Vec<crate::agent_registry::AgentRecord> = registry.list().cloned().collect();
+    for mut record in stale {
+        let Ok(suffix) = record
+            .inbox_dir
+            .strip_prefix(legacy_root)
+            .map(Path::to_path_buf)
+        else {
+            continue;
+        };
+        record.inbox_dir = root.join(suffix);
+        registry
+            .register(record)
+            .map_err(|e| io::Error::other(format!("rewrite inbox_dir during migration: {e}")))?;
+    }
+    Ok(())
 }
 const AGENT_FILE_MODE: u32 = 0o600;
 
@@ -568,6 +718,100 @@ mod tests {
     use std::fs;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn migration_moves_legacy_entries_and_keeps_identity_tomls() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let legacy = root.join("identities");
+        fs::create_dir_all(legacy.join("agents").join("lead")).unwrap();
+        fs::create_dir_all(legacy.join("personas").join("lead")).unwrap();
+        fs::write(legacy.join("blacklist.toml"), b"entries = []").unwrap();
+        fs::write(
+            legacy.join("11111111-1111-1111-1111-111111111111.toml"),
+            b"x",
+        )
+        .unwrap();
+
+        let moved = migrate_legacy_identities_nesting(root).unwrap();
+
+        assert_eq!(moved, vec!["agents", "personas", "blacklist.toml"]);
+        assert!(root.join("agents").join("lead").is_dir());
+        assert!(root.join("personas").join("lead").is_dir());
+        assert!(root.join("blacklist.toml").is_file());
+        assert!(
+            legacy
+                .join("11111111-1111-1111-1111-111111111111.toml")
+                .is_file(),
+            "identity TOMLs must stay in identities/"
+        );
+    }
+
+    #[test]
+    fn migration_rewrites_registry_inbox_dirs_under_legacy_root() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let legacy = root.join("identities");
+        let legacy_inbox = legacy.join("agents").join("lead").join("inbox");
+        ensure_directory(&legacy_inbox, 0o700).unwrap();
+
+        let mut registry =
+            crate::agent_registry::AgentRegistry::open(legacy.join("agents").join("registry.toml"))
+                .unwrap();
+        registry
+            .register(crate::agent_registry::AgentRecord {
+                name: crate::agent_registry::ValidatedAgentName::new("lead").unwrap(),
+                identity_id: reeve_types::IdentityId::new().unwrap(),
+                inbox_dir: legacy_inbox,
+                persona_name: None,
+                spawned_at: OffsetDateTime::from_unix_timestamp(1_760_000_000).unwrap(),
+                status: crate::agent_registry::AgentStatus::Running,
+                stopped_reason: None,
+            })
+            .unwrap();
+        drop(registry);
+
+        let moved = migrate_legacy_identities_nesting(root).unwrap();
+        assert!(moved.contains(&"agents"));
+
+        let migrated = crate::agent_registry::AgentRegistry::open(
+            RuntimeLayout::new(root).agent_registry_path(),
+        )
+        .unwrap();
+        let record = migrated.lookup("lead").unwrap();
+        assert_eq!(
+            record.inbox_dir,
+            root.join("agents").join("lead").join("inbox"),
+            "inbox_dir must be rewritten to the migrated location"
+        );
+        assert!(record.inbox_dir.is_dir(), "rewritten path must exist");
+    }
+
+    #[test]
+    fn migration_is_idempotent_and_never_clobbers_destination() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        let legacy = root.join("identities");
+        fs::create_dir_all(legacy.join("teams")).unwrap();
+        fs::write(legacy.join("teams").join("old.toml"), b"legacy").unwrap();
+        fs::create_dir_all(root.join("teams")).unwrap();
+        fs::write(root.join("teams").join("new.toml"), b"current").unwrap();
+
+        let moved = migrate_legacy_identities_nesting(root).unwrap();
+        assert!(moved.is_empty(), "populated destination must win");
+        assert!(legacy.join("teams").join("old.toml").is_file());
+        assert!(root.join("teams").join("new.toml").is_file());
+
+        let again = migrate_legacy_identities_nesting(root).unwrap();
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn migration_on_fresh_layout_is_a_no_op() {
+        let tmp = tempdir().unwrap();
+        let moved = migrate_legacy_identities_nesting(tmp.path()).unwrap();
+        assert!(moved.is_empty());
+    }
 
     // T1: provision creates all expected directories at the correct relative
     // paths.

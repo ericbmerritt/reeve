@@ -11,6 +11,7 @@ use secrecy::ExposeSecret as _;
 
 mod adapter;
 mod daemon;
+mod engagement;
 mod envelope;
 mod identity;
 mod keychain;
@@ -50,6 +51,13 @@ enum Commands {
     Daemon {
         #[command(subcommand)]
         command: daemon::DaemonSubcommand,
+    },
+    /// Manage engagements: durable named pieces of work with a working root.
+    /// Mutations are signed operator envelopes to the estate coordinator and
+    /// require a running daemon; `list` reads the durable store directly.
+    Engagement {
+        #[command(subcommand)]
+        command: engagement::EngagementSubcommand,
     },
     /// Attach the TUI to the running daemon. With no agent name, follows
     /// the session-memory logic (resumes the last-chatted agent, or
@@ -140,14 +148,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }) => cmd_envelope_verify(&file),
         Some(Commands::Adapter { command }) => adapter::dispatch(command),
         Some(Commands::Daemon { command }) => daemon::dispatch(&command),
+        Some(Commands::Engagement { command }) => engagement::dispatch(command),
         Some(Commands::Attach { name }) => cmd_attach(name.as_deref()),
         Some(Commands::Send { to, body }) => cmd_send(&to, &body),
     }
 }
 
 fn cmd_reeve() -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = IdentityRegistry::default_data_dir()?;
-    let registry = IdentityRegistry::open(data_dir.clone())?;
+    let data_root = reeve_runtime::default_data_root()?;
+    let registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
 
     if !identity::has_operator(&registry)? {
         // First-run enrollment flow.
@@ -203,7 +212,7 @@ fn cmd_reeve() -> Result<(), Box<dyn std::error::Error>> {
     let session_path = reeve_tui::session::default_path(&state_dir);
     let keystore = Arc::new(keychain::open_platform_keystore()?);
     reeve_tui::app::run(
-        &data_dir,
+        &data_root,
         &agent_registry_path,
         &session_path,
         None,
@@ -255,9 +264,8 @@ fn run_unenroll(
     keychain: &dyn reeve_runtime::OperatorKeyStore,
     confirm: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = IdentityRegistry::default_data_dir()?;
-    let registry = IdentityRegistry::open(data_dir.clone())?;
-    let audit = AuditLog::open(data_dir)?;
+    let registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
+    let audit = AuditLog::open(reeve_runtime::default_data_root()?)?;
 
     match identity::unenroll(&registry, keychain, &audit, confirm) {
         Ok(identity_id) => {
@@ -314,8 +322,7 @@ fn parse_identity_id(s: &str) -> Result<IdentityId, Box<dyn std::error::Error>> 
 }
 
 fn cmd_send(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let data_dir = IdentityRegistry::default_data_dir()?;
-    let id_registry = IdentityRegistry::open(data_dir.clone())?;
+    let id_registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
     let keychain = keychain::open_platform_keystore()?;
     send::send(
@@ -338,13 +345,13 @@ fn cmd_attach(name: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         return Ok(());
     }
-    let data_dir = IdentityRegistry::default_data_dir()?;
-    let registry = IdentityRegistry::open(data_dir.clone())?;
+    let data_root = reeve_runtime::default_data_root()?;
+    let registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
     let session_path = reeve_tui::session::default_path(&state_dir);
     let keystore = Arc::new(keychain::open_platform_keystore()?);
     reeve_tui::app::run(
-        &data_dir,
+        &data_root,
         &agent_registry_path,
         &session_path,
         name,
