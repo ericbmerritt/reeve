@@ -131,6 +131,7 @@ impl Handler<InvokeTool> for ListAgentsTool {
                     "status": match r.status {
                         crate::agent_registry::AgentStatus::Running => "running",
                         crate::agent_registry::AgentStatus::Stopped => "stopped",
+                        crate::agent_registry::AgentStatus::Retired => "retired",
                     },
                 })
             })

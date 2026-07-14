@@ -26,13 +26,14 @@ pub mod model_resolution;
 pub mod runtime_lock;
 pub mod spawn_coordinator;
 pub mod supervisor;
+pub mod team;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tool;
 pub mod verify;
 pub mod watcher;
 
-pub use agent::{Agent, AgentError, ProcessInbound, QuarantineEvent};
+pub use agent::{Agent, AgentError, ControlRoutes, ProcessInbound, QuarantineEvent, Retire};
 pub use agent_fs::{
     default_data_root, migrate_legacy_identities_nesting, AgentDirs, AgentFsError,
     AtomicFileWriter, ConversationEntry, ConversationThread, DataRootError, RuntimeLayout,
@@ -54,7 +55,7 @@ pub use daemon::{
 pub use delivery::{deposit_envelope, DepositError};
 pub use dispatcher::{MessageDispatcher, SendError, SendFailed, SendMessage, SendResult};
 pub use engagement::{EngagementError, EngagementRecord, EngagementRegistry, EngagementState};
-pub use estate::{EstateCoordinator, EstateOp, ESTATE_AGENT_NAME};
+pub use estate::{EstateCoordinator, EstateOp, TeamOpsDeps, ESTATE_AGENT_NAME};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{
@@ -67,6 +68,9 @@ pub use model_resolution::{resolve_model, write_spawn_snapshot, ModelResolveErro
 pub use runtime_lock::{default_log_path, default_state_dir, RuntimeLock, RuntimeLockError};
 pub use spawn_coordinator::{SpawnCoordinator, SpawnRequestError, SpawnResponse};
 pub use supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
+pub use team::{
+    MemberDisposition, TeamError, TeamMemberRecord, TeamRecord, TeamRegistry, TeamState,
+};
 pub use tool::{
     check_authority, AuditHandle, BlacklistHandle, InvokeTool, ListPersonasTool, Refusal,
     SendMessageTool, SpawnAgentTool, ToolResult,

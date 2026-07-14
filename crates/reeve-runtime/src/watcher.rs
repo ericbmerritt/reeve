@@ -367,6 +367,21 @@ impl Watcher {
             .insert(agent_id, recipient);
     }
 
+    /// Remove `agent_id`'s route. Callers must invoke this once an agent
+    /// actor has stopped for good (`Stopped`/`Retired`): the `Recipient`
+    /// held in `routing_table` keeps the actix mailbox sender alive, and
+    /// `actix::Supervisor` decides whether to restart an actor purely by
+    /// whether its mailbox still has a connected sender — not by whether the
+    /// actor called `ctx.stop()` vs `ctx.terminate()`. An unregistered route
+    /// is what actually lets the mailbox disconnect and the Supervisor give
+    /// up restarting.
+    pub fn unregister_route(&self, agent_id: IdentityId) {
+        self.routing_table
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&agent_id);
+    }
+
     /// Returns `true` when a route is registered for `id`.
     #[cfg(test)]
     pub(crate) fn has_route(&self, id: IdentityId) -> bool {

@@ -35,7 +35,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use reeve_runtime::capability::{CapabilityProfile, Thresholds};
-use reeve_runtime::{audit_log_path, AgentDirs, AgentRegistry};
+use reeve_runtime::{audit_log_path, AgentDirs, AgentRegistry, RuntimeLayout, TeamRegistry};
 
 use crate::panopticon::read_snapshot as read_panopticon_snapshot;
 use crate::panopticon::AUDIT_TAIL_BYTES;
@@ -165,6 +165,27 @@ fn initial_screen_for_session(session: &Session, agent_registry_path: &Path) -> 
             Screen::Chat
         }
         _ => Screen::Panopticon,
+    }
+}
+
+/// Resolve the default team's lead-role member, if the team is formed and
+/// that member is currently running.
+///
+/// There is no reserved "lead" identity in the runtime as of Phase 2 — the
+/// role is just a durable team member like any other, named by whatever the
+/// template produced (e.g. `default-lead`). `reeve attach` with no name and
+/// no usable session memory falls back to this instead of landing on an
+/// empty panopticon, so a fresh install's first attach still opens a chat.
+fn default_team_lead_if_running(data_dir: &Path, agent_registry_path: &Path) -> Option<String> {
+    let rosters_root = RuntimeLayout::new(data_dir).rosters_root();
+    let team = TeamRegistry::open(rosters_root).ok()?.get("default").ok()?;
+    let lead_name = team.lead_member_name()?;
+    let registry = AgentRegistry::open(agent_registry_path.to_path_buf()).ok()?;
+    match registry.lookup(lead_name) {
+        Some(record) if matches!(record.status, reeve_runtime::AgentStatus::Running) => {
+            Some(lead_name.to_owned())
+        }
+        _ => None,
     }
 }
 
@@ -441,6 +462,10 @@ pub fn run(
                 state.chat_agent_name.clear();
                 state.chat_agent_name.push_str(name);
             }
+        } else if let Some(name) = default_team_lead_if_running(data_dir, agent_registry_path) {
+            state.chat_agent_name.clear();
+            state.chat_agent_name.push_str(&name);
+            state.screen = Screen::Chat;
         }
     }
 
@@ -1120,7 +1145,7 @@ fn submit_engagement_command(
         }
     };
 
-    let agent_registry_path = reeve_runtime::RuntimeLayout::new(data_dir).agent_registry_path();
+    let agent_registry_path = RuntimeLayout::new(data_dir).agent_registry_path();
     let estate_record = AgentRegistry::open(agent_registry_path)
         .ok()
         .and_then(|r| r.lookup(reeve_runtime::ESTATE_AGENT_NAME).cloned());
@@ -1236,7 +1261,7 @@ fn common_prefix(candidates: &[String]) -> String {
 /// Load engagement names partitioned by state for name completion. Errors
 /// degrade to empty pools — completion is a convenience, never a gate.
 fn engagement_name_pools(data_dir: &Path) -> (Vec<String>, Vec<String>) {
-    let root = reeve_runtime::RuntimeLayout::new(data_dir).engagements_root();
+    let root = RuntimeLayout::new(data_dir).engagements_root();
     let Ok(registry) = reeve_runtime::EngagementRegistry::open(root) else {
         return (Vec::new(), Vec::new());
     };
@@ -1960,6 +1985,79 @@ mod tests {
             Path::new("/nonexistent/no-such-registry.toml"),
         );
         assert_eq!(screen, Screen::Panopticon);
+    }
+
+    // ── default_team_lead_if_running ────────────────────────────────
+
+    /// Form a "default" roster at `data_dir` whose lead-role member is
+    /// `lead_agent_name`, so `default_team_lead_if_running` has a team to
+    /// resolve against.
+    fn form_default_team(data_dir: &Path, lead_agent_name: &str) {
+        use reeve_runtime::{TeamMemberRecord, TeamRecord, TeamState};
+        #[cfg(unix)]
+        chmod_700(data_dir);
+        let rosters_root = RuntimeLayout::new(data_dir).rosters_root();
+        TeamRegistry::open(rosters_root)
+            .unwrap()
+            .form(&TeamRecord {
+                name: "default".to_owned(),
+                template_name: "default".to_owned(),
+                lead_role: "lead".to_owned(),
+                members: vec![TeamMemberRecord {
+                    agent_name: lead_agent_name.to_owned(),
+                    role_label: "lead".to_owned(),
+                    persona_name: "lead".to_owned(),
+                }],
+                state: TeamState::Formed,
+                formed_at: OffsetDateTime::now_utc(),
+                dispositions: std::collections::BTreeMap::new(),
+            })
+            .unwrap();
+    }
+
+    // SA6: default team formed, lead member running → resolves to that
+    // member's name. The fresh-install "attach lands on its lead" path.
+    #[test]
+    fn default_team_lead_if_running_resolves_running_lead() {
+        let tmp = tempfile::tempdir().unwrap();
+        form_default_team(tmp.path(), "default-lead");
+        let registry_path = RuntimeLayout::new(tmp.path()).agent_registry_path();
+        // register_running_agent chmods the registry's parent before
+        // opening it, so that directory must exist first.
+        std::fs::create_dir_all(registry_path.parent().unwrap()).unwrap();
+        register_running_agent(&registry_path, "default-lead");
+
+        let resolved = default_team_lead_if_running(tmp.path(), &registry_path);
+        assert_eq!(resolved, Some("default-lead".to_owned()));
+    }
+
+    // SA7: no default team formed yet → None, not a panic. Callers fall
+    // back to the panopticon exactly as they do for a missing session.
+    #[test]
+    fn default_team_lead_if_running_is_none_when_team_not_formed() {
+        let tmp = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        chmod_700(tmp.path());
+        let registry_path = RuntimeLayout::new(tmp.path()).agent_registry_path();
+
+        assert_eq!(
+            default_team_lead_if_running(tmp.path(), &registry_path),
+            None
+        );
+    }
+
+    // SA8: default team formed, but its lead member has no running record
+    // (never spawned yet, or stopped) → None.
+    #[test]
+    fn default_team_lead_if_running_is_none_when_lead_not_running() {
+        let tmp = tempfile::tempdir().unwrap();
+        form_default_team(tmp.path(), "default-lead");
+        let registry_path = RuntimeLayout::new(tmp.path()).agent_registry_path();
+
+        assert_eq!(
+            default_team_lead_if_running(tmp.path(), &registry_path),
+            None
+        );
     }
 
     // ── reload_state per-agent dispatch ────────────────────────────────

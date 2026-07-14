@@ -141,6 +141,17 @@ impl RuntimeLayout {
         self.engagement_dir(name).join("record.toml")
     }
 
+    // ── Team rosters ──────────────────────────────────────────────────────────
+
+    /// Root of the standing-team roster store: `<root>/rosters/`.
+    ///
+    /// Distinct from `teams/`, which holds operator-authored team
+    /// *templates*; rosters are machine-managed durable state written when
+    /// a template is formed into a standing team.
+    pub fn rosters_root(&self) -> PathBuf {
+        self.root.join("rosters")
+    }
+
     // ── Identities ────────────────────────────────────────────────────────────
 
     /// Directory holding identity TOML files: `<root>/identities/`.
