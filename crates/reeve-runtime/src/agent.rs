@@ -35,6 +35,7 @@ use crate::audit::{AuditEvent, AuditLog, AuthorityDisposition};
 use crate::capability::Thresholds;
 use crate::model_resolution::SpawnSnapshot;
 use crate::tool::{InvokeTool, Refusal, ToolResult};
+use crate::watcher::Watcher;
 
 // ── History loader ────────────────────────────────────────────────────────────
 
@@ -332,6 +333,56 @@ impl actix::Message for ProcessInbound {
     type Result = ();
 }
 
+// ── Retire ────────────────────────────────────────────────────────────────────
+
+/// Operator-initiated permanent retirement of this agent's identity.
+///
+/// Sent by the estate coordinator (retire-agent, or team dissolution with
+/// the `retired` disposition). The incarnation winds down exactly like a
+/// `max_task_duration` trip — no new tool invocations or model calls,
+/// in-flight work drains — and the registry record lands on
+/// [`AgentStatus::Retired`], which the resume pass never relaunches and
+/// whose name is never reusable.
+#[derive(Debug, Clone, Copy)]
+pub struct Retire;
+
+impl actix::Message for Retire {
+    type Result = ();
+}
+
+/// Shared name → retire-recipient table: every started agent (lead, spawned,
+/// resumed) registers here so the estate coordinator can wind incarnations
+/// down for retirement. Lives next to [`Retire`], the message it routes,
+/// rather than in `estate.rs`, which already depends on this module.
+///
+/// The single owner of every mutation: register on start, unregister on
+/// `Agent`'s internal stop transition and (redundantly but harmlessly) on
+/// `estate::retire_identity`. Poisoned-lock recovery matches
+/// [`crate::watcher::Watcher`]'s routing table rather than dropping the
+/// operation, since both tables sit at the same "route to a live agent"
+/// boundary.
+#[derive(Clone, Default)]
+pub struct ControlRoutes(Arc<std::sync::RwLock<HashMap<String, Recipient<Retire>>>>);
+
+impl ControlRoutes {
+    /// Register `name`'s retire route, replacing any prior entry.
+    pub fn register(&self, name: String, recipient: Recipient<Retire>) {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(name, recipient);
+    }
+
+    /// Remove and return `name`'s retire route, if a live incarnation is
+    /// registered.
+    pub fn unregister(&self, name: &str) -> Option<Recipient<Retire>> {
+        self.0
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(name)
+    }
+}
+
 // ── ToolBatchTimeout (internal) ───────────────────────────────────────────────
 
 /// Self-message scheduled when a tool batch is dispatched. Fires after
@@ -425,6 +476,11 @@ pub struct Agent {
     /// new adapter calls and new inbound messages; in-flight work drains to
     /// completion and then the agent transitions to `Stopped`.
     exiting: bool,
+    /// Registry status written when the wind-down completes. `Stopped` for
+    /// threshold trips and errors; `Retired` when the operator retired the
+    /// identity (a [`Retire`] message) — retirement is permanent and the
+    /// resume pass never relaunches a `Retired` record.
+    final_status: AgentStatus,
     /// Role name of this agent in the registry (e.g. `"lead"`, `"worker-abc12345"`).
     /// Used when updating the registry record to `Stopped` on exit.
     role_name: String,
@@ -453,6 +509,22 @@ pub struct Agent {
     /// envelope evicted from this set has also vanished from the directory
     /// the watcher scans.
     seen_message_ids: SeenIds,
+    /// Handle used to unregister this agent's `ProcessInbound` route on
+    /// stop. `None` in tests that construct an `Agent` without a watcher.
+    watcher: Option<Arc<Watcher>>,
+    /// Handle used to unregister this agent's `Retire` route on stop.
+    /// Pruned here on every terminal transition (this is the entry point
+    /// that also covers a threshold-trip stop, which never goes through
+    /// `estate::retire_identity`'s own — redundant but harmless — prune);
+    /// without it the entry, and the mailbox sender it keeps alive, would
+    /// outlive the actor. `None` in tests that construct an `Agent` without
+    /// one.
+    control_routes: Option<ControlRoutes>,
+    /// Set once [`Agent::transition_to_stopped`] has run, so a stray
+    /// Supervisor restart (mailbox connectivity is the only thing that gates
+    /// `actix::Supervisor` restarts, not `stop()` vs `terminate()`) does not
+    /// repeat the registry flush.
+    stopped: bool,
 }
 
 /// Maximum number of `message_id`s the agent retains for dedup. 4096 covers
@@ -557,7 +629,7 @@ impl Agent {
     /// an empty tools vector behaves as a text-only agent.
     #[expect(
         clippy::too_many_arguments,
-        reason = "agent constructor wires together ten independent collaborators; \
+        reason = "agent constructor wires together twelve independent collaborators; \
                   bundling into a struct trades clarity for indirection"
     )]
     pub fn new(
@@ -573,6 +645,8 @@ impl Agent {
         data_dir: PathBuf,
         role_name: String,
         registry_path: PathBuf,
+        watcher: Option<Arc<Watcher>>,
+        control_routes: Option<ControlRoutes>,
     ) -> Result<Self, AgentError> {
         let conversation_path = dirs.conversation_path();
         let conversation = ConversationThread::open(&conversation_path).map_err(AgentError::Fs)?;
@@ -619,8 +693,12 @@ impl Agent {
             data_dir,
             task_started_at: None,
             exiting: false,
+            final_status: AgentStatus::Stopped,
             role_name,
             registry_path,
+            watcher,
+            control_routes,
+            stopped: false,
         })
     }
 
@@ -650,7 +728,13 @@ impl Agent {
         }
         self.exiting = true;
         if self.status_writer.write("exiting").is_err() {
-            ctx.stop();
+            // Fall through to the same route-unregistering exit every other
+            // terminal transition takes (see transition_to_stopped's doc):
+            // a bare ctx.stop() here would leave the watcher/control-routes
+            // entries registered, keeping the mailbox connected and the
+            // Supervisor free to restart the actor despite the intended
+            // stop (ADR 005).
+            self.transition_to_stopped(ctx);
             return;
         }
         let secs = self.thresholds.max_task_duration_secs.unwrap_or(0);
@@ -676,15 +760,65 @@ impl Agent {
         }
     }
 
-    /// Update the registry to `Stopped` and stop the actor.
-    fn transition_to_stopped(&self, ctx: &mut Context<Self>) {
-        if let Ok(mut reg) = AgentRegistry::open(self.registry_path.clone()) {
-            let _ = reg.update_status(&self.role_name, AgentStatus::Stopped);
+    /// Update the registry to the wind-down's final status (`Stopped`, or
+    /// `Retired` after a [`Retire`] message), unregister this agent's
+    /// watcher route, and stop the actor.
+    ///
+    /// Idempotent: `actix::Supervisor` decides whether to restart an actor
+    /// by mailbox connectivity alone, not by `stop()` vs `terminate()` — so
+    /// as long as any `Recipient` handle to this actor survives elsewhere
+    /// (which unregistering the watcher route prevents going forward), a
+    /// restart can still land here again. The `stopped` guard keeps a stray
+    /// restart from repeating the registry flush.
+    fn transition_to_stopped(&mut self, ctx: &mut Context<Self>) {
+        if self.stopped {
+            ctx.terminate();
+            return;
         }
-        // Use terminate() rather than stop() so that actix::Supervisor does
-        // not invoke restarting() and restart the actor — this is an
-        // intentional permanent stop, not a crash.
+        self.stopped = true;
+        // A failed write here is not retried: the `stopped` guard above makes
+        // this the only attempt, unlike the accidental infinite retry a
+        // Supervisor restart loop used to provide before routes were
+        // unregistered on stop.
+        match AgentRegistry::open(self.registry_path.clone()) {
+            Ok(mut reg) => {
+                if let Err(err) = reg.update_status(&self.role_name, self.final_status) {
+                    warn!(name = %self.role_name, err = %err, "failed to write final agent status to registry");
+                }
+            }
+            Err(err) => {
+                warn!(name = %self.role_name, err = %err, "failed to open agent registry to write final status");
+            }
+        }
+        if let Some(watcher) = &self.watcher {
+            watcher.unregister_route(self.agent_id);
+        }
+        if let Some(routes) = &self.control_routes {
+            routes.unregister(&self.role_name);
+        }
         ctx.terminate();
+    }
+
+    /// Begin the retirement wind-down: same drain semantics as a threshold
+    /// trip, but the registry lands on `Retired` and the journal names the
+    /// operator's act rather than a limit.
+    fn begin_retirement(&mut self, ctx: &mut Context<Self>) {
+        self.final_status = AgentStatus::Retired;
+        if self.exiting {
+            return;
+        }
+        self.exiting = true;
+        if self.status_writer.write("exiting").is_err() {
+            // See enter_exiting's identical fallback: route unregistration
+            // must happen on every terminal transition, not just the ones
+            // that reach the end of this function successfully (ADR 005).
+            self.transition_to_stopped(ctx);
+            return;
+        }
+        self.append_system_entry("retiring: operator request", ctx);
+        if !self.in_flight {
+            self.transition_to_stopped(ctx);
+        }
     }
 
     /// Check the task clock against `max_task_duration`. Called by the
@@ -1169,6 +1303,14 @@ impl Supervised for Agent {
 
 // ── Handler<ProcessInbound> ───────────────────────────────────────────────────
 
+impl Handler<Retire> for Agent {
+    type Result = ();
+
+    fn handle(&mut self, _msg: Retire, ctx: &mut Context<Self>) {
+        self.begin_retirement(ctx);
+    }
+}
+
 impl Handler<ProcessInbound> for Agent {
     type Result = ();
 
@@ -1538,6 +1680,8 @@ mod tests {
             data_dir,
             "lead".to_owned(),
             registry_path,
+            None,
+            None,
         )
     }
 
@@ -3562,6 +3706,138 @@ mod tests {
         });
     }
 
+    /// Construct a `lead` agent wired to a real `Watcher`/`ControlRoutes`/
+    /// registry, with a matching registry record pre-registered — the setup
+    /// [`transition_to_stopped_unregisters_routes_and_is_idempotent`] needs
+    /// to exercise real route unregistration, not the `None`-routed
+    /// [`mock_agent`].
+    fn agent_with_real_routes(
+        tmp: &std::path::Path,
+        agent_id: IdentityId,
+        watcher: &Arc<crate::watcher::Watcher>,
+        control_routes: &super::ControlRoutes,
+        registry_path: &std::path::Path,
+    ) -> Agent {
+        let dirs = AgentDirs::provision(tmp, "lead").unwrap();
+        crate::agent_registry::AgentRegistry::open(registry_path.to_path_buf())
+            .unwrap()
+            .register(crate::agent_registry::AgentRecord {
+                name: crate::agent_registry::ValidatedAgentName::new("lead").unwrap(),
+                identity_id: agent_id,
+                inbox_dir: dirs.inbox_root(),
+                persona_name: Some("lead".to_owned()),
+                spawned_at: time::OffsetDateTime::now_utc(),
+                status: crate::agent_registry::AgentStatus::Running,
+                stopped_reason: None,
+            })
+            .unwrap();
+        Agent::new(
+            Arc::new(TextResponseAdapter::new("mock@test")),
+            &dirs,
+            mock_snapshot(),
+            String::new(),
+            agent_id,
+            reeve_types::Keypair::generate(),
+            Vec::new(),
+            crate::capability::Thresholds::default(),
+            None,
+            tmp.to_path_buf(),
+            "lead".to_owned(),
+            registry_path.to_path_buf(),
+            Some(Arc::clone(watcher)),
+            Some(control_routes.clone()),
+        )
+        .unwrap()
+    }
+
+    // Regression test for the actix::Supervisor restart-loop / full-disk-fsync
+    // storm bug (ADR 005): a route left in Watcher::routing_table or
+    // ControlRoutes keeps the actor's mailbox connected, which is the only
+    // thing that gates whether Supervisor restarts it. transition_to_stopped
+    // must unregister both routes, and must not repeat the registry flush if
+    // it is somehow entered a second time.
+    #[test]
+    fn transition_to_stopped_unregisters_routes_and_is_idempotent() {
+        let tmp = crate::test_support::secure_dir();
+        let (_, watcher, registry_path) = crate::test_support::build_registries(tmp.path());
+        let control_routes = super::ControlRoutes::default();
+        let agent_id = IdentityId::new().unwrap();
+        let agent = agent_with_real_routes(
+            tmp.path(),
+            agent_id,
+            &watcher,
+            &control_routes,
+            &registry_path,
+        );
+
+        let watcher_for_asserts = Arc::clone(&watcher);
+        let registry_path_for_asserts = registry_path.clone();
+
+        actix::System::new().block_on(async move {
+            use actix::Actor as _;
+            use actix::AsyncContext as _;
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let mut done_tx = Some(done_tx);
+            let addr = Agent::create(move |ctx| {
+                let self_addr = ctx.address();
+                watcher.register_route(agent_id, self_addr.clone().recipient());
+                control_routes.register("lead".to_owned(), self_addr.recipient());
+                assert!(
+                    watcher.has_route(agent_id),
+                    "route must be registered before stop"
+                );
+
+                ctx.run_later(Duration::from_millis(0), move |act, ctx| {
+                    assert!(!act.stopped, "must not be stopped before first transition");
+                    act.transition_to_stopped(ctx);
+                    assert!(
+                        act.stopped,
+                        "stopped flag must be set after first transition"
+                    );
+                    assert!(
+                        !watcher.has_route(agent_id),
+                        "watcher route must be unregistered on stop"
+                    );
+                    assert!(
+                        control_routes.unregister("lead").is_none(),
+                        "control_routes route must already be unregistered on stop"
+                    );
+
+                    // A stray restart landing here again (mailbox-connectivity
+                    // gated, not stop()-vs-terminate() gated — see ADR 005)
+                    // must not repeat the registry flush or panic.
+                    act.transition_to_stopped(ctx);
+
+                    let _ = done_tx
+                        .take()
+                        .expect("run_later fires exactly once")
+                        .send(());
+                });
+                agent
+            });
+            let _ = addr;
+
+            tokio::time::timeout(Duration::from_secs(5), done_rx)
+                .await
+                .expect("transition_to_stopped closure timed out")
+                .expect("done channel dropped before firing");
+        });
+
+        assert!(
+            !watcher_for_asserts.has_route(agent_id),
+            "watcher route must stay unregistered after a repeat transition"
+        );
+        assert_eq!(
+            crate::agent_registry::AgentRegistry::open(registry_path_for_asserts)
+                .unwrap()
+                .lookup("lead")
+                .unwrap()
+                .status,
+            crate::agent_registry::AgentStatus::Stopped,
+            "final status must be the one written by the single real transition"
+        );
+    }
+
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -4332,6 +4608,8 @@ mod tests {
             data_dir.to_path_buf(),
             "lead".to_owned(),
             registry_path,
+            None,
+            None,
         )
         .unwrap()
     }
@@ -4506,6 +4784,8 @@ mod tests {
                 data_dir.clone(),
                 "lead".to_owned(),
                 registry_path,
+                None,
+                None,
             )
             .unwrap()
         };

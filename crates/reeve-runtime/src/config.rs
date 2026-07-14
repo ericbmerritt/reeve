@@ -42,6 +42,28 @@ model_preferences = ["claude-opus-4-7"]
 display_name = "Lead"
 "#;
 
+/// Default capability profile written to
+/// `{data_dir}/personas/lead/profile.toml` if absent. Unrestricted
+/// (`enabled_categories` omitted, `capability::CapabilityProfile::allows`
+/// treats an absent list as "all categories allowed") — the same effective
+/// permissiveness the pre-Phase-2 hardcoded lead ran with when no
+/// profile.toml existed.
+///
+/// Ships only for `lead`, the one persona the shipped `teams/default.toml`
+/// references. Without *some* profile.toml existing for a persona, a
+/// minted agent's own per-incarnation profile snapshot never gets written
+/// (`SpawnCoordinator` only writes one when a persona profile resolved),
+/// and `resume_one_subagent` refuses to resume an agent with neither a
+/// snapshot nor a persona profile to synthesize from (no permissive
+/// fallback, by design — see its doc comment) — so without this, the
+/// default team's lead role could never survive a daemon restart. Shipping
+/// *conservative*, restricted default profiles for every persona is
+/// tracked separately (phase 4, "the policy chain composes"); this only
+/// closes the resumability gap for what phase 2 ships today.
+const DEFAULT_LEAD_PROFILE_TOML: &str = r#"name = "lead"
+version = 1
+"#;
+
 /// Default `DeepSeek` R1 persona written to
 /// `{data_dir}/personas/deepseek-r1/config.toml` if absent.
 ///
@@ -305,6 +327,7 @@ pub fn load_team_config(path: &Path) -> Result<TeamConfig, ConfigError> {
 ///
 /// Paths written:
 /// - `{data_dir}/personas/lead/config.toml`
+/// - `{data_dir}/personas/lead/profile.toml`
 /// - `{data_dir}/personas/deepseek-r1/config.toml`
 /// - `{data_dir}/personas/glm-5.2/config.toml`
 /// - `{data_dir}/teams/default.toml`
@@ -314,11 +337,13 @@ pub fn load_team_config(path: &Path) -> Result<TeamConfig, ConfigError> {
 pub fn install_defaults(data_dir: &Path) -> Result<(), ConfigError> {
     let layout = RuntimeLayout::new(data_dir);
     let persona_path = layout.persona_config_path("lead");
+    let persona_profile_path = layout.persona_profile_path("lead");
     let deepseek_persona_path = layout.persona_config_path("deepseek-r1");
     let glm_persona_path = layout.persona_config_path("glm-5.2");
     let team_path = layout.team_config_path("default");
 
     write_if_absent(&persona_path, DEFAULT_PERSONA_TOML)?;
+    write_if_absent(&persona_profile_path, DEFAULT_LEAD_PROFILE_TOML)?;
     write_if_absent(&deepseek_persona_path, DEFAULT_DEEPSEEK_R1_PERSONA_TOML)?;
     write_if_absent(&glm_persona_path, DEFAULT_GLM_5_2_PERSONA_TOML)?;
     write_if_absent(&team_path, DEFAULT_TEAM_TOML)?;
@@ -456,9 +481,19 @@ mod tests {
         install_defaults(tmp.path()).unwrap();
 
         let persona_path = tmp.path().join("personas").join("lead").join("config.toml");
+        let persona_profile_path = tmp
+            .path()
+            .join("personas")
+            .join("lead")
+            .join("profile.toml");
         let team_path = tmp.path().join("teams").join("default.toml");
 
         assert!(persona_path.is_file(), "persona config missing");
+        assert!(
+            persona_profile_path.is_file(),
+            "lead persona profile missing — the default team's lead role \
+             could never resume across a daemon restart without it"
+        );
         assert!(team_path.is_file(), "team config missing");
 
         let persona_content = fs::read_to_string(&persona_path).unwrap();

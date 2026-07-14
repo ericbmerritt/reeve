@@ -223,6 +223,29 @@ pub(crate) fn atomic_write_file(
     Ok(())
 }
 
+/// Same as [`atomic_write_file`], but refuses to overwrite an existing
+/// `path`: the persist step fails with `io::ErrorKind::AlreadyExists`
+/// instead of silently replacing it. Callers enforcing name permanence
+/// (a name, once taken, is never reused) need this — a separate
+/// existence pre-check followed by a clobbering `persist` leaves a TOCTOU
+/// window where two concurrent writers can both pass the check and the
+/// second `persist` silently overwrites the first's record.
+pub(crate) fn atomic_write_file_no_clobber(
+    path: &Path,
+    dir: &Path,
+    content: &[u8],
+    mode: u32,
+) -> io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    apply_file_perms(tmp.as_file(), mode)?;
+    tmp.write_all(content)?;
+    tmp.as_file().sync_all()?;
+    tmp.persist_noclobber(path).map_err(|e| e.error)?;
+    sync_directory(dir);
+    Ok(())
+}
+
 /// Read a file with `O_NOFOLLOW`, up to `max_bytes`, as a UTF-8 string.
 ///
 /// Returns `io::Error` on open failure (including symlinks → `ELOOP`/`ENOTDIR`),

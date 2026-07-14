@@ -31,7 +31,7 @@ use crate::dispatcher::{MessageDispatcher, SendMessage};
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
-use crate::model_resolution::{resolve_model, write_spawn_snapshot, SpawnSnapshot};
+use crate::model_resolution::SpawnSnapshot;
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
 use crate::spawn_coordinator::{build_subagent_tools, SpawnCoordinator, SpawnRequest};
 use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
@@ -536,7 +536,7 @@ fn run_actor_system(
         actix::System::new().block_on(async {
             // _dispatcher_addr keeps the actor alive for the duration of the
             // system.
-            let _dispatcher_addr = match launch_actors(state_dir, startup) {
+            let _dispatcher_addr = match launch_actors(state_dir, startup).await {
                 Ok(addr) => addr,
                 Err(e) => {
                     launch_err = Some(e);
@@ -575,7 +575,7 @@ fn run_actor_system(
         actix::System::new().block_on(async {
             // _dispatcher_addr keeps the actor alive for the duration of the
             // system.
-            let _dispatcher_addr = match launch_actors(state_dir, startup) {
+            let _dispatcher_addr = match launch_actors(state_dir, startup).await {
                 Ok(addr) => addr,
                 Err(e) => {
                     launch_err = Some(e);
@@ -593,14 +593,18 @@ fn run_actor_system(
         }
     }
 
-    // On clean shutdown, mark the daemon's own actors as Stopped. Failure
-    // here is non-fatal: the registry will show Running at next startup and
-    // be corrected then.
+    // On clean shutdown, mark the estate coordinator Stopped — it is the
+    // one identity the daemon bootstraps directly rather than through the
+    // ordinary spawn path, so nothing else marks it on the way down.
+    // Failure here is non-fatal: the registry will show Running at next
+    // startup and be corrected then. (Every other agent, including the
+    // default team's lead role, is an ordinary spawned agent; its status
+    // going stale across a SIGTERM shutdown is the same pre-existing gap
+    // every other spawned agent already has, not something new here.)
     if let Ok(mut registry) = AgentRegistry::open(agent_registry_path) {
-        for name in ["lead", crate::estate::ESTATE_AGENT_NAME] {
-            if let Err(err) = registry.update_status(name, AgentStatus::Stopped) {
-                tracing::warn!(err = %err, name, "failed to mark agent as Stopped on shutdown");
-            }
+        let name = crate::estate::ESTATE_AGENT_NAME;
+        if let Err(err) = registry.update_status(name, AgentStatus::Stopped) {
+            tracing::warn!(err = %err, name, "failed to mark agent as Stopped on shutdown");
         }
     }
 
@@ -610,27 +614,23 @@ fn run_actor_system(
 /// Pre-computed inputs for [`launch_actors`]; produced by the fallible
 /// [`prepare_agent_startup`] step that runs before the actix system starts.
 ///
-/// The [`Agent`] value itself is constructed inside [`launch_actors`] so it
-/// can hold [`actix::Recipient`]s to tool actors that only exist once the
-/// actix runtime is up.
+/// No agent identity but the estate coordinator's own is minted here. The
+/// default team's members (including whichever one holds the lead role) are
+/// minted inside [`launch_actors`] through the ordinary spawn-coordinator
+/// path — see `crate::estate::form_team` — once that path exists to mint
+/// through; there is no bespoke lead-agent bootstrap left to precompute.
 struct AgentStartup {
     /// All adapters available to the daemon; used by the subagent resume path
-    /// to match each subagent's snapshotted `adapter_id`.
+    /// to match each subagent's snapshotted `adapter_id`, and by the spawn
+    /// coordinator to resolve a persona's preferred model at mint time.
     adapters: Vec<Arc<dyn reeve_adapter::Adapter>>,
-    /// Resolved adapter for the lead agent.
-    adapter: Arc<dyn reeve_adapter::Adapter>,
-    dirs: AgentDirs,
-    snapshot: SpawnSnapshot,
-    system_prompt: String,
-    inbox: AgentInbox,
-    agent_id: reeve_types::IdentityId,
-    keypair: reeve_types::Keypair,
     agent_registry_path: PathBuf,
     watcher: Arc<Watcher>,
     data_dir: PathBuf,
     identity_registry: Arc<IdentityRegistry>,
     /// The operator's identity, threaded to the spawn coordinator so it can
-    /// distinguish operator-sourced from peer-sourced spawns.
+    /// distinguish operator-sourced from peer-sourced spawns, and used as
+    /// the `sender_id` when the daemon forms the default team on first boot.
     operator_id: reeve_types::IdentityId,
     /// Team-config byte cap on caller-supplied `system_prompt` at spawn.
     max_system_prompt_bytes: usize,
@@ -642,13 +642,15 @@ struct AgentStartup {
 
 /// Look up a named agent identity in the agent registry, verifying the
 /// on-disk keypair against the identity registry; bootstrap a fresh identity
-/// and register both records when the name is unseen. Shared by the lead and
-/// the estate coordinator — the two identities the daemon itself owns.
+/// and register both records when the name is unseen. Used for the estate
+/// coordinator's identity — the one identity the daemon itself owns and
+/// bootstraps directly, rather than through the ordinary spawn path every
+/// other agent (including the default team's lead) mints through.
 #[expect(
     clippy::too_many_arguments,
     reason = "the function threads two registries plus the identity fields; \
-              bundling into a struct trades clarity for indirection at the \
-              two call sites"
+              bundling into a struct trades clarity for indirection at its \
+              one call site"
 )]
 #[expect(
     clippy::too_many_lines,
@@ -765,14 +767,11 @@ fn ensure_named_agent_identity(
 }
 
 /// Fallible preparation: load configs, provision directories, resolve the
-/// model, write the spawn snapshot, and construct the lead agent value.
+/// model. The default team's members are minted later, inside
+/// [`launch_actors`], through the ordinary spawn-coordinator path.
 ///
 /// None of this requires the actix runtime to be running, so errors can be
 /// propagated normally.
-#[expect(
-    clippy::too_many_lines,
-    reason = "splitting would obscure the linear dependency chain across startup steps"
-)]
 fn prepare_agent_startup(
     data_dir: &Path,
     identity_registry: &Arc<IdentityRegistry>,
@@ -787,48 +786,15 @@ fn prepare_agent_startup(
     })?;
     debug!("default configs ready");
 
-    // 2. Load the default team config.
+    // 2. Load the default team config, needed only for its system-prompt
+    // byte cap here — member enumeration happens inside `form_team` itself
+    // when `launch_actors` forms the team.
     let layout = RuntimeLayout::new(data_dir);
     let team_path = layout.team_config_path("default");
     let team = load_team_config(&team_path).map_err(|e| DaemonError::Resource {
         component: "team config",
         source: Box::new(e),
     })?;
-    debug!(lead_role = %team.lead_role, "loaded team config");
-
-    // 3. Locate the lead member entry.
-    let lead_member = team
-        .members
-        .iter()
-        .find(|m| m.role_label == team.lead_role)
-        .ok_or_else(|| DaemonError::Resource {
-            component: "lead member",
-            source: Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                "team config has no member with role_label '{}'",
-                team.lead_role
-            )),
-        })?;
-
-    // 4. Load persona config for the lead member.
-    let persona_path = layout.persona_config_path(&lead_member.persona_name);
-    let persona_config = load_persona_config(&persona_path).map_err(|e| DaemonError::Resource {
-        component: "persona config",
-        source: Box::new(e),
-    })?;
-    debug!(name = %lead_member.persona_name, "loaded persona config");
-
-    // 5. Provision the lead agent directory tree.
-    let dirs = AgentDirs::provision(data_dir, "lead").map_err(|e| DaemonError::Resource {
-        component: "agent dirs",
-        source: Box::new(e),
-    })?;
-
-    // 6. On first run mint a new identity and register it; on restart reuse the stored identity_id.
-    let keypair =
-        generate_or_load_keypair(&dirs.identity_key_path()).map_err(|e| DaemonError::Resource {
-            component: "agent keypair",
-            source: Box::new(e),
-        })?;
 
     let mut agent_registry =
         AgentRegistry::open(agent_registry_path.clone()).map_err(|e| DaemonError::Resource {
@@ -836,12 +802,11 @@ fn prepare_agent_startup(
             source: Box::new(e),
         })?;
 
-    // The operator identity anchors both a bootstrapped lead's `created_by`
-    // and the lead's system-prompt provenance. Resolve it once up front so it
-    // is available whether the lead is reused or freshly bootstrapped. The
-    // reeve-cli first-run flow refuses to start the daemon without an enrolled
-    // operator, so a miss here means the identity registry was tampered with
-    // between enrollment and daemon start.
+    // The operator identity anchors the estate coordinator's `created_by`
+    // and is the `sender_id` `launch_actors` forms the default team with.
+    // The reeve-cli first-run flow refuses to start the daemon without an
+    // enrolled operator, so a miss here means the identity registry was
+    // tampered with between enrollment and daemon start.
     let operator_id = {
         let all_identities = identity_registry
             .list()
@@ -860,17 +825,6 @@ fn prepare_agent_startup(
                 ),
             })?
     };
-
-    let agent_id = ensure_named_agent_identity(
-        "lead",
-        &lead_member.persona_name,
-        Some(lead_member.persona_name.clone()),
-        dirs.inbox_root(),
-        &keypair,
-        &mut agent_registry,
-        identity_registry,
-        operator_id,
-    )?;
 
     // The estate coordinator is addressable exactly like an agent — reserved
     // name, provisioned inbox, durable identity — so the CLI and TUI resolve
@@ -903,50 +857,8 @@ fn prepare_agent_startup(
     )?;
     let estate_inbox = AgentInbox::from_path(estate_dirs.inbox_root());
 
-    // 7. Resolve the model adapter against this persona's preferences.
-    let adapter_refs: Vec<&dyn reeve_adapter::Adapter> =
-        adapters.iter().map(std::ops::Deref::deref).collect();
-    let mut snapshot = resolve_model(&persona_config, &adapter_refs, agent_id).map_err(|e| {
-        DaemonError::Resource {
-            component: "model resolution",
-            source: Box::new(e),
-        }
-    })?;
-    // The lead is a cold spawn: its system prompt is the operator-authored
-    // persona base, so the operator is its prompt source (trusted).
-    snapshot.system_prompt_source = Some(operator_id);
-    debug!(adapter_id = %snapshot.adapter_id, "resolved adapter");
-    let adapter = adapters
-        .iter()
-        .find(|a| a.id() == snapshot.adapter_id)
-        .ok_or_else(|| DaemonError::Resource {
-            component: "adapter post-resolution lookup",
-            source: Box::<dyn std::error::Error + Send + Sync>::from(
-                "resolve_model succeeded but adapter was not found in the slice",
-            ),
-        })?;
-
-    // 8. Write the spawn snapshot to disk (includes agent_id for TUI signing).
-    write_spawn_snapshot(&dirs, &snapshot).map_err(|e| DaemonError::Resource {
-        component: "spawn snapshot",
-        source: Box::new(e),
-    })?;
-    debug!(agent_id = %agent_id, "wrote spawn snapshot");
-
-    // 9. Build the inbox handle pointing to the lead's provisioned inbox.
-    let inbox = AgentInbox::from_path(dirs.inbox_root());
-
-    let system_prompt = persona_config.system_prompt.clone();
-
     Ok(AgentStartup {
         adapters: adapters.to_vec(),
-        adapter: Arc::clone(adapter),
-        dirs,
-        snapshot,
-        system_prompt,
-        inbox,
-        agent_id,
-        keypair,
         agent_registry_path,
         watcher,
         data_dir: data_dir.to_path_buf(),
@@ -964,25 +876,17 @@ fn prepare_agent_startup(
 #[expect(
     clippy::too_many_lines,
     reason = "linear actor wiring sequence: heartbeat, watcher, dispatcher, \
-              spawn coordinator, lead agent, and the persisted-subagent \
-              resume pass. Each step depends on outputs of the previous; \
-              splitting just to chase a line budget would obscure the order."
+              spawn coordinator, estate coordinator, persisted-subagent \
+              resume, and (first boot only) default-team formation. Each \
+              step depends on outputs of the previous; splitting just to \
+              chase a line budget would obscure the order."
 )]
-fn launch_actors(
+async fn launch_actors(
     state_dir: PathBuf,
     startup: AgentStartup,
 ) -> Result<actix::Addr<MessageDispatcher>, DaemonError> {
-    use actix::Actor as _;
-
     let AgentStartup {
         adapters,
-        adapter,
-        dirs,
-        snapshot,
-        system_prompt,
-        inbox,
-        agent_id,
-        keypair,
         agent_registry_path,
         watcher,
         data_dir,
@@ -1032,25 +936,7 @@ fn launch_actors(
         )
     });
 
-    // EstateCoordinator: operator-tier organizational operations arriving as
-    // signed envelopes on the reserved `estate` inbox.
-    let engagements = crate::engagement::EngagementRegistry::open(
-        RuntimeLayout::new(&data_dir).engagements_root(),
-    )
-    .map_err(|e| DaemonError::Resource {
-        component: "engagement registry",
-        source: Box::new(e),
-    })?;
-    let estate_audit = Arc::clone(&audit_shared);
-    let estate_addr = actix::Supervisor::start(move |_| {
-        crate::estate::EstateCoordinator::new(operator_id, engagements, estate_audit)
-    });
-    watcher_addr.do_send(WatchInbox {
-        agent_id: estate_id,
-        inbox: estate_inbox,
-        on_quarantine: None,
-        recipient: estate_addr.recipient(),
-    });
+    let control_routes = crate::agent::ControlRoutes::default();
 
     // The dispatcher re-opens the agent registry on every dispatch so it
     // stays in lockstep with records the spawn coordinator persists at
@@ -1069,17 +955,15 @@ fn launch_actors(
         )
     });
 
-    // Keep clones for the subagent re-launch pass below; the spawn coordinator
-    // and lead agent both consume their respective handles.
+    // Keep clones for the subagent re-launch pass below; the spawn
+    // coordinator consumes its own handles.
     let data_dir_for_resume = data_dir.clone();
-    let data_dir_for_lead = data_dir.clone();
     let agent_registry_path_for_resume = agent_registry_path.clone();
     let identity_registry_for_resume = Arc::clone(&identity_registry);
     let adapters_for_resume = adapters.clone();
     let watcher_for_resume = Arc::clone(&watcher_for_coord);
     let watcher_addr_for_resume = watcher_addr.clone();
     let dispatcher_recipient_for_resume = dispatcher_addr.clone().recipient();
-    let data_dir_for_whois = data_dir.clone();
 
     let spawn_coordinator = SpawnCoordinator::new(
         data_dir,
@@ -1093,117 +977,42 @@ fn launch_actors(
         Some(Arc::clone(&blacklist_handle)),
         operator_id,
         max_system_prompt_bytes,
-    );
+    )
+    .with_control_routes(control_routes.clone());
     let coord_addr = actix::Supervisor::start(move |_| spawn_coordinator);
-
-    let lead_profile = {
-        let p = RuntimeLayout::new(&data_dir_for_resume).persona_profile_path("lead");
-        match load_capability_profile(&p) {
-            Ok(profile) => {
-                debug!(path = %p.display(), "loaded lead persona capability profile");
-                Some(Arc::new(profile))
-            }
-            Err(err) => {
-                warn!(err = %err, "lead persona profile.toml missing or unreadable;                        lead tools run without capability enforcement");
-                None
-            }
-        }
-    };
     let coord_recipient_for_resume = coord_addr.clone();
-    let spawn_agent_tool = crate::tool::SpawnAgentTool::new(
-        coord_addr.recipient(),
-        lead_profile.clone(),
-        Some(Arc::clone(&blacklist_handle)),
-    )
-    .with_audit(Arc::clone(&audit_shared));
-    let send_message_tool = crate::tool::SendMessageTool::new(
-        dispatcher_addr.clone().recipient(),
-        lead_profile.clone(),
-        Some(Arc::clone(&blacklist_handle)),
-    )
-    .with_audit(Arc::clone(&audit_shared));
-    let list_agents_tool = crate::tool::ListAgentsTool::new(
-        agent_registry_path_for_resume.clone(),
-        lead_profile.clone(),
-    )
-    .with_audit(Arc::clone(&audit_shared));
-    let whoami_tool =
-        crate::tool::WhoamiTool::new(agent_registry_path_for_resume.clone(), lead_profile.clone())
-            .with_audit(Arc::clone(&audit_shared));
-    let whois_tool = crate::tool::WhoisTool::new(data_dir_for_whois.clone(), lead_profile.clone())
-        .with_audit(Arc::clone(&audit_shared));
-    let list_personas_tool =
-        crate::tool::ListPersonasTool::new(data_dir_for_whois, lead_profile.clone())
-            .with_audit(Arc::clone(&audit_shared));
-    let lead_thresholds_from_profile = lead_profile
-        .as_deref()
-        .map(|p| p.thresholds.clone())
-        .unwrap_or_default();
-    let tools: Vec<(
-        reeve_adapter::Tool,
-        actix::Recipient<crate::tool::InvokeTool>,
-    )> = vec![
-        (
-            crate::tool::SpawnAgentTool::descriptor(),
-            spawn_agent_tool.start().recipient(),
-        ),
-        (
-            crate::tool::SendMessageTool::descriptor(),
-            send_message_tool.start().recipient(),
-        ),
-        (
-            crate::tool::ListAgentsTool::descriptor(),
-            list_agents_tool.start().recipient(),
-        ),
-        (
-            crate::tool::WhoamiTool::descriptor(),
-            whoami_tool.start().recipient(),
-        ),
-        (
-            crate::tool::WhoisTool::descriptor(),
-            whois_tool.start().recipient(),
-        ),
-        (
-            crate::tool::ListPersonasTool::descriptor(),
-            list_personas_tool.start().recipient(),
-        ),
-    ];
 
-    // Agent: processes inbound envelopes via the model adapter and the tool
-    // execution loop.
-    let lead_agent = Agent::new(
-        adapter,
-        &dirs,
-        snapshot,
-        system_prompt,
-        agent_id,
-        keypair,
-        tools,
-        lead_thresholds_from_profile,
-        Some(Arc::clone(&audit_shared)),
-        data_dir_for_lead,
-        "lead".to_owned(),
-        agent_registry_path_for_resume.clone(),
+    // EstateCoordinator: operator-tier organizational operations arriving as
+    // signed envelopes on the reserved `estate` inbox. Started after the
+    // spawn coordinator because team formation mints members through it.
+    let layout_for_estate = RuntimeLayout::new(&data_dir_for_resume);
+    let engagements = crate::engagement::EngagementRegistry::open(
+        layout_for_estate.engagements_root(),
     )
     .map_err(|e| DaemonError::Resource {
-        component: "lead agent",
+        component: "engagement registry",
         source: Box::new(e),
     })?;
-    let lead_addr = actix::Supervisor::start(move |_| lead_agent);
+    let teams = crate::team::TeamRegistry::open(layout_for_estate.rosters_root()).map_err(|e| {
+        DaemonError::Resource {
+            component: "team registry",
+            source: Box::new(e),
+        }
+    })?;
+    let estate_team_ops = crate::estate::TeamOpsDeps {
+        spawner: coord_addr.clone().recipient(),
+        teams,
+        control_routes: control_routes.clone(),
+        agent_registry_path: agent_registry_path_for_resume.clone(),
+        data_dir: data_dir_for_resume.clone(),
+    };
 
-    let lead_addr_clone = lead_addr.clone();
-    watcher_addr.do_send(WatchInbox {
-        agent_id,
-        inbox,
-        on_quarantine: Some(Box::new(move |reason| {
-            lead_addr.do_send(crate::agent::QuarantineEvent { reason });
-        })),
-        recipient: lead_addr_clone.recipient(),
-    });
-
-    // Re-launch any non-lead agents the previous daemon left in the registry.
-    // Without this, the lead's send_message to a subagent that was alive in a
-    // prior daemon run would silently land in an unwatched inbox.
+    // Re-launch any agent the previous daemon left in the registry, before
+    // forming the default team below: on a fresh install the registry is
+    // empty (nothing to resume, no-op); on every later boot this must run
+    // first so the default team's already-formed members are resumed here
+    // rather than raced by a second, freshly-minted instance from the
+    // form-team call that follows.
     let resume_inbox_starter = watcher_addr_for_resume.recipient();
     resume_persisted_subagents(
         &data_dir_for_resume,
@@ -1216,17 +1025,48 @@ fn launch_actors(
         &resume_inbox_starter,
         &dispatcher_recipient_for_resume,
         Some(&coord_recipient_for_resume.recipient()),
+        Some(&control_routes),
     );
+
+    // Form the default team from teams/default.toml on first boot. Refuses
+    // (audited `name_taken`, not an error) and is a no-op on every later
+    // boot once the roster already exists — the roster's existence is the
+    // sole gate, so this is safe to call unconditionally on every start.
+    // Members mint through the ordinary spawn-coordinator path with no
+    // special-casing for the lead role; `reeve team form` (operator-
+    // triggered) goes through the identical `form_team` call.
+    crate::estate::form_team(
+        &estate_team_ops,
+        &audit_shared,
+        operator_id,
+        "default",
+        "default",
+        time::OffsetDateTime::now_utc(),
+    )
+    .await;
+
+    let estate_audit = Arc::clone(&audit_shared);
+    let estate_addr = actix::Supervisor::start(move |_| {
+        crate::estate::EstateCoordinator::new(operator_id, engagements, estate_audit)
+            .with_team_ops(estate_team_ops)
+    });
+    watcher_addr.do_send(WatchInbox {
+        agent_id: estate_id,
+        inbox: estate_inbox,
+        on_quarantine: None,
+        recipient: estate_addr.recipient(),
+    });
 
     Ok(dispatcher_addr)
 }
 
-/// Re-launch every non-lead agent in the registry. Called once on daemon
-/// start, after the lead is up. Each non-lead record is treated as a
+/// Re-launch every agent in the registry other than the estate coordinator.
+/// Called once on daemon start, before the default team is (re-)formed —
+/// see `launch_actors`'s ordering comment. Each record is treated as a
 /// best-effort resume: per-agent failures (missing snapshot, persona
 /// removed, adapter id mismatch, keypair drift) are logged and skipped
 /// rather than failing the whole daemon — one corrupt persisted agent
-/// must not prevent the lead from coming up at all.
+/// must not prevent the rest of the estate from coming up.
 ///
 /// Symmetry with the spawn-time path: this performs steps L–P of the
 /// spawn coordinator (build tools, construct Agent, supervise, register
@@ -1280,6 +1120,7 @@ fn resume_persisted_subagents(
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
     coordinator: Option<&actix::Recipient<SpawnRequest>>,
+    control_routes: Option<&crate::agent::ControlRoutes>,
 ) {
     let registry = match AgentRegistry::open(agent_registry_path.to_path_buf()) {
         Ok(r) => r,
@@ -1290,12 +1131,17 @@ fn resume_persisted_subagents(
     };
 
     for record in registry.list() {
-        // The lead and the estate coordinator are the daemon's own actors,
-        // launched directly by launch_actors — neither is a resumable
-        // model-backed subagent.
-        if record.name.as_str() == "lead"
-            || record.name.as_str() == crate::estate::ESTATE_AGENT_NAME
-        {
+        // The estate coordinator is the daemon's own actor, launched
+        // directly by launch_actors — it is not a resumable model-backed
+        // agent. Every other record, including the default team's lead
+        // role, is an ordinary agent resumed the same way.
+        if record.name.as_str() == crate::estate::ESTATE_AGENT_NAME {
+            continue;
+        }
+        // Retirement is the deliberate end of an identity: never resumed,
+        // unlike Stopped (which is retried each boot in case the failure
+        // was transient).
+        if matches!(record.status, AgentStatus::Retired) {
             continue;
         }
         if let Err(err) = resume_one_subagent(
@@ -1309,6 +1155,7 @@ fn resume_persisted_subagents(
             inbox_starter,
             dispatcher,
             coordinator.cloned(),
+            control_routes,
             record,
         ) {
             warn!(
@@ -1360,6 +1207,7 @@ fn resume_one_subagent(
     inbox_starter: &actix::Recipient<WatchInbox>,
     dispatcher: &actix::Recipient<SendMessage>,
     coordinator: Option<actix::Recipient<SpawnRequest>>,
+    control_routes: Option<&crate::agent::ControlRoutes>,
     record: &AgentRecord,
 ) -> Result<(), ResumeError> {
     let dirs = AgentDirs::open(data_dir, record.name.as_str())
@@ -1502,16 +1350,27 @@ fn resume_one_subagent(
         data_dir.to_path_buf(),
         record.name.as_str().to_owned(),
         agent_registry_path.to_path_buf(),
+        Some(Arc::clone(watcher)),
+        control_routes.cloned(),
     )
     .map_err(|e| format!("construct Agent: {e}"))?;
     let agent_addr = actix::Supervisor::start(move |_| new_agent);
 
     watcher.register_route(record.identity_id, agent_addr.clone().recipient());
+    if let Some(routes) = control_routes {
+        routes.register(
+            record.name.as_str().to_owned(),
+            agent_addr.clone().recipient(),
+        );
+    }
     let inbox = AgentInbox::from_path(dirs.inbox_root());
+    let agent_addr_for_quarantine = agent_addr.clone();
     inbox_starter.do_send(WatchInbox {
         agent_id: record.identity_id,
         inbox,
-        on_quarantine: None,
+        on_quarantine: Some(Box::new(move |reason| {
+            agent_addr_for_quarantine.do_send(crate::agent::QuarantineEvent { reason });
+        })),
         recipient: agent_addr.recipient(),
     });
 
@@ -1731,64 +1590,13 @@ mod tests {
         );
     }
 
-    // A2: prepare_agent_startup returns Resource error when no adapter matches.
+    // A3: prepare_agent_startup produces the same estate_id across two calls
+    // against the same data directory (durable identity). The default
+    // team's lead-role member is no longer minted here — it goes through
+    // the ordinary spawn path inside `launch_actors` — so this only covers
+    // the one identity `prepare_agent_startup` still bootstraps directly.
     #[test]
-    fn prepare_agent_startup_fails_with_no_matching_adapter() {
-        struct WrongAdapter;
-
-        #[async_trait::async_trait]
-        impl reeve_adapter::Adapter for WrongAdapter {
-            fn id(&self) -> &'static str {
-                "other-model@route"
-            }
-
-            fn capabilities(&self) -> reeve_adapter::Capabilities {
-                reeve_adapter::Capabilities::new()
-            }
-
-            async fn call(
-                &self,
-                _: &[reeve_adapter::Message],
-                _: &[reeve_adapter::Tool],
-                _: &reeve_adapter::Params,
-            ) -> Result<reeve_adapter::Response, reeve_adapter::AdapterError> {
-                Err(reeve_adapter::AdapterError::BadRequest {
-                    message: String::from("mock"),
-                })
-            }
-        }
-
-        let tmp = crate::test_support::secure_dir();
-        let data_dir = tmp.path().to_path_buf();
-        let agent_registry_path = registry_path_for_data_dir(&data_dir);
-        let (identity_registry, watcher, _) = build_registries(&data_dir);
-        enroll_test_operator(&identity_registry);
-        let adapter: Arc<dyn reeve_adapter::Adapter> = Arc::new(WrongAdapter);
-
-        let result = prepare_agent_startup(
-            &data_dir,
-            &identity_registry,
-            watcher,
-            std::slice::from_ref(&adapter),
-            agent_registry_path,
-        );
-        let is_model_resolution_err = matches!(
-            result,
-            Err(DaemonError::Resource {
-                component: "model resolution",
-                ..
-            })
-        );
-        assert!(
-            is_model_resolution_err,
-            "expected Resource model resolution error"
-        );
-    }
-
-    // A3: prepare_agent_startup produces the same agent_id and keypair across two
-    // calls against the same data directory (durable identity).
-    #[test]
-    fn prepare_agent_startup_uses_stable_identity_across_calls() {
+    fn prepare_agent_startup_uses_stable_estate_identity_across_calls() {
         let tmp = crate::test_support::secure_dir();
         let data_dir = tmp.path().to_path_buf();
         let adapter: Arc<dyn reeve_adapter::Adapter> =
@@ -1804,8 +1612,6 @@ mod tests {
             registry_path_for_data_dir(&data_dir),
         )
         .expect("first prepare_agent_startup should succeed");
-        let first_id = first.agent_id;
-        let first_public = *first.keypair.public();
 
         let (identity_registry2, watcher2, _) = build_registries(&data_dir);
         let second = prepare_agent_startup(
@@ -1818,32 +1624,22 @@ mod tests {
         .expect("second prepare_agent_startup should succeed");
 
         assert_eq!(
-            first_id, second.agent_id,
-            "agent_id must be stable across restarts"
-        );
-        assert_eq!(
-            first_public,
-            *second.keypair.public(),
-            "keypair public key must be stable across restarts"
-        );
-
-        assert_eq!(
             first.estate_id, second.estate_id,
             "estate coordinator identity must be stable across restarts"
         );
 
-        // The identity registry must contain exactly two Agent-typed entries
-        // after the second call — the lead and the estate coordinator, with
-        // no duplication on the second bootstrap. (The remaining entry is
-        // the test operator enrolled before the first call.)
+        // The identity registry must contain exactly one Agent-typed entry
+        // after the second call — the estate coordinator, with no
+        // duplication on the second bootstrap. (The other entry is the test
+        // operator enrolled before the first call.)
         let stored = identity_registry2
-            .lookup(second.agent_id)
+            .lookup(second.estate_id)
             .expect("identity registry lookup must not fail")
-            .expect("identity registry must contain the agent_id after second call");
+            .expect("identity registry must contain the estate_id after second call");
         assert_eq!(
             stored.identity().identity_id,
-            second.agent_id,
-            "stored identity id must match agent_id"
+            second.estate_id,
+            "stored identity id must match estate_id"
         );
         let all = identity_registry2
             .list()
@@ -1854,27 +1650,17 @@ mod tests {
             .collect();
         assert_eq!(
             agents.len(),
-            2,
-            "identity registry must contain exactly two Agent-typed entries \
-             (lead + estate), not duplicated; got: {agents:?}"
-        );
-
-        // The agent registry must show the lead record with status Running
-        // after the second call.
-        let agent_registry = AgentRegistry::open(registry_path_for_data_dir(&data_dir)).unwrap();
-        let record = agent_registry
-            .lookup("lead")
-            .expect("lead record must be present in agent registry after second call");
-        assert_eq!(
-            record.status,
-            AgentStatus::Running,
-            "lead agent status must be Running after second prepare_agent_startup"
+            1,
+            "identity registry must contain exactly one Agent-typed entry \
+             (estate), not duplicated; got: {agents:?}"
         );
     }
 
-    // A4: When the on-disk keypair does not match the identity-registry public key,
-    // prepare_agent_startup must return a Resource("keypair mismatch") error.
-    // This exercises the mismatch branch at the keypair-verification step.
+    // A4: When the on-disk keypair does not match the identity-registry public
+    // key, prepare_agent_startup must return a Resource("keypair mismatch")
+    // error. Exercises the mismatch branch at the keypair-verification step,
+    // via the estate identity — the one identity this function still
+    // bootstraps directly through `ensure_named_agent_identity`.
     #[test]
     fn prepare_agent_startup_rejects_mismatched_keypair() {
         let tmp = crate::test_support::secure_dir();
@@ -1882,10 +1668,10 @@ mod tests {
         let adapter: Arc<dyn reeve_adapter::Adapter> =
             Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
 
-        // First call: establishes identity and writes the keypair file.
+        // First call: establishes identity and writes the estate keypair file.
         let (identity_registry1, watcher1, _) = build_registries(&data_dir);
         enroll_test_operator(&identity_registry1);
-        let first = prepare_agent_startup(
+        prepare_agent_startup(
             &data_dir,
             &identity_registry1,
             watcher1,
@@ -1894,10 +1680,12 @@ mod tests {
         )
         .expect("first call should succeed");
 
-        // Overwrite the keypair file with a freshly generated keypair so that
-        // the on-disk key no longer matches the identity-registry entry.
+        // Overwrite the estate keypair file with a freshly generated keypair
+        // so the on-disk key no longer matches the identity-registry entry.
+        let estate_dirs = AgentDirs::open(&data_dir, crate::estate::ESTATE_AGENT_NAME)
+            .expect("estate dirs must exist after first call");
         let new_keypair = reeve_types::Keypair::generate();
-        let key_path = first.dirs.identity_key_path();
+        let key_path = estate_dirs.identity_key_path();
         let seed = new_keypair.private().to_seed_bytes();
         // Direct write simulates out-of-band key replacement (e.g. manual restore
         // from backup) without going through generate_or_load_keypair.
@@ -2014,6 +1802,7 @@ mod tests {
                 &inbox_starter,
                 &dispatcher,
                 None,
+                None,
             );
 
             // resume runs synchronously: by the time it returns the worker
@@ -2037,6 +1826,122 @@ mod tests {
         assert!(
             worker_dirs.profile_path().exists(),
             "resume should synthesize agents/worker/profile.toml from the persona profile"
+        );
+    }
+
+    // R1a: the default team's lead-role member — an ordinary "lead"-persona
+    // agent since phase 2, with no bespoke bootstrap of its own — resumes
+    // successfully across a daemon restart using nothing but what
+    // `install_defaults` ships. Regression test for a live bug found while
+    // smoke-testing the phase-2 boot redesign: before `install_defaults`
+    // shipped `personas/lead/profile.toml`, a lead-role member minted
+    // through the ordinary spawn path got no capability-profile snapshot at
+    // mint time (spawn only writes one when a persona profile resolved) and
+    // then failed to resume on every subsequent boot with
+    // `ProfileMissing` — silently breaking the walking-skeleton demo after
+    // the very first restart.
+    #[test]
+    #[cfg(unix)]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "linear fixture setup mirroring R1's shape (identity, snapshot, \
+                  registry record) plus the resume call and both assertions; \
+                  splitting fragments a single coherent scenario"
+    )]
+    fn resume_succeeds_for_lead_persona_agent_after_install_defaults() {
+        use crate::test_support::{NullDispatcher, NullInboxStarter};
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        let operator_id = enroll_test_operator(&identity_registry);
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+
+        // The one thing a fresh install does before anything can be minted.
+        crate::config::install_defaults(&data_dir).unwrap();
+
+        // Provision a "default-lead" record the same way a first-boot
+        // `form_team` mint would have, but — matching R1's setup — with no
+        // agent-level profile.toml of its own, so this exercises the
+        // synthesize-from-persona-profile fallback specifically.
+        let lead_dirs = AgentDirs::provision(&data_dir, "default-lead").unwrap();
+        let lead_keypair = generate_or_load_keypair(&lead_dirs.identity_key_path()).unwrap();
+        let lead_id = reeve_types::IdentityId::new().unwrap();
+        {
+            let mut identity =
+                reeve_types::Identity::new_agent("default-lead".to_owned(), operator_id).unwrap();
+            identity.identity_id = lead_id;
+            let key_record = reeve_types::KeyRecord::new(lead_id, *lead_keypair.public()).unwrap();
+            let stored = StoredIdentity::new(identity, key_record).unwrap();
+            identity_registry.write(&stored).unwrap();
+        }
+        let snapshot = SpawnSnapshot {
+            persona_name: "lead".to_owned(),
+            persona_version: 1,
+            adapter_id: adapter.id().to_owned(),
+            agent_id: lead_id.to_string(),
+            system_prompt: "You are a helpful AI assistant.".to_owned(),
+            system_prompt_source: None,
+        };
+        write_spawn_snapshot(&lead_dirs, &snapshot).unwrap();
+        {
+            let mut agent_registry = AgentRegistry::open(agent_registry_path.clone()).unwrap();
+            agent_registry
+                .register(AgentRecord {
+                    name: ValidatedAgentName::new("default-lead").unwrap(),
+                    identity_id: lead_id,
+                    inbox_dir: lead_dirs.inbox_root(),
+                    persona_name: Some("lead".to_owned()),
+                    spawned_at: time::OffsetDateTime::now_utc(),
+                    status: AgentStatus::Running,
+                    stopped_reason: None,
+                })
+                .unwrap();
+        }
+
+        let agent_registry_path_for_assert = agent_registry_path.clone();
+        actix::System::new().block_on(async move {
+            let inbox_starter = NullInboxStarter.start().recipient();
+            let dispatcher = NullDispatcher.start().recipient();
+            let test_audit =
+                Arc::new(AuditLog::open(data_dir.clone()).expect("open audit log in test"));
+            resume_persisted_subagents(
+                &data_dir,
+                &agent_registry_path,
+                &identity_registry,
+                std::slice::from_ref(&adapter),
+                None,
+                &test_audit,
+                &watcher,
+                &inbox_starter,
+                &dispatcher,
+                None,
+                None,
+            );
+
+            assert!(
+                watcher.has_route(lead_id),
+                "the default team's lead role must resume across a restart \
+                 using only what install_defaults ships — got ProfileMissing \
+                 (no route registered) instead"
+            );
+
+            actix::System::current().stop();
+        });
+
+        let record = AgentRegistry::open(agent_registry_path_for_assert)
+            .unwrap()
+            .lookup("default-lead")
+            .unwrap()
+            .clone();
+        assert_eq!(
+            record.status,
+            AgentStatus::Running,
+            "resume must not have marked default-lead Stopped(profile_missing); \
+             got stopped_reason={:?}",
+            record.stopped_reason
         );
     }
 
@@ -2109,6 +2014,7 @@ mod tests {
                 &watcher,
                 &inbox_starter,
                 &dispatcher,
+                None,
                 None,
             );
 
@@ -2201,6 +2107,7 @@ mod tests {
                 &inbox_starter,
                 &dispatcher,
                 None,
+                None,
             );
 
             assert!(
@@ -2288,6 +2195,7 @@ mod tests {
                 &watcher,
                 &inbox_starter,
                 &dispatcher,
+                None,
                 None,
             );
 

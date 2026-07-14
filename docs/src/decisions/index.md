@@ -7,3 +7,4 @@ fact; superseded ADRs get a `Superseded by:` line at the top.
 - [ADR 002 — Tool-actor trust boundary](./002-tool-actor-trust-boundary.md)
 - [ADR 003 — Actor-system internals](./003-actor-system-internals.md)
 - [ADR 004 — Multi-provider failover for a single model](./004-multi-provider-failover.md)
+- [ADR 005 — `actix::Supervisor` restart is gated on mailbox connectivity, not `stop()` vs `terminate()`](./005-supervisor-restart-is-mailbox-gated.md)

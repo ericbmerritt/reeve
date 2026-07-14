@@ -99,6 +99,11 @@ pub struct SpawnRequest {
     system_prompt: String,
     sender_id: IdentityId,
     reply_to: actix::Recipient<SpawnResponse>,
+    /// Operator-chosen durable name. `None` derives the historical
+    /// `{persona}-{hex}` name. Named spawns are the estate coordinator's
+    /// minting path (team formation, teamless standing agents); either way
+    /// the name-permanence check applies before provisioning.
+    requested_name: Option<ValidatedAgentName>,
 }
 
 impl SpawnRequest {
@@ -135,7 +140,14 @@ impl SpawnRequest {
             system_prompt: params.system_prompt,
             sender_id: params.sender_id,
             reply_to,
+            requested_name: None,
         }
+    }
+
+    /// Used by the estate coordinator's minting path.
+    pub(crate) fn with_requested_name(mut self, name: ValidatedAgentName) -> Self {
+        self.requested_name = Some(name);
+        self
     }
 
     pub fn persona_name(&self) -> &ValidatedAgentName {
@@ -225,6 +237,10 @@ pub struct SpawnCoordinator {
     /// `max_system_prompt_bytes`, defaulting to
     /// [`crate::config::DEFAULT_MAX_SYSTEM_PROMPT_BYTES`].
     max_system_prompt_bytes: usize,
+    /// Shared name → retire-recipient table; every started agent registers
+    /// here so the estate coordinator can wind incarnations down. `None` in
+    /// tests that don't exercise retirement.
+    control_routes: Option<crate::agent::ControlRoutes>,
 }
 
 impl SpawnCoordinator {
@@ -259,7 +275,15 @@ impl SpawnCoordinator {
             audit,
             operator_id,
             max_system_prompt_bytes,
+            control_routes: None,
         }
+    }
+
+    /// Register started agents in the shared retire-route table.
+    #[must_use]
+    pub fn with_control_routes(mut self, routes: crate::agent::ControlRoutes) -> Self {
+        self.control_routes = Some(routes);
+        self
     }
 }
 
@@ -271,18 +295,20 @@ impl Supervised for SpawnCoordinator {}
 
 // ── Subagent tool wiring ──────────────────────────────────────────────────────
 
-/// Build the tool set every spawned subagent gets:
-/// - `send_message` — wired to the shared dispatcher so subordinates can
-///   reply to the lead (and to peers) via their own tool loop.
-/// - `list_agents` — read-only directory of the agent registry so subagents
-///   can discover peers spawned alongside them.
-/// - `whoami` — self-identification, useful for self-aware operations and
-///   for confirming the subagent is correctly registered.
-///
-/// Notably *not* included: `spawn_agent`. The ladder reserves subordinate
-/// spawning to the lead in this phase; granting it to subagents would
-/// introduce a spawn graph the operator can't currently observe through
-/// the panopticon.
+/// Build the tool set every spawned agent gets — this is also, since Phase 2,
+/// what a formed team's lead role receives: there is no separate lead-only
+/// tool list anywhere in the runtime, only per-persona capability-profile
+/// gating (`check_authority`) applied identically regardless of role:
+/// - `send_message` — wired to the shared dispatcher so agents can reply to
+///   their spawner (and to peers) via their own tool loop.
+/// - `list_agents` — read-only directory of the agent registry so agents can
+///   discover peers spawned alongside them.
+/// - `whoami` / `whois` — self- and peer-identification.
+/// - `list_personas` — read-only directory of available personas.
+/// - `spawn_agent` — included whenever a live coordinator recipient is
+///   available (`coordinator: Some(_)`); every real call site passes one.
+///   Attempts are still refused at invocation time by `check_authority` if
+///   the agent's capability profile doesn't grant `SpawnAgents`.
 ///
 /// Extracted into a free function so tests can assert the descriptor list
 /// without spinning up the full spawn pipeline.
@@ -290,6 +316,12 @@ impl Supervised for SpawnCoordinator {}
     clippy::too_many_arguments,
     reason = "build_subagent_tools wires six independent collaborators; \
               bundling into a context struct adds indirection at three call sites"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one tool-actor construction block per tool, repeated for each of \
+              the six tools every agent gets; splitting on line count would \
+              fragment a list that is easiest to audit as a single block"
 )]
 pub(crate) fn build_subagent_tools(
     coordinator: Option<actix::Recipient<SpawnRequest>>,
@@ -333,6 +365,14 @@ pub(crate) fn build_subagent_tools(
             t
         }
     };
+    let list_personas_tool = {
+        let t = crate::tool::ListPersonasTool::new(data_dir.to_path_buf(), profile.clone());
+        if let Some(a) = audit.clone() {
+            t.with_audit(a)
+        } else {
+            t
+        }
+    };
     let mut tools = vec![
         (
             SendMessageTool::descriptor(),
@@ -349,6 +389,10 @@ pub(crate) fn build_subagent_tools(
         (
             crate::tool::WhoisTool::descriptor(),
             whois_tool.start().recipient(),
+        ),
+        (
+            crate::tool::ListPersonasTool::descriptor(),
+            list_personas_tool.start().recipient(),
         ),
     ];
     if let Some(coord) = coordinator {
@@ -393,6 +437,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             system_prompt,
             sender_id,
             reply_to,
+            requested_name,
         } = msg;
         let persona_name_str = persona_name.as_str();
 
@@ -411,27 +456,65 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             return;
         }
 
-        let mut suffix_bytes = [0u8; 4];
-        OsRng.fill_bytes(&mut suffix_bytes);
-        let suffix = suffix_bytes
-            .iter()
-            .fold(String::with_capacity(8), |mut acc, b| {
-                use std::fmt::Write as _;
-                let _ = write!(acc, "{b:02x}");
-                acc
-            });
-        let agent_name_str = format!("{persona_name_str}-{suffix}");
-        let derived_display_name = agent_name_str.clone();
-        let validated_name = match ValidatedAgentName::new(&agent_name_str) {
-            Ok(n) => n,
-            Err(err) => {
-                error_reply(
-                    &reply_to,
-                    format!("derived agent name '{agent_name_str}' is invalid: {err}"),
-                );
-                return;
+        let validated_name = if let Some(name) = requested_name {
+            name
+        } else {
+            let mut suffix_bytes = [0u8; 4];
+            OsRng.fill_bytes(&mut suffix_bytes);
+            let suffix = suffix_bytes
+                .iter()
+                .fold(String::with_capacity(8), |mut acc, b| {
+                    use std::fmt::Write as _;
+                    let _ = write!(acc, "{b:02x}");
+                    acc
+                });
+            let derived = format!("{persona_name_str}-{suffix}");
+            match ValidatedAgentName::new(&derived) {
+                Ok(n) => n,
+                Err(err) => {
+                    error_reply(
+                        &reply_to,
+                        format!("derived agent name '{derived}' is invalid: {err}"),
+                    );
+                    return;
+                }
             }
         };
+        let agent_name_str = validated_name.as_str().to_owned();
+        let derived_display_name = agent_name_str.clone();
+
+        // Names are forever: any name ever present in the registry —
+        // running, stopped, or retired — is permanently unavailable. The
+        // registry accumulates records precisely so this check holds across
+        // the estate's whole history. Guarded on file existence so a fresh
+        // estate (no registry yet) skips it without side effects — opening
+        // the registry would create its parent directory, and later steps
+        // own that side effect (and its failure modes, e.g. the
+        // one-orphan-identity posture at the commit step).
+        if self.agent_registry_path.symlink_metadata().is_ok() {
+            match AgentRegistry::open(self.agent_registry_path.clone()) {
+                Ok(registry) => {
+                    if registry.lookup(&agent_name_str).is_some() {
+                        error_reply(
+                            &reply_to,
+                            format!(
+                                "agent name '{agent_name_str}' was already used; \
+                                 names are never reused"
+                            ),
+                        );
+                        return;
+                    }
+                }
+                Err(err) => {
+                    warn!(%err, "failed to open agent registry for name-permanence check");
+                    error_reply(
+                        &reply_to,
+                        String::from("failed to open agent registry for name-permanence check"),
+                    );
+                    return;
+                }
+            }
+        }
 
         let layout = RuntimeLayout::new(&self.data_dir);
         let persona_path = layout.persona_config_path(persona_name_str);
@@ -699,6 +782,8 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             self.data_dir.clone(),
             agent_name_str.clone(),
             self.agent_registry_path.clone(),
+            Some(Arc::clone(&self.watcher)),
+            self.control_routes.clone(),
         ) {
             Ok(a) => a,
             Err(err) => {
@@ -712,11 +797,18 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
         self.watcher
             .register_route(agent_id, agent_addr.clone().recipient());
 
+        if let Some(routes) = &self.control_routes {
+            routes.register(agent_name_str.clone(), agent_addr.clone().recipient());
+        }
+
         let inbox = AgentInbox::from_path(dirs.inbox_root());
+        let agent_addr_for_quarantine = agent_addr.clone();
         self.inbox_starter.do_send(WatchInbox {
             agent_id,
             inbox,
-            on_quarantine: None,
+            on_quarantine: Some(Box::new(move |reason| {
+                agent_addr_for_quarantine.do_send(crate::agent::QuarantineEvent { reason });
+            })),
             recipient: agent_addr.recipient(),
         });
 

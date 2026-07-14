@@ -231,6 +231,76 @@ pub enum AuditEvent {
         at: OffsetDateTime,
     },
 
+    /// A team was formed from a template: its members were minted as new
+    /// durable agents and bound into a standing roster.
+    #[serde(rename = "team.formed")]
+    TeamFormed {
+        sender_id: IdentityId,
+        name: String,
+        /// Durable names of the minted member agents.
+        members: Vec<String>,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// A team was dissolved. Members were individually retired or released
+    /// per the operator's disposition; each member also gets its own
+    /// `agent.retired` / `agent.released` event.
+    #[serde(rename = "team.dissolved")]
+    TeamDissolved {
+        sender_id: IdentityId,
+        name: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// A durable agent was minted by operator request (team formation or a
+    /// teamless standing agent).
+    #[serde(rename = "agent.minted")]
+    AgentMinted {
+        sender_id: IdentityId,
+        name: String,
+        persona_name: String,
+        /// Team the agent was minted into; `None` for teamless agents.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        team: Option<String>,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// A durable agent was permanently retired: its incarnation wound down,
+    /// its record is archival, and its name is never reusable.
+    #[serde(rename = "agent.retired")]
+    AgentRetired {
+        sender_id: IdentityId,
+        name: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// A team member was released to teamless standing during dissolution.
+    #[serde(rename = "agent.released")]
+    AgentReleased {
+        sender_id: IdentityId,
+        name: String,
+        team: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// A team or agent estate operation was refused (the team/agent
+    /// analogue of `engagement.op_refused`).
+    #[serde(rename = "estate.op_refused")]
+    EstateOpRefused {
+        sender_id: Option<IdentityId>,
+        op: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        reason: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
     /// An estate operation was refused. `reason` is a short machine-readable
     /// token (e.g. `"not_operator"`, `"name_taken"`, `"wrong_state"`,
     /// `"invalid_payload"`); refusals are audited so an attempted operation
@@ -759,6 +829,10 @@ mod tests {
     }
 
     // A10: each event variant serializes to under 4096 bytes (PIPE_BUF safety).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one literal per audit variant; the length is the enumeration"
+    )]
     #[test]
     fn each_event_serializes_under_pipe_buf() {
         const PIPE_BUF: usize = 4096;
@@ -825,6 +899,44 @@ mod tests {
                 op: "open-engagement".to_owned(),
                 name: Some("n".repeat(255)),
                 reason: "name_taken".to_owned(),
+                at: at(),
+            },
+            AuditEvent::TeamFormed {
+                sender_id,
+                name: "n".repeat(255),
+                members: (0..8)
+                    .map(|i| format!("member-{i}-{}", "m".repeat(200)))
+                    .collect(),
+                at: at(),
+            },
+            AuditEvent::TeamDissolved {
+                sender_id,
+                name: "n".repeat(255),
+                at: at(),
+            },
+            AuditEvent::AgentMinted {
+                sender_id,
+                name: "n".repeat(255),
+                persona_name: "p".repeat(255),
+                team: Some("t".repeat(255)),
+                at: at(),
+            },
+            AuditEvent::AgentRetired {
+                sender_id,
+                name: "n".repeat(255),
+                at: at(),
+            },
+            AuditEvent::AgentReleased {
+                sender_id,
+                name: "n".repeat(255),
+                team: "t".repeat(255),
+                at: at(),
+            },
+            AuditEvent::EstateOpRefused {
+                sender_id: Some(sender_id),
+                op: "form-team".to_owned(),
+                name: Some("n".repeat(255)),
+                reason: "r".repeat(512),
                 at: at(),
             },
         ];

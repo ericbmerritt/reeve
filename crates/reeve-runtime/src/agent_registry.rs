@@ -209,12 +209,19 @@ impl AgentRegistryError {
 
 /// Persisted lifecycle state of a registered agent.
 ///
-/// Records are cumulative — a `Stopped` agent remains in the registry.
+/// Records are cumulative — a `Stopped` or `Retired` agent remains in the
+/// registry forever. That permanence is load-bearing: the registry is the
+/// name-permanence check (`specs/reeve-organization.md` § Gotchas, "names
+/// are forever"), so a record must never be deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum AgentStatus {
     Running,
     Stopped,
+    /// Permanently retired: never resumed, never re-incarnated; the name is
+    /// never reusable (true of every registry name, but retirement is the
+    /// deliberate end of the identity rather than a pause).
+    Retired,
 }
 
 // ── ValidatedAgentName ────────────────────────────────────────────────────────
