@@ -40,6 +40,18 @@ pub enum EngagementState {
     Closed,
 }
 
+/// The unit currently staffed to a top-level engagement: a standing team, or
+/// a lone teamless agent (the degenerate unit of one). Per
+/// `specs/reeve-organization.md` § Engagement, "a team member is never a
+/// top-level unit on its own" — a `Team` variant names the roster, not one
+/// of its members.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum StaffedUnit {
+    Team { name: String },
+    Agent { name: String },
+}
+
 // ── Record ────────────────────────────────────────────────────────────────────
 
 /// Persisted engagement record.
@@ -63,6 +75,15 @@ pub struct EngagementRecord {
     /// delegation phase ships nesting.
     #[serde(default)]
     pub parent: Option<String>,
+    /// The unit (team or lone teamless agent) currently staffed here, if
+    /// any — at most one at a time, serially re-staffable. This is the
+    /// single source of truth for staffing (not mirrored on the team
+    /// record): "is this team already staffed elsewhere" is answered by
+    /// scanning engagements, not by a second pointer that could drift out
+    /// of sync with this one. `#[serde(default)]`: absent in records
+    /// written before staffing existed, which is the same as unstaffed.
+    #[serde(default)]
+    pub staffed_unit: Option<StaffedUnit>,
 }
 
 // ── Error ─────────────────────────────────────────────────────────────────────
@@ -186,7 +207,7 @@ pub fn resolve_vcs_toplevel(start: &std::path::Path) -> Result<PathBuf, io::Erro
 /// Stateless between calls: every operation reads and writes the record
 /// file directly, so daemon restarts (and concurrent readers like the CLI's
 /// `list`) always see the durable truth.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EngagementRegistry {
     engagements_root: PathBuf,
 }
@@ -232,6 +253,7 @@ impl EngagementRegistry {
             state: EngagementState::Open,
             opened_at,
             parent: None,
+            staffed_unit: None,
         };
         self.write_record(&record)?;
         Ok(record)
@@ -247,6 +269,21 @@ impl EngagementRegistry {
     /// reopening restores, never rewrites.
     pub fn reopen(&self, name: &str) -> Result<EngagementRecord, EngagementError> {
         self.transition(name, EngagementState::Closed, EngagementState::Open)
+    }
+
+    /// Set (or clear, with `None`) the staffed unit on an engagement
+    /// record. No state precondition here — staffing and lifecycle state
+    /// are independent axes at this layer; the estate coordinator enforces
+    /// "must be `Open` and not already staffed" before calling this.
+    pub fn set_staffed_unit(
+        &self,
+        name: &str,
+        staffed_unit: Option<StaffedUnit>,
+    ) -> Result<EngagementRecord, EngagementError> {
+        let mut record = self.get(name)?;
+        record.staffed_unit = staffed_unit;
+        self.write_record(&record)?;
+        Ok(record)
     }
 
     /// Read the record for `name`.
@@ -377,6 +414,42 @@ mod tests {
         assert_eq!(reloaded.root, Some(PathBuf::from("/repo")));
         assert_eq!(reloaded.state, EngagementState::Open);
         assert_eq!(reloaded.parent, None);
+    }
+
+    #[test]
+    fn open_engagement_starts_unstaffed() {
+        let tmp = secure_dir();
+        let record = store(tmp.path())
+            .open_engagement("reconciler", "modernize it", None, now())
+            .unwrap();
+        assert_eq!(record.staffed_unit, None);
+    }
+
+    // A record written before staffing existed (no `staffed_unit` key at
+    // all) still parses, defaulting to unstaffed — the same
+    // backward-compatibility guarantee `root`/`parent` already established.
+    #[test]
+    fn record_without_staffed_unit_key_parses_as_unstaffed() {
+        let tmp = secure_dir();
+        let registry = store(tmp.path());
+        registry
+            .open_engagement("legacy", "pre-staffing record", None, now())
+            .unwrap();
+        let path = tmp
+            .path()
+            .join("engagements")
+            .join("legacy")
+            .join("record.toml");
+        let pre_staffing_toml = r#"
+name = "legacy"
+purpose = "pre-staffing record"
+state = "open"
+opened_at = "2025-10-09T15:33:20Z"
+"#;
+        fs::write(&path, pre_staffing_toml).unwrap();
+
+        let reloaded = registry.get("legacy").unwrap();
+        assert_eq!(reloaded.staffed_unit, None);
     }
 
     #[test]

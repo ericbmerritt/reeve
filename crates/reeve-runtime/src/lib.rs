@@ -54,8 +54,10 @@ pub use daemon::{
 };
 pub use delivery::{deposit_envelope, DepositError};
 pub use dispatcher::{MessageDispatcher, SendError, SendFailed, SendMessage, SendResult};
-pub use engagement::{EngagementError, EngagementRecord, EngagementRegistry, EngagementState};
-pub use estate::{EstateCoordinator, EstateOp, TeamOpsDeps, ESTATE_AGENT_NAME};
+pub use engagement::{
+    EngagementError, EngagementRecord, EngagementRegistry, EngagementState, StaffedUnit,
+};
+pub use estate::{EstateCoordinator, EstateOp, EstateOpsDeps, ESTATE_AGENT_NAME};
 pub use identity_registry::{IdentityRegistry, RegistryError, StoredIdentity};
 pub use inbox::{AgentInbox, InboxError, InboxLayout};
 pub use keychain::{

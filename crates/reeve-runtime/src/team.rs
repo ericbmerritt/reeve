@@ -175,7 +175,7 @@ impl TeamError {
 /// Stateless between calls, like the engagement store: every operation
 /// reads and writes the record file directly so restarts and concurrent
 /// readers see the durable truth.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TeamRegistry {
     rosters_root: PathBuf,
 }

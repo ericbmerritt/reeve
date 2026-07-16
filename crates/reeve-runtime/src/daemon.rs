@@ -18,7 +18,6 @@ use std::time::{Duration, SystemTime};
 
 use tracing::{debug, info, warn};
 
-use crate::agent::Agent;
 use crate::agent_fs::{AgentDirs, RuntimeLayout};
 use crate::agent_registry::{
     generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
@@ -33,7 +32,7 @@ use crate::inbox::AgentInbox;
 use crate::ledger::{DeliveryLedger, ReplayLedger};
 use crate::model_resolution::SpawnSnapshot;
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
-use crate::spawn_coordinator::{build_subagent_tools, SpawnCoordinator, SpawnRequest};
+use crate::spawn_coordinator::{SpawnCoordinator, SpawnRequest};
 use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
 use crate::tool::BlacklistHandle;
 use crate::watcher::Watcher;
@@ -999,12 +998,19 @@ async fn launch_actors(
             source: Box::new(e),
         }
     })?;
-    let estate_team_ops = crate::estate::TeamOpsDeps {
+    let estate_team_ops = crate::estate::EstateOpsDeps {
         spawner: coord_addr.clone().recipient(),
         teams,
+        engagements: engagements.clone(),
         control_routes: control_routes.clone(),
         agent_registry_path: agent_registry_path_for_resume.clone(),
         data_dir: data_dir_for_resume.clone(),
+        identity_registry: Arc::clone(&identity_registry_for_resume),
+        adapters: adapters_for_resume.clone(),
+        watcher: Arc::clone(&watcher_for_resume),
+        inbox_starter: watcher_addr_for_resume.clone().recipient(),
+        dispatcher: dispatcher_recipient_for_resume.clone(),
+        blacklist: Some(Arc::clone(&blacklist_handle)),
     };
 
     // Re-launch any agent the previous daemon left in the registry, before
@@ -1324,55 +1330,26 @@ fn resume_one_subagent(
             )));
         }
     };
-    let resume_thresholds = profile
-        .as_deref()
-        .map(|p| p.thresholds.clone())
-        .unwrap_or_default();
-    let tools = build_subagent_tools(
-        coordinator,
-        dispatcher.clone(),
-        agent_registry_path.to_path_buf(),
-        data_dir,
-        profile,
-        blacklist.map(Arc::clone),
-        Some(Arc::clone(audit)),
-    );
-    let new_agent = Agent::new(
+    crate::spawn_coordinator::launch_incarnation(
         Arc::clone(adapter),
         &dirs,
         snapshot,
         system_prompt,
         record.identity_id,
         keypair,
-        tools,
-        resume_thresholds,
-        Some(Arc::clone(audit)),
-        data_dir.to_path_buf(),
-        record.name.as_str().to_owned(),
-        agent_registry_path.to_path_buf(),
-        Some(Arc::clone(watcher)),
-        control_routes.cloned(),
+        profile,
+        data_dir,
+        record.name.as_str(),
+        agent_registry_path,
+        watcher,
+        control_routes,
+        coordinator,
+        dispatcher,
+        blacklist,
+        inbox_starter,
+        audit,
     )
-    .map_err(|e| format!("construct Agent: {e}"))?;
-    let agent_addr = actix::Supervisor::start(move |_| new_agent);
-
-    watcher.register_route(record.identity_id, agent_addr.clone().recipient());
-    if let Some(routes) = control_routes {
-        routes.register(
-            record.name.as_str().to_owned(),
-            agent_addr.clone().recipient(),
-        );
-    }
-    let inbox = AgentInbox::from_path(dirs.inbox_root());
-    let agent_addr_for_quarantine = agent_addr.clone();
-    inbox_starter.do_send(WatchInbox {
-        agent_id: record.identity_id,
-        inbox,
-        on_quarantine: Some(Box::new(move |reason| {
-            agent_addr_for_quarantine.do_send(crate::agent::QuarantineEvent { reason });
-        })),
-        recipient: agent_addr.recipient(),
-    });
+    .map_err(ResumeError::Other)?;
 
     tracing::info!(
         agent_name = %record.name,
@@ -1763,6 +1740,8 @@ mod tests {
             agent_id: worker_id.to_string(),
             system_prompt: "You are a worker. Reply with 'ack' to any inbound.".to_owned(),
             system_prompt_source: None,
+            engagement_name: None,
+            working_root: None,
         };
         write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
 
@@ -1884,6 +1863,8 @@ mod tests {
             agent_id: lead_id.to_string(),
             system_prompt: "You are a helpful AI assistant.".to_owned(),
             system_prompt_source: None,
+            engagement_name: None,
+            working_root: None,
         };
         write_spawn_snapshot(&lead_dirs, &snapshot).unwrap();
         {
@@ -1982,6 +1963,8 @@ mod tests {
             agent_id: worker_id.to_string(),
             system_prompt: "You are a worker.".to_owned(),
             system_prompt_source: None,
+            engagement_name: None,
+            working_root: None,
         };
         write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
         {
@@ -2074,6 +2057,8 @@ mod tests {
             agent_id: worker_id.to_string(),
             system_prompt: "You are a worker.".to_owned(),
             system_prompt_source: None,
+            engagement_name: None,
+            working_root: None,
         };
         write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
         {
@@ -2162,6 +2147,8 @@ mod tests {
             agent_id: worker_id.to_string(),
             system_prompt: String::from("ignored"),
             system_prompt_source: None,
+            engagement_name: None,
+            working_root: None,
         };
         write_spawn_snapshot(&worker_dirs, &snapshot).unwrap();
 

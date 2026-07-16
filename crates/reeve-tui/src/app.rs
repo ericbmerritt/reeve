@@ -1655,6 +1655,7 @@ mod tests {
                     state_changed_at: None,
                 })
                 .collect(),
+            engagements: Vec::new(),
             recent_events: Vec::new(),
             queue_counts: crate::panopticon::QueueCounts::default(),
             total_cost_usd: 0.0,

@@ -4,8 +4,13 @@
 //! adapters to find the first match, then records the resolved (adapter,
 //! model) pair as a [`SpawnSnapshot`] written to `agents/{name}/agent.toml`.
 //!
-//! The snapshot is immutable for the agent's lifetime. Enforcement of
-//! capability profiles is deferred to `reeve-authority`.
+//! The snapshot is immutable for the *incarnation's* lifetime, not the
+//! agent's: grants and context snapshot per incarnation (per
+//! `specs/reeve-organization.md` § Constraints and the Narrowing Law) — a
+//! running incarnation is never silently re-rooted or re-granted, but
+//! re-staffing writes a new snapshot and forces the next incarnation to
+//! pick it up. Enforcement of capability profiles is deferred to
+//! `reeve-authority`.
 
 use std::fmt;
 use std::path::PathBuf;
@@ -26,10 +31,12 @@ pub struct SpawnSnapshot {
     /// Resolved adapter identifier (e.g., `"claude-opus-4-7@anthropic-direct"`).
     pub adapter_id: String,
     // model is derived from adapter_id — not stored separately
-    /// The transient [`reeve_types::IdentityId`] generated for this boot session.
+    /// The agent's durable [`reeve_types::IdentityId`], stringified.
     ///
-    /// Written by the daemon at spawn time so that external senders (e.g. the
-    /// TUI) can address signed envelopes to the correct watcher slot.
+    /// Written once at mint time and re-read verbatim on every subsequent
+    /// resume or reincarnation — it does not change across the agent's
+    /// incarnations, let alone within one. External senders (e.g. the TUI)
+    /// address signed envelopes to this id.
     pub agent_id: String,
     /// The composed system prompt the agent was constructed with at spawn
     /// time: persona's base prompt plus any task the spawner appended. Held
@@ -55,6 +62,21 @@ pub struct SpawnSnapshot {
     /// combined string, so it is not retroactively re-tagged.
     #[serde(default)]
     pub system_prompt_source: Option<reeve_types::IdentityId>,
+    /// Name of the engagement this incarnation is staffed to, if any.
+    /// `None` for an unstaffed agent (teamless standing, or a team between
+    /// engagements). Staffed-but-rootless is a valid combination — see
+    /// `working_root` below — so `Some(engagement_name)` with
+    /// `working_root: None` does not imply unstaffed. `#[serde(default)]`:
+    /// absent in snapshots written before staffing existed, which is the
+    /// same as never having been staffed.
+    #[serde(default)]
+    pub engagement_name: Option<String>,
+    /// The staffed engagement's working root, snapshotted at incarnation
+    /// start. `None` when unstaffed, or when the engagement itself carries
+    /// no root — there is no daemon-cwd fallback anywhere; a rootless
+    /// snapshot means file effectors refuse for want of context, by design.
+    #[serde(default)]
+    pub working_root: Option<PathBuf>,
 }
 
 impl SpawnSnapshot {
@@ -169,6 +191,8 @@ pub fn resolve_model(
                 agent_id: agent_id.to_string(),
                 system_prompt: String::new(), // filled in by the spawn caller
                 system_prompt_source: None,   // set by the spawn caller
+                engagement_name: None,        // minted agents start unstaffed
+                working_root: None,           // staffing is always a separate, later act
             });
         }
     }
@@ -367,6 +391,8 @@ mod tests {
             agent_id: String::from("01930000-0000-7000-8000-000000000001"),
             system_prompt: String::new(),
             system_prompt_source: None,
+            engagement_name: None,
+            working_root: None,
         };
 
         write_spawn_snapshot(&dirs, &snapshot).expect("write");
@@ -392,6 +418,8 @@ mod tests {
             agent_id: String::from("01930000-0000-7000-8000-000000000002"),
             system_prompt: String::new(),
             system_prompt_source: None,
+            engagement_name: Some(String::from("reconciler")),
+            working_root: Some(PathBuf::from("/repo/reconciler")),
         };
 
         let serialized = toml::to_string(&original).expect("serialize");
@@ -402,6 +430,25 @@ mod tests {
         assert_eq!(deserialized.adapter_id, original.adapter_id);
         assert_eq!(deserialized.agent_id, original.agent_id);
         assert_eq!(deserialized.model(), original.model());
+        assert_eq!(deserialized.engagement_name, original.engagement_name);
+        assert_eq!(deserialized.working_root, original.working_root);
+    }
+
+    // M8: a snapshot TOML written before engagement_name/working_root
+    // existed (the two keys simply absent) still parses, both fields
+    // defaulting to None — the same backward-compatibility guarantee
+    // system_prompt/system_prompt_source already established.
+    #[test]
+    fn spawn_snapshot_without_engagement_fields_parses_as_unstaffed() {
+        let pre_phase3_toml = r#"
+persona_name = "lead"
+persona_version = 1
+adapter_id = "claude-opus-4-7@anthropic-direct"
+agent_id = "01930000-0000-7000-8000-000000000003"
+"#;
+        let parsed: SpawnSnapshot = toml::from_str(pre_phase3_toml).expect("parse");
+        assert_eq!(parsed.engagement_name, None);
+        assert_eq!(parsed.working_root, None);
     }
 
     // M7: ModelResolveError Display impls are non-empty and informative.

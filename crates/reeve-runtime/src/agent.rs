@@ -350,10 +350,46 @@ impl actix::Message for Retire {
     type Result = ();
 }
 
-/// Shared name → retire-recipient table: every started agent (lead, spawned,
-/// resumed) registers here so the estate coordinator can wind incarnations
-/// down for retirement. Lives next to [`Retire`], the message it routes,
+// ── PrepareReincarnation ─────────────────────────────────────────────────────
+
+/// Re-staffing's wind-down trigger: drain exactly like [`Retire`] (no new
+/// tool invocations or model calls, in-flight work completes), but the
+/// registry lands on [`AgentStatus::Stopped`] rather than
+/// [`AgentStatus::Retired`] — the name stays live, unlike retirement. Never
+/// refused: per `specs/reeve-organization.md` § Constraints, re-staffing
+/// "does not refuse the re-staff — interrupting work is the operator's
+/// call." The caller writes the new snapshot to `agent.toml` *before*
+/// sending this message, not after — a crash mid-drain then self-heals on
+/// the next boot's resume pass, which reads whatever `agent.toml` current
+/// holds. `reply_to` fires [`ReincarnationReady`] once the wind-down
+/// completes, so the caller (the estate coordinator's staffing op) knows
+/// only that it is safe to relaunch — mirrors `estate::MintCapture`'s
+/// bridge from an actix message to an awaitable channel.
+pub struct PrepareReincarnation {
+    pub reply_to: Recipient<ReincarnationReady>,
+}
+
+impl actix::Message for PrepareReincarnation {
+    type Result = ();
+}
+
+/// Sent once a [`PrepareReincarnation`] wind-down completes.
+pub struct ReincarnationReady;
+
+impl actix::Message for ReincarnationReady {
+    type Result = ();
+}
+
+/// Shared name → address table: every started agent (lead, spawned,
+/// resumed) registers here so the estate coordinator can control its
+/// incarnation directly — wind it down for retirement ([`Retire`]) or for
+/// re-staffing ([`PrepareReincarnation`]). Lives next to those messages
 /// rather than in `estate.rs`, which already depends on this module.
+///
+/// Stores the concrete `Addr<Agent>` rather than a single message-specific
+/// `Recipient<M>` precisely so new control messages don't need a parallel
+/// table each — any `Recipient<M>` the estate coordinator needs is derived
+/// from the stored `Addr` on demand.
 ///
 /// The single owner of every mutation: register on start, unregister on
 /// `Agent`'s internal stop transition and (redundantly but harmlessly) on
@@ -362,20 +398,20 @@ impl actix::Message for Retire {
 /// operation, since both tables sit at the same "route to a live agent"
 /// boundary.
 #[derive(Clone, Default)]
-pub struct ControlRoutes(Arc<std::sync::RwLock<HashMap<String, Recipient<Retire>>>>);
+pub struct ControlRoutes(Arc<std::sync::RwLock<HashMap<String, actix::Addr<Agent>>>>);
 
 impl ControlRoutes {
-    /// Register `name`'s retire route, replacing any prior entry.
-    pub fn register(&self, name: String, recipient: Recipient<Retire>) {
+    /// Register `name`'s address, replacing any prior entry.
+    pub fn register(&self, name: String, addr: actix::Addr<Agent>) {
         self.0
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(name, recipient);
+            .insert(name, addr);
     }
 
-    /// Remove and return `name`'s retire route, if a live incarnation is
+    /// Remove and return `name`'s address, if a live incarnation is
     /// registered.
-    pub fn unregister(&self, name: &str) -> Option<Recipient<Retire>> {
+    pub fn unregister(&self, name: &str) -> Option<actix::Addr<Agent>> {
         self.0
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -477,10 +513,15 @@ pub struct Agent {
     /// completion and then the agent transitions to `Stopped`.
     exiting: bool,
     /// Registry status written when the wind-down completes. `Stopped` for
-    /// threshold trips and errors; `Retired` when the operator retired the
-    /// identity (a [`Retire`] message) — retirement is permanent and the
-    /// resume pass never relaunches a `Retired` record.
+    /// threshold trips, errors, and reincarnation (the name stays live);
+    /// `Retired` when the operator retired the identity (a [`Retire`]
+    /// message) — retirement is permanent and the resume pass never
+    /// relaunches a `Retired` record.
     final_status: AgentStatus,
+    /// Set by [`PrepareReincarnation`]; fired once the drain it triggers
+    /// reaches [`Agent::transition_to_stopped`], so the caller knows it is
+    /// safe to relaunch this identity with a new incarnation's snapshot.
+    reincarnation_reply: Option<Recipient<ReincarnationReady>>,
     /// Role name of this agent in the registry (e.g. `"lead"`, `"worker-abc12345"`).
     /// Used when updating the registry record to `Stopped` on exit.
     role_name: String,
@@ -694,6 +735,7 @@ impl Agent {
             task_started_at: None,
             exiting: false,
             final_status: AgentStatus::Stopped,
+            reincarnation_reply: None,
             role_name,
             registry_path,
             watcher,
@@ -782,7 +824,24 @@ impl Agent {
         // unregistered on stop.
         match AgentRegistry::open(self.registry_path.clone()) {
             Ok(mut reg) => {
-                if let Err(err) = reg.update_status(&self.role_name, self.final_status) {
+                // A concurrent RetireAgent can write Retired directly to the
+                // registry while this incarnation's wind-down is still
+                // draining: retire_identity's control-route lookup finds
+                // nothing (this wind-down already unregistered it) and falls
+                // back to a direct registry write. Retirement is terminal —
+                // if it landed first, this Stopped write must not overwrite
+                // it. reincarnate_member carries the matching guard on the
+                // relaunch side.
+                let already_retired = reg
+                    .lookup(&self.role_name)
+                    .is_some_and(|record| record.status == AgentStatus::Retired);
+                if already_retired && self.final_status != AgentStatus::Retired {
+                    debug!(
+                        name = %self.role_name,
+                        attempted = ?self.final_status,
+                        "registry already shows Retired; not downgrading"
+                    );
+                } else if let Err(err) = reg.update_status(&self.role_name, self.final_status) {
                     warn!(name = %self.role_name, err = %err, "failed to write final agent status to registry");
                 }
             }
@@ -795,6 +854,9 @@ impl Agent {
         }
         if let Some(routes) = &self.control_routes {
             routes.unregister(&self.role_name);
+        }
+        if let Some(reply_to) = self.reincarnation_reply.take() {
+            reply_to.do_send(ReincarnationReady);
         }
         ctx.terminate();
     }
@@ -816,6 +878,38 @@ impl Agent {
             return;
         }
         self.append_system_entry("retiring: operator request", ctx);
+        if !self.in_flight {
+            self.transition_to_stopped(ctx);
+        }
+    }
+
+    /// Begin the reincarnation wind-down (see [`PrepareReincarnation`]).
+    ///
+    /// Guards against downgrading a retirement already in flight: if this
+    /// incarnation is already headed for `Retired`, a racing re-staff must
+    /// not resurrect it into `Stopped` — retirement is permanent and wins.
+    /// The reply fires immediately in that case so the caller isn't left
+    /// waiting on a reply that would never distinguish the two outcomes.
+    fn begin_reincarnation(
+        &mut self,
+        reply_to: Recipient<ReincarnationReady>,
+        ctx: &mut Context<Self>,
+    ) {
+        if self.final_status == AgentStatus::Retired {
+            reply_to.do_send(ReincarnationReady);
+            return;
+        }
+        self.final_status = AgentStatus::Stopped;
+        self.reincarnation_reply = Some(reply_to);
+        if self.exiting {
+            return;
+        }
+        self.exiting = true;
+        if self.status_writer.write("exiting").is_err() {
+            self.transition_to_stopped(ctx);
+            return;
+        }
+        self.append_system_entry("reincarnating: staffing change", ctx);
         if !self.in_flight {
             self.transition_to_stopped(ctx);
         }
@@ -1311,6 +1405,14 @@ impl Handler<Retire> for Agent {
     }
 }
 
+impl Handler<PrepareReincarnation> for Agent {
+    type Result = ();
+
+    fn handle(&mut self, msg: PrepareReincarnation, ctx: &mut Context<Self>) {
+        self.begin_reincarnation(msg.reply_to, ctx);
+    }
+}
+
 impl Handler<ProcessInbound> for Agent {
     type Result = ();
 
@@ -1562,7 +1664,7 @@ mod tests {
     use actix::Supervisor;
     use tempfile::tempdir;
 
-    use super::{Agent, ProcessInbound};
+    use super::{Agent, PrepareReincarnation, ProcessInbound, ReincarnationReady};
     use crate::agent_fs::{AgentDirs, ConversationEntry};
     use crate::model_resolution::SpawnSnapshot;
     use reeve_types::IdentityId;
@@ -1649,6 +1751,8 @@ mod tests {
             agent_id: String::new(),
             system_prompt: String::new(),
             system_prompt_source: None,
+            engagement_name: None,
+            working_root: None,
         }
     }
 
@@ -3781,7 +3885,7 @@ mod tests {
             let addr = Agent::create(move |ctx| {
                 let self_addr = ctx.address();
                 watcher.register_route(agent_id, self_addr.clone().recipient());
-                control_routes.register("lead".to_owned(), self_addr.recipient());
+                control_routes.register("lead".to_owned(), self_addr);
                 assert!(
                     watcher.has_route(agent_id),
                     "route must be registered before stop"
@@ -3836,6 +3940,178 @@ mod tests {
             crate::agent_registry::AgentStatus::Stopped,
             "final status must be the one written by the single real transition"
         );
+    }
+
+    // Regression: a concurrent RetireAgent can write Retired directly to the
+    // registry while this incarnation's wind-down is still draining (its
+    // control-route lookup finds nothing because reincarnate_member already
+    // unregistered it — see estate::reincarnate_member's matching guard on
+    // the relaunch side). Retirement is terminal; transition_to_stopped's
+    // own Stopped write must not race past it.
+    #[test]
+    fn transition_to_stopped_does_not_downgrade_already_retired_registry_entry() {
+        let tmp = crate::test_support::secure_dir();
+        let (_, watcher, registry_path) = crate::test_support::build_registries(tmp.path());
+        let control_routes = super::ControlRoutes::default();
+        let agent_id = IdentityId::new().unwrap();
+        let agent = agent_with_real_routes(
+            tmp.path(),
+            agent_id,
+            &watcher,
+            &control_routes,
+            &registry_path,
+        );
+        assert_eq!(
+            agent.final_status,
+            crate::agent_registry::AgentStatus::Stopped,
+            "precondition: this wind-down is headed for Stopped, not Retired"
+        );
+
+        // Simulate the concurrent RetireAgent landing first.
+        crate::agent_registry::AgentRegistry::open(registry_path.clone())
+            .unwrap()
+            .update_status("lead", crate::agent_registry::AgentStatus::Retired)
+            .unwrap();
+
+        actix::System::new().block_on(async move {
+            use actix::Actor as _;
+            use actix::AsyncContext as _;
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let mut done_tx = Some(done_tx);
+            let addr = Agent::create(move |ctx| {
+                ctx.run_later(Duration::from_millis(0), move |act, ctx| {
+                    act.transition_to_stopped(ctx);
+                    let _ = done_tx
+                        .take()
+                        .expect("run_later fires exactly once")
+                        .send(());
+                });
+                agent
+            });
+            let _ = addr;
+
+            tokio::time::timeout(Duration::from_secs(5), done_rx)
+                .await
+                .expect("transition_to_stopped closure timed out")
+                .expect("done channel dropped before firing");
+        });
+
+        assert_eq!(
+            crate::agent_registry::AgentRegistry::open(registry_path)
+                .unwrap()
+                .lookup("lead")
+                .unwrap()
+                .status,
+            crate::agent_registry::AgentStatus::Retired,
+            "a concurrently-landed Retired must survive this incarnation's Stopped write"
+        );
+    }
+
+    /// Bridges a [`ReincarnationReady`] actix message to an awaitable
+    /// channel — the same one-shot-capture shape `estate::MintCapture`
+    /// uses to bridge `SpawnResponse`.
+    struct ReadyCapture {
+        tx: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl actix::Actor for ReadyCapture {
+        type Context = actix::Context<Self>;
+    }
+
+    impl actix::Handler<ReincarnationReady> for ReadyCapture {
+        type Result = ();
+
+        fn handle(&mut self, _msg: ReincarnationReady, ctx: &mut actix::Context<Self>) {
+            use actix::ActorContext as _;
+            if let Some(tx) = self.tx.take() {
+                let _ = tx.send(());
+            }
+            ctx.stop();
+        }
+    }
+
+    // Re-staffing's wind-down: PrepareReincarnation drains the agent exactly
+    // like Retire, but lands the registry on Stopped (not Retired) so the
+    // name stays live for the caller to relaunch, and signals ReincarnationReady.
+    #[test]
+    fn prepare_reincarnation_drains_and_signals_ready_landing_on_stopped() {
+        use actix::Actor as _;
+
+        let tmp = crate::test_support::secure_dir();
+        let (_, watcher, registry_path) = crate::test_support::build_registries(tmp.path());
+        let control_routes = super::ControlRoutes::default();
+        let agent_id = IdentityId::new().unwrap();
+        let agent = agent_with_real_routes(
+            tmp.path(),
+            agent_id,
+            &watcher,
+            &control_routes,
+            &registry_path,
+        );
+        let registry_path_for_asserts = registry_path.clone();
+
+        actix::System::new().block_on(async move {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let capture_addr = ReadyCapture { tx: Some(tx) }.start();
+            let agent_addr = Agent::create(move |_| agent);
+            agent_addr.do_send(PrepareReincarnation {
+                reply_to: capture_addr.recipient(),
+            });
+
+            tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("PrepareReincarnation never signaled ReincarnationReady")
+                .expect("ready channel dropped before firing");
+        });
+
+        assert_eq!(
+            crate::agent_registry::AgentRegistry::open(registry_path_for_asserts)
+                .unwrap()
+                .lookup("lead")
+                .unwrap()
+                .status,
+            crate::agent_registry::AgentStatus::Stopped,
+            "reincarnation wind-down must land on Stopped, not Retired — the \
+             name stays live for the caller to relaunch"
+        );
+    }
+
+    // A re-staff racing with a retirement already in flight must not
+    // resurrect the identity: retirement wins, and the reincarnation reply
+    // still fires (immediately) so the caller isn't left hanging.
+    #[test]
+    fn prepare_reincarnation_does_not_downgrade_a_retirement_already_in_flight() {
+        let tmp = crate::test_support::secure_dir();
+        let (_, watcher, registry_path) = crate::test_support::build_registries(tmp.path());
+        let control_routes = super::ControlRoutes::default();
+        let agent_id = IdentityId::new().unwrap();
+        let mut agent = agent_with_real_routes(
+            tmp.path(),
+            agent_id,
+            &watcher,
+            &control_routes,
+            &registry_path,
+        );
+        agent.final_status = crate::agent_registry::AgentStatus::Retired;
+
+        actix::System::new().block_on(async move {
+            use actix::Actor as _;
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let capture_addr = ReadyCapture { tx: Some(tx) }.start();
+
+            agent.begin_reincarnation(capture_addr.recipient(), &mut actix::Context::new());
+
+            assert_eq!(
+                agent.final_status,
+                crate::agent_registry::AgentStatus::Retired,
+                "a racing re-staff must not downgrade an in-flight retirement"
+            );
+
+            tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .expect("begin_reincarnation must reply immediately when already retired")
+                .expect("ready channel dropped before firing");
+        });
     }
 
     #[test]

@@ -29,7 +29,9 @@ use crate::config::load_persona_config;
 use crate::dispatcher::SendMessage;
 use crate::identity_registry::{IdentityRegistry, StoredIdentity};
 use crate::inbox::AgentInbox;
-use crate::model_resolution::{compose_system_prompt, resolve_model, write_spawn_snapshot};
+use crate::model_resolution::{
+    compose_system_prompt, resolve_model, write_spawn_snapshot, SpawnSnapshot,
+};
 use crate::supervisor::WatchInbox;
 use crate::tool::{BlacklistHandle, InvokeTool, SendMessageTool};
 use crate::watcher::Watcher;
@@ -350,7 +352,11 @@ pub(crate) fn build_subagent_tools(
         }
     };
     let whoami_tool = {
-        let t = crate::tool::WhoamiTool::new(agent_registry_path, profile.clone());
+        let t = crate::tool::WhoamiTool::new(
+            agent_registry_path,
+            data_dir.to_path_buf(),
+            profile.clone(),
+        );
         if let Some(a) = audit.clone() {
             t.with_audit(a)
         } else {
@@ -413,6 +419,95 @@ pub(crate) fn build_subagent_tools(
         );
     }
     tools
+}
+
+/// Construct an `Agent` from an already-resolved snapshot, identity, and
+/// capability profile, start it under supervision, and register its
+/// routes — the shared "bring an incarnation up" core both boot-time
+/// resume (`daemon::resume_one_subagent`) and runtime re-staffing
+/// (`estate`'s reincarnation path) use.
+///
+/// Deliberately does neither identity verification nor snapshot loading:
+/// callers resolve those their own way. Resume verifies the on-disk
+/// keypair against the identity registry and reads `agent.toml` from disk
+/// (crossing a trust boundary — the daemon just restarted and disk state
+/// could have been tampered with while it was down). Re-staffing already
+/// trusts the identity it was just driving moments ago and constructs a
+/// fresh in-memory snapshot with the new engagement context, which it
+/// writes to disk itself before calling here.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "bundles every collaborator an incarnation's tools, thresholds, and \
+              routing need; both call sites already hold each one individually, \
+              and a context struct would only relocate the same fields"
+)]
+pub(crate) fn launch_incarnation(
+    adapter: Arc<dyn reeve_adapter::Adapter>,
+    dirs: &AgentDirs,
+    snapshot: SpawnSnapshot,
+    system_prompt: String,
+    identity_id: IdentityId,
+    keypair: reeve_types::Keypair,
+    profile: Option<Arc<CapabilityProfile>>,
+    data_dir: &Path,
+    name: &str,
+    agent_registry_path: &Path,
+    watcher: &Arc<Watcher>,
+    control_routes: Option<&crate::agent::ControlRoutes>,
+    coordinator: Option<actix::Recipient<SpawnRequest>>,
+    dispatcher: &actix::Recipient<SendMessage>,
+    blacklist: Option<&BlacklistHandle>,
+    inbox_starter: &actix::Recipient<WatchInbox>,
+    audit: &Arc<crate::audit::AuditLog>,
+) -> Result<(), String> {
+    let thresholds = profile
+        .as_deref()
+        .map(|p| p.thresholds.clone())
+        .unwrap_or_default();
+    let tools = build_subagent_tools(
+        coordinator,
+        dispatcher.clone(),
+        agent_registry_path.to_path_buf(),
+        data_dir,
+        profile,
+        blacklist.map(Arc::clone),
+        Some(Arc::clone(audit)),
+    );
+    let new_agent = Agent::new(
+        adapter,
+        dirs,
+        snapshot,
+        system_prompt,
+        identity_id,
+        keypair,
+        tools,
+        thresholds,
+        Some(Arc::clone(audit)),
+        data_dir.to_path_buf(),
+        name.to_owned(),
+        agent_registry_path.to_path_buf(),
+        Some(Arc::clone(watcher)),
+        control_routes.cloned(),
+    )
+    .map_err(|e| format!("construct Agent: {e}"))?;
+    let agent_addr = actix::Supervisor::start(move |_| new_agent);
+
+    watcher.register_route(identity_id, agent_addr.clone().recipient());
+    if let Some(routes) = control_routes {
+        routes.register(name.to_owned(), agent_addr.clone());
+    }
+    let inbox = AgentInbox::from_path(dirs.inbox_root());
+    let agent_addr_for_quarantine = agent_addr.clone();
+    inbox_starter.do_send(WatchInbox {
+        agent_id: identity_id,
+        inbox,
+        on_quarantine: Some(Box::new(move |reason| {
+            agent_addr_for_quarantine.do_send(crate::agent::QuarantineEvent { reason });
+        })),
+        recipient: agent_addr.recipient(),
+    });
+
+    Ok(())
 }
 
 // ── SpawnRequest handler ──────────────────────────────────────────────────────
@@ -798,7 +893,7 @@ impl actix::Handler<SpawnRequest> for SpawnCoordinator {
             .register_route(agent_id, agent_addr.clone().recipient());
 
         if let Some(routes) = &self.control_routes {
-            routes.register(agent_name_str.clone(), agent_addr.clone().recipient());
+            routes.register(agent_name_str.clone(), agent_addr.clone());
         }
 
         let inbox = AgentInbox::from_path(dirs.inbox_root());
