@@ -154,6 +154,7 @@ fn sample_panopticon(now: OffsetDateTime) -> PanopticonSnapshot {
                 state_changed_at: None,
             },
         ],
+        engagements: Vec::new(),
         recent_events: vec![
             RecentEvent {
                 timestamp: now - Duration::seconds(12),

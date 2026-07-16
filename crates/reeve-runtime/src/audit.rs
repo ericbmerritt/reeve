@@ -288,6 +288,48 @@ pub enum AuditEvent {
         at: OffsetDateTime,
     },
 
+    /// A unit (team or lone teamless agent) was staffed to a top-level
+    /// engagement: each member's snapshot now carries the engagement's
+    /// context. `unit_kind` is `"team"` or `"agent"`; `unit_name` is the
+    /// team or agent name.
+    #[serde(rename = "staffing.staffed")]
+    Staffed {
+        sender_id: IdentityId,
+        engagement: String,
+        unit_kind: &'static str,
+        unit_name: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// A unit was recalled from a top-level engagement: each member
+    /// re-incarnated rootless.
+    #[serde(rename = "staffing.unstaffed")]
+    Unstaffed {
+        sender_id: IdentityId,
+        engagement: String,
+        unit_kind: &'static str,
+        unit_name: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
+    /// One member's incarnation wound down and restarted with a new
+    /// snapshot — emitted once per member on both staff and unstaff,
+    /// alongside the unit-level `staffing.staffed`/`staffing.unstaffed`
+    /// event.
+    #[serde(rename = "staffing.reincarnated")]
+    Reincarnated {
+        sender_id: IdentityId,
+        name: String,
+        /// Engagement the new incarnation is staffed to; `None` when the
+        /// reincarnation is an unstaff (the new snapshot is rootless).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        engagement: Option<String>,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
+    },
+
     /// A team or agent estate operation was refused (the team/agent
     /// analogue of `engagement.op_refused`).
     #[serde(rename = "estate.op_refused")]
@@ -937,6 +979,26 @@ mod tests {
                 op: "form-team".to_owned(),
                 name: Some("n".repeat(255)),
                 reason: "r".repeat(512),
+                at: at(),
+            },
+            AuditEvent::Staffed {
+                sender_id,
+                engagement: "e".repeat(255),
+                unit_kind: "team",
+                unit_name: "t".repeat(255),
+                at: at(),
+            },
+            AuditEvent::Unstaffed {
+                sender_id,
+                engagement: "e".repeat(255),
+                unit_kind: "agent",
+                unit_name: "a".repeat(255),
+                at: at(),
+            },
+            AuditEvent::Reincarnated {
+                sender_id,
+                name: "n".repeat(255),
+                engagement: Some("e".repeat(255)),
                 at: at(),
             },
         ];

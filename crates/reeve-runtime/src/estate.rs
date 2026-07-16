@@ -32,27 +32,56 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tracing::{info, warn};
 
-use crate::agent::{ControlRoutes, ProcessInbound, Retire};
-use crate::agent_registry::{AgentRegistry, AgentStatus};
+use crate::agent::{
+    ControlRoutes, PrepareReincarnation, ProcessInbound, ReincarnationReady, Retire,
+};
+use crate::agent_fs::{AgentDirs, RuntimeLayout};
+use crate::agent_registry::{generate_or_load_keypair, AgentRegistry, AgentStatus};
 use crate::audit::{AuditEvent, AuditLog};
-use crate::engagement::{EngagementError, EngagementRegistry};
-use crate::spawn_coordinator::{SpawnRequest, SpawnResponse};
+use crate::capability::load_capability_profile;
+use crate::dispatcher::SendMessage;
+use crate::engagement::{EngagementError, EngagementRegistry, EngagementState, StaffedUnit};
+use crate::identity_registry::IdentityRegistry;
+use crate::model_resolution::{write_spawn_snapshot, SpawnSnapshot};
+use crate::spawn_coordinator::{launch_incarnation, SpawnRequest, SpawnResponse};
+use crate::supervisor::WatchInbox;
 use crate::team::{MemberDisposition, TeamMemberRecord, TeamRecord, TeamRegistry, TeamState};
+use crate::tool::BlacklistHandle;
+use crate::watcher::Watcher;
 
 /// Reserved agent-registry name for the estate coordinator.
 pub const ESTATE_AGENT_NAME: &str = "estate";
 
-/// Runtime collaborators for team and agent operations. Bundled so the
-/// engagement-only construction (and its tests) stays untouched; the daemon
-/// always wires this.
-pub struct TeamOpsDeps {
+/// Runtime collaborators for the estate coordinator's async-dispatched
+/// operations: team formation/dissolution, agent mint/retire, and staffing.
+/// Bundled so the engagement-only construction (and its tests) stays
+/// untouched; the daemon always wires this.
+///
+/// Carries its own [`EngagementRegistry`] handle, a second instance from
+/// the one `EstateCoordinator` holds privately for the synchronous
+/// engagement-op bucket — safe because the store is stateless between
+/// calls (every operation reads and writes the record file directly), so
+/// two instances rooted at the same path never desync.
+#[derive(Clone)]
+pub struct EstateOpsDeps {
     /// Spawn path used to mint member agents with requested names.
     pub spawner: actix::Recipient<SpawnRequest>,
     pub teams: TeamRegistry,
+    pub engagements: EngagementRegistry,
     pub control_routes: ControlRoutes,
     pub agent_registry_path: PathBuf,
     /// Data root, for loading team templates.
     pub data_dir: PathBuf,
+    /// Collaborators below this line exist only for staffing's runtime
+    /// reincarnation path (`spawn_coordinator::launch_incarnation`) — team
+    /// formation and mint/retire don't need them, since minting goes
+    /// through `spawner` instead.
+    pub identity_registry: Arc<IdentityRegistry>,
+    pub adapters: Vec<Arc<dyn reeve_adapter::Adapter>>,
+    pub watcher: Arc<Watcher>,
+    pub inbox_starter: actix::Recipient<WatchInbox>,
+    pub dispatcher: actix::Recipient<SendMessage>,
+    pub blacklist: Option<BlacklistHandle>,
 }
 
 /// How long the coordinator waits for one member mint to complete.
@@ -96,6 +125,15 @@ pub enum EstateOp {
     /// Permanently retire a teamless agent (standing-team members are
     /// retired through dissolution, not individually).
     RetireAgent { name: String },
+    /// Staff a standing team to a top-level engagement: each member winds
+    /// down and re-incarnates with the engagement's context.
+    StaffTeam { engagement: String, team: String },
+    /// Staff a lone teamless agent to a top-level engagement — the
+    /// degenerate unit of one.
+    StaffAgent { engagement: String, agent: String },
+    /// Recall whatever unit is staffed to an engagement: every member winds
+    /// down and re-incarnates rootless.
+    Unstaff { engagement: String },
 }
 
 impl EstateOp {
@@ -109,10 +147,15 @@ impl EstateOp {
             Self::DissolveTeam { .. } => "dissolve-team",
             Self::MintAgent { .. } => "mint-agent",
             Self::RetireAgent { .. } => "retire-agent",
+            Self::StaffTeam { .. } => "staff-team",
+            Self::StaffAgent { .. } => "staff-agent",
+            Self::Unstaff { .. } => "unstaff",
         }
     }
 
-    /// The engagement/team/agent name the operation targets.
+    /// The engagement/team/agent name the operation targets. For staffing
+    /// ops this is the engagement — the record the operation mutates —
+    /// matching `OpenEngagement`/`CloseEngagement`/`ReopenEngagement`.
     pub fn name(&self) -> &str {
         match self {
             Self::OpenEngagement { name, .. }
@@ -122,6 +165,9 @@ impl EstateOp {
             | Self::DissolveTeam { name, .. }
             | Self::MintAgent { name, .. }
             | Self::RetireAgent { name } => name,
+            Self::StaffTeam { engagement, .. }
+            | Self::StaffAgent { engagement, .. }
+            | Self::Unstaff { engagement } => engagement,
         }
     }
 }
@@ -147,7 +193,7 @@ pub struct EstateCoordinator {
     /// Collaborators for team/agent operations. `None` only in
     /// engagement-focused tests; the daemon always wires it, and an unwired
     /// team op is refused (and audited) rather than panicking.
-    team_ops: Option<Arc<TeamOpsDeps>>,
+    team_ops: Option<Arc<EstateOpsDeps>>,
 }
 
 impl EstateCoordinator {
@@ -166,7 +212,7 @@ impl EstateCoordinator {
 
     /// Wire the team/agent operation collaborators.
     #[must_use]
-    pub fn with_team_ops(mut self, deps: TeamOpsDeps) -> Self {
+    pub fn with_team_ops(mut self, deps: EstateOpsDeps) -> Self {
         self.team_ops = Some(Arc::new(deps));
         self
     }
@@ -257,23 +303,52 @@ impl EstateCoordinator {
                     ),
                 }
             }
-            EstateOp::CloseEngagement { name } => match self.engagements.close(name) {
-                Ok(_) => {
-                    info!(name, "engagement closed");
-                    self.audit_event(&AuditEvent::EngagementClosed {
-                        sender_id,
-                        name: name.clone(),
-                        at,
-                    });
+            EstateOp::CloseEngagement { name } => {
+                // The engagement outlives any staffing (spec § Engagement):
+                // closing a still-staffed engagement would leave a unit
+                // pointed at a closed record. Require an explicit unstaff
+                // first rather than silently cascading one.
+                match self.engagements.get(name) {
+                    Ok(record) if record.staffed_unit.is_some() => {
+                        self.refuse(
+                            Some(sender_id),
+                            op.verb(),
+                            Some(name.clone()),
+                            "staffed",
+                            at,
+                        );
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(err) => {
+                        self.refuse(
+                            Some(sender_id),
+                            op.verb(),
+                            Some(name.clone()),
+                            refusal_reason(&err),
+                            at,
+                        );
+                        return;
+                    }
                 }
-                Err(err) => self.refuse(
-                    Some(sender_id),
-                    op.verb(),
-                    Some(name.clone()),
-                    refusal_reason(&err),
-                    at,
-                ),
-            },
+                match self.engagements.close(name) {
+                    Ok(_) => {
+                        info!(name, "engagement closed");
+                        self.audit_event(&AuditEvent::EngagementClosed {
+                            sender_id,
+                            name: name.clone(),
+                            at,
+                        });
+                    }
+                    Err(err) => self.refuse(
+                        Some(sender_id),
+                        op.verb(),
+                        Some(name.clone()),
+                        refusal_reason(&err),
+                        at,
+                    ),
+                }
+            }
             EstateOp::ReopenEngagement { name } => match self.engagements.reopen(name) {
                 Ok(_) => {
                     info!(name, "engagement reopened");
@@ -294,8 +369,11 @@ impl EstateCoordinator {
             EstateOp::FormTeam { .. }
             | EstateOp::DissolveTeam { .. }
             | EstateOp::MintAgent { .. }
-            | EstateOp::RetireAgent { .. } => {
-                unreachable!("team ops are dispatched to execute_team_op, not execute")
+            | EstateOp::RetireAgent { .. }
+            | EstateOp::StaffTeam { .. }
+            | EstateOp::StaffAgent { .. }
+            | EstateOp::Unstaff { .. } => {
+                unreachable!("team and staffing ops are dispatched to execute_team_op, not execute")
             }
         }
     }
@@ -341,7 +419,10 @@ impl Handler<ProcessInbound> for EstateCoordinator {
             EstateOp::FormTeam { .. }
             | EstateOp::DissolveTeam { .. }
             | EstateOp::MintAgent { .. }
-            | EstateOp::RetireAgent { .. } => {
+            | EstateOp::RetireAgent { .. }
+            | EstateOp::StaffTeam { .. }
+            | EstateOp::StaffAgent { .. }
+            | EstateOp::Unstaff { .. } => {
                 let Some(deps) = self.team_ops.clone() else {
                     audit_estate_refusal(
                         &self.audit,
@@ -462,7 +543,7 @@ impl Handler<StopCapture> for MintCapture {
 /// coordinator owns provisioning, identity, tools, and the name-permanence
 /// check; this just requests and awaits.
 async fn mint_one(
-    deps: &TeamOpsDeps,
+    deps: &EstateOpsDeps,
     operator_id: reeve_types::IdentityId,
     persona: &str,
     requested_name: crate::agent_registry::ValidatedAgentName,
@@ -494,7 +575,7 @@ async fn mint_one(
 /// registry record `Retired` directly when no incarnation is live. When a
 /// route exists the agent itself lands the record on `Retired` at the end
 /// of its drain.
-fn retire_identity(deps: &TeamOpsDeps, name: &str) {
+fn retire_identity(deps: &EstateOpsDeps, name: &str) {
     let route = deps.control_routes.unregister(name);
     if let Some(route) = route {
         route.do_send(Retire);
@@ -518,8 +599,551 @@ fn member_agent_name(team: &str, role: &str, index: u32, count: u32) -> String {
     }
 }
 
+// ── Staffing ───────────────────────────────────────────────────────────────
+
+/// One-shot capture actor bridging a [`ReincarnationReady`] recipient to an
+/// awaitable channel — the same shape as [`MintCapture`], for the
+/// wind-down-then-relaunch reincarnation path.
+struct WindDownCapture {
+    tx: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Actor for WindDownCapture {
+    type Context = Context<Self>;
+}
+
+impl Handler<ReincarnationReady> for WindDownCapture {
+    type Result = ();
+
+    fn handle(&mut self, _msg: ReincarnationReady, ctx: &mut Context<Self>) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(());
+        }
+        ctx.stop();
+    }
+}
+
+impl Handler<StopCapture> for WindDownCapture {
+    type Result = ();
+
+    fn handle(&mut self, _msg: StopCapture, ctx: &mut Context<Self>) {
+        ctx.stop();
+    }
+}
+
+/// The engagement side of a staff precondition: must exist, be `Open`, and
+/// carry no staffed unit yet (strict 1:1-at-a-time). Returns the
+/// engagement's root on success.
+fn check_engagement_available(
+    deps: &EstateOpsDeps,
+    engagement: &str,
+) -> Result<Option<PathBuf>, &'static str> {
+    let record = deps.engagements.get(engagement).map_err(|err| match err {
+        EngagementError::NotFound { .. } => "engagement_not_found",
+        EngagementError::InvalidName { .. }
+        | EngagementError::NameTaken { .. }
+        | EngagementError::WrongState { .. }
+        | EngagementError::RelativeRoot { .. }
+        | EngagementError::Io { .. }
+        | EngagementError::Toml { .. } => "engagement_error",
+    })?;
+    if record.state != EngagementState::Open {
+        return Err("engagement_not_open");
+    }
+    if record.staffed_unit.is_some() {
+        return Err("engagement_already_staffed");
+    }
+    Ok(record.root)
+}
+
+/// The unit side of a staff precondition: is this team/agent already
+/// staffed to some *other* open engagement? Staffing state lives only on
+/// the engagement record (§ `EstateOpsDeps` doc), so this scans rather
+/// than following a second pointer that could drift out of sync.
+fn unit_already_staffed(deps: &EstateOpsDeps, unit: &StaffedUnit) -> Result<bool, String> {
+    let all = deps.engagements.list().map_err(|e| e.to_string())?;
+    Ok(all
+        .iter()
+        .any(|e| e.state == EngagementState::Open && e.staffed_unit.as_ref() == Some(unit)))
+}
+
+/// Wind down one member's live incarnation (if any) and restart it with a
+/// new snapshot carrying `engagement`/`root` — `None`/`None` to unstaff
+/// (rootless). The new snapshot is written to disk *before* the wind-down
+/// starts, so a daemon crash mid-reincarnation self-heals on the next
+/// boot's resume pass (which reads whatever `agent.toml` currently holds)
+/// instead of needing special recovery.
+///
+/// Unlike `daemon::resume_one_subagent`, this does not verify the on-disk
+/// keypair against the identity registry: this identity was live and
+/// trusted moments ago, not crossing the disk-could-have-been-tampered
+/// boundary a daemon restart crosses.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is a distinct collaborator or datum the wind-down/relaunch/audit \
+              sequence needs (deps, audit, sender identity, target agent, new engagement \
+              context, timestamp); bundling them into a struct would just move the same count \
+              into a constructor"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear sequence — snapshot rewrite, wind-down, relaunch, audit — each step \
+              depends on the previous one's output, so splitting it would scatter a single \
+              causal chain across helper functions the reader has to reassemble"
+)]
+async fn reincarnate_member(
+    deps: &EstateOpsDeps,
+    audit: &Arc<AuditLog>,
+    sender_id: reeve_types::IdentityId,
+    name: &str,
+    engagement: Option<&str>,
+    root: Option<&std::path::Path>,
+    at: OffsetDateTime,
+) -> Result<(), String> {
+    let dirs =
+        AgentDirs::open(&deps.data_dir, name).map_err(|e| format!("open agent dirs: {e}"))?;
+    let record = AgentRegistry::open(deps.agent_registry_path.clone())
+        .map_err(|e| format!("open agent registry: {e}"))?
+        .lookup(name)
+        .ok_or_else(|| "agent not found in registry".to_owned())?
+        .clone();
+
+    let snapshot_text = std::fs::read_to_string(dirs.agent_toml_path())
+        .map_err(|e| format!("read agent.toml: {e}"))?;
+    let mut snapshot: SpawnSnapshot =
+        toml::from_str(&snapshot_text).map_err(|e| format!("parse agent.toml: {e}"))?;
+    snapshot.engagement_name = engagement.map(str::to_owned);
+    snapshot.working_root = root.map(std::path::Path::to_path_buf);
+    write_spawn_snapshot(&dirs, &snapshot).map_err(|e| format!("write new snapshot: {e}"))?;
+
+    if let Some(addr) = deps.control_routes.unregister(name) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let capture_addr = WindDownCapture { tx: Some(tx) }.start();
+        addr.do_send(PrepareReincarnation {
+            reply_to: capture_addr.clone().recipient(),
+        });
+        // Drop the Addr before awaiting the reply: actix::Supervisor gates
+        // restart eligibility on mailbox connectivity alone (ADR 005), so a
+        // live handle held across this await — even one no longer stored in
+        // any table — keeps a terminating agent "connected" and Supervisor
+        // restarts it in a tight loop for the full timeout below.
+        drop(addr);
+        match tokio::time::timeout(MINT_TIMEOUT, rx).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => return Err("reincarnation reply channel dropped".to_owned()),
+            Err(_) => {
+                capture_addr.do_send(StopCapture);
+                return Err(format!(
+                    "reincarnation wind-down timed out after {MINT_TIMEOUT:?}"
+                ));
+            }
+        }
+    }
+
+    // A concurrent RetireAgent can land while the wind-down above was
+    // draining: retire_identity's control-route lookup found nothing (this
+    // function already unregistered it) and wrote Retired directly to the
+    // registry. Retirement is terminal — re-check before relaunching so a
+    // race does not resurrect a retired identity. transition_to_stopped
+    // carries the matching guard against the reverse ordering (this
+    // function's Stopped write landing after a concurrent Retired one).
+    let currently_retired = AgentRegistry::open(deps.agent_registry_path.clone())
+        .ok()
+        .and_then(|reg| reg.lookup(name).map(|r| r.status))
+        == Some(AgentStatus::Retired);
+    if currently_retired {
+        return Err("agent was retired during wind-down; relaunch aborted".to_owned());
+    }
+
+    let keypair = generate_or_load_keypair(&dirs.identity_key_path())
+        .map_err(|e| format!("load keypair: {e}"))?;
+    let adapter = deps
+        .adapters
+        .iter()
+        .find(|a| a.id() == snapshot.adapter_id)
+        .ok_or_else(|| {
+            format!(
+                "no adapter matches snapshot adapter_id '{}'",
+                snapshot.adapter_id
+            )
+        })?;
+    let persona_name = record
+        .persona_name
+        .as_deref()
+        .unwrap_or(&snapshot.persona_name);
+    let profile = if let Ok(p) = load_capability_profile(&dirs.profile_path()) {
+        Some(Arc::new(p))
+    } else {
+        let persona_profile_path =
+            RuntimeLayout::new(&deps.data_dir).persona_profile_path(persona_name);
+        load_capability_profile(&persona_profile_path)
+            .ok()
+            .map(Arc::new)
+    };
+    let system_prompt = snapshot.system_prompt.clone();
+
+    launch_incarnation(
+        Arc::clone(adapter),
+        &dirs,
+        snapshot,
+        system_prompt,
+        record.identity_id,
+        keypair,
+        profile,
+        &deps.data_dir,
+        name,
+        &deps.agent_registry_path,
+        &deps.watcher,
+        Some(&deps.control_routes),
+        Some(deps.spawner.clone()),
+        &deps.dispatcher,
+        deps.blacklist.as_ref(),
+        &deps.inbox_starter,
+        audit,
+    )?;
+
+    audit_append(
+        audit,
+        &AuditEvent::Reincarnated {
+            sender_id,
+            name: name.to_owned(),
+            engagement: engagement.map(str::to_owned),
+            at,
+        },
+    );
+    Ok(())
+}
+
+/// Staff a standing team to a top-level engagement: every member winds
+/// down and re-incarnates with the engagement's context. Aborts on the
+/// first member that fails to reincarnate, matching `form_team`'s
+/// stop-on-first-failure posture — members that already reincarnated
+/// before the failure keep their new context (not rolled back; the audit
+/// trail shows exactly what happened), and the engagement is not marked
+/// staffed since the rotation did not complete.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors reincarnate_member's collaborators (deps, audit, sender identity, \
+              timestamp) plus the two names that identify the staffing target"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "each precondition (roster lookup, state check, double-staffing scan, engagement \
+              availability) is a distinct refusal path that must run before the member loop; \
+              collapsing them into helpers would hide which check produced which audit reason"
+)]
+async fn staff_team(
+    deps: &EstateOpsDeps,
+    audit: &Arc<AuditLog>,
+    sender_id: reeve_types::IdentityId,
+    engagement: &str,
+    team: &str,
+    at: OffsetDateTime,
+) {
+    use crate::team::TeamError;
+    let refuse = |reason: &str| {
+        audit_estate_refusal(
+            audit,
+            Some(sender_id),
+            "staff-team",
+            Some(engagement.to_owned()),
+            reason,
+            at,
+        );
+    };
+    let team_record = match deps.teams.get(team) {
+        Ok(r) => r,
+        Err(TeamError::NotFound { .. }) => {
+            refuse("team_not_found");
+            return;
+        }
+        Err(err) => {
+            warn!(err = %err, "roster lookup failed during staff-team");
+            refuse("roster_error");
+            return;
+        }
+    };
+    if team_record.state != TeamState::Formed {
+        refuse("team_wrong_state");
+        return;
+    }
+    let unit = StaffedUnit::Team {
+        name: team.to_owned(),
+    };
+    match unit_already_staffed(deps, &unit) {
+        Ok(true) => {
+            refuse("unit_already_staffed");
+            return;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            warn!(err = %err, "engagement scan failed during staff-team");
+            refuse("engagement_scan_error");
+            return;
+        }
+    }
+    let root = match check_engagement_available(deps, engagement) {
+        Ok(root) => root,
+        Err(reason) => {
+            refuse(reason);
+            return;
+        }
+    };
+
+    for member in &team_record.members {
+        if let Err(err) = reincarnate_member(
+            deps,
+            audit,
+            sender_id,
+            &member.agent_name,
+            Some(engagement),
+            root.as_deref(),
+            at,
+        )
+        .await
+        {
+            warn!(member = %member.agent_name, err, "member failed to reincarnate during staff-team");
+            refuse(&format!("reincarnate_failed: {}: {err}", member.agent_name));
+            return;
+        }
+    }
+
+    if let Err(err) = deps.engagements.set_staffed_unit(engagement, Some(unit)) {
+        warn!(err = %err, "failed to write staffed_unit after staff-team");
+        refuse("engagement_write_failed");
+        return;
+    }
+    info!(engagement, team, "team staffed");
+    audit_append(
+        audit,
+        &AuditEvent::Staffed {
+            sender_id,
+            engagement: engagement.to_owned(),
+            unit_kind: "team",
+            unit_name: team.to_owned(),
+            at,
+        },
+    );
+}
+
+/// Staff a lone teamless agent to a top-level engagement — the degenerate
+/// unit of one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "mirrors staff_team's collaborators (deps, audit, sender identity, timestamp) \
+              plus the two names that identify the staffing target"
+)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "each precondition (reserved name, team-membership scan, registry lookup, \
+              double-staffing scan, engagement availability) is a distinct refusal path that \
+              must run before reincarnation; collapsing them into helpers would hide which \
+              check produced which audit reason"
+)]
+async fn staff_agent(
+    deps: &EstateOpsDeps,
+    audit: &Arc<AuditLog>,
+    sender_id: reeve_types::IdentityId,
+    engagement: &str,
+    agent: &str,
+    at: OffsetDateTime,
+) {
+    let refuse = |reason: &str| {
+        audit_estate_refusal(
+            audit,
+            Some(sender_id),
+            "staff-agent",
+            Some(engagement.to_owned()),
+            reason,
+            at,
+        );
+    };
+    if agent == ESTATE_AGENT_NAME {
+        refuse("reserved");
+        return;
+    }
+    // A team member is never a top-level unit on its own (spec § Engagement,
+    // "Staffing authority follows the tree") — staff the team instead.
+    match deps.teams.list() {
+        Ok(rosters) => {
+            let serving = rosters.iter().any(|r| {
+                r.state == TeamState::Formed && r.members.iter().any(|m| m.agent_name == agent)
+            });
+            if serving {
+                refuse("team_member");
+                return;
+            }
+        }
+        Err(err) => {
+            warn!(err = %err, "roster scan failed during staff-agent");
+            refuse("roster_error");
+            return;
+        }
+    }
+    match AgentRegistry::open(deps.agent_registry_path.clone()) {
+        Ok(registry) => match registry.lookup(agent) {
+            None => {
+                refuse("agent_not_found");
+                return;
+            }
+            Some(record) if matches!(record.status, AgentStatus::Retired) => {
+                refuse("agent_retired");
+                return;
+            }
+            Some(_) => {}
+        },
+        Err(err) => {
+            warn!(err = %err, "agent registry open failed during staff-agent");
+            refuse("registry_error");
+            return;
+        }
+    }
+    let unit = StaffedUnit::Agent {
+        name: agent.to_owned(),
+    };
+    match unit_already_staffed(deps, &unit) {
+        Ok(true) => {
+            refuse("unit_already_staffed");
+            return;
+        }
+        Ok(false) => {}
+        Err(err) => {
+            warn!(err = %err, "engagement scan failed during staff-agent");
+            refuse("engagement_scan_error");
+            return;
+        }
+    }
+    let root = match check_engagement_available(deps, engagement) {
+        Ok(root) => root,
+        Err(reason) => {
+            refuse(reason);
+            return;
+        }
+    };
+
+    if let Err(err) = reincarnate_member(
+        deps,
+        audit,
+        sender_id,
+        agent,
+        Some(engagement),
+        root.as_deref(),
+        at,
+    )
+    .await
+    {
+        warn!(agent, err, "agent failed to reincarnate during staff-agent");
+        refuse(&format!("reincarnate_failed: {err}"));
+        return;
+    }
+
+    if let Err(err) = deps.engagements.set_staffed_unit(engagement, Some(unit)) {
+        warn!(err = %err, "failed to write staffed_unit after staff-agent");
+        refuse("engagement_write_failed");
+        return;
+    }
+    info!(engagement, agent, "agent staffed");
+    audit_append(
+        audit,
+        &AuditEvent::Staffed {
+            sender_id,
+            engagement: engagement.to_owned(),
+            unit_kind: "agent",
+            unit_name: agent.to_owned(),
+            at,
+        },
+    );
+}
+
+/// Recall whatever unit is staffed to an engagement: every member winds
+/// down and re-incarnates rootless (per spec § Constraints, an unstaffed
+/// agent's snapshot carries no root — no daemon-cwd fallback anywhere).
+/// The unit stays alive, just idle; unstaffing is not retirement.
+async fn unstaff(
+    deps: &EstateOpsDeps,
+    audit: &Arc<AuditLog>,
+    sender_id: reeve_types::IdentityId,
+    engagement: &str,
+    at: OffsetDateTime,
+) {
+    let refuse = |reason: &str| {
+        audit_estate_refusal(
+            audit,
+            Some(sender_id),
+            "unstaff",
+            Some(engagement.to_owned()),
+            reason,
+            at,
+        );
+    };
+    let record = match deps.engagements.get(engagement) {
+        Ok(r) => r,
+        Err(EngagementError::NotFound { .. }) => {
+            refuse("engagement_not_found");
+            return;
+        }
+        Err(err) => {
+            warn!(err = %err, "engagement lookup failed during unstaff");
+            refuse("engagement_error");
+            return;
+        }
+    };
+    let Some(unit) = record.staffed_unit.clone() else {
+        refuse("not_staffed");
+        return;
+    };
+
+    let members: Vec<String> = match &unit {
+        StaffedUnit::Team { name } => match deps.teams.get(name) {
+            Ok(team_record) => team_record
+                .members
+                .iter()
+                .map(|m| m.agent_name.clone())
+                .collect(),
+            Err(err) => {
+                warn!(err = %err, "roster lookup failed during unstaff");
+                refuse("roster_error");
+                return;
+            }
+        },
+        StaffedUnit::Agent { name } => vec![name.clone()],
+    };
+
+    for member in &members {
+        if let Err(err) = reincarnate_member(deps, audit, sender_id, member, None, None, at).await {
+            warn!(
+                member,
+                err, "member failed to reincarnate rootless during unstaff"
+            );
+            refuse(&format!("reincarnate_failed: {member}: {err}"));
+            return;
+        }
+    }
+
+    if let Err(err) = deps.engagements.set_staffed_unit(engagement, None) {
+        warn!(err = %err, "failed to clear staffed_unit after unstaff");
+        refuse("engagement_write_failed");
+        return;
+    }
+    let (unit_kind, unit_name) = match &unit {
+        StaffedUnit::Team { name } => ("team", name.clone()),
+        StaffedUnit::Agent { name } => ("agent", name.clone()),
+    };
+    info!(engagement, unit_kind, unit_name, "unit unstaffed");
+    audit_append(
+        audit,
+        &AuditEvent::Unstaffed {
+            sender_id,
+            engagement: engagement.to_owned(),
+            unit_kind,
+            unit_name,
+            at,
+        },
+    );
+}
+
 async fn execute_team_op(
-    deps: Arc<TeamOpsDeps>,
+    deps: Arc<EstateOpsDeps>,
     audit: Arc<AuditLog>,
     sender_id: reeve_types::IdentityId,
     op: EstateOp,
@@ -569,6 +1193,15 @@ async fn execute_team_op(
             }
         }
         EstateOp::RetireAgent { name } => retire_teamless_agent(&deps, &audit, sender_id, name, at),
+        EstateOp::StaffTeam { engagement, team } => {
+            staff_team(&deps, &audit, sender_id, engagement, team, at).await;
+        }
+        EstateOp::StaffAgent { engagement, agent } => {
+            staff_agent(&deps, &audit, sender_id, engagement, agent, at).await;
+        }
+        EstateOp::Unstaff { engagement } => {
+            unstaff(&deps, &audit, sender_id, engagement, at).await;
+        }
         EstateOp::OpenEngagement { .. }
         | EstateOp::CloseEngagement { .. }
         | EstateOp::ReopenEngagement { .. } => {
@@ -588,7 +1221,7 @@ async fn execute_team_op(
               fragment the partial-failure posture"
 )]
 pub(crate) async fn form_team(
-    deps: &TeamOpsDeps,
+    deps: &EstateOpsDeps,
     audit: &AuditLog,
     sender_id: reeve_types::IdentityId,
     name: &str,
@@ -622,7 +1255,7 @@ pub(crate) async fn form_team(
         refuse("invalid_template");
         return;
     }
-    let layout = crate::agent_fs::RuntimeLayout::new(&deps.data_dir);
+    let layout = RuntimeLayout::new(&deps.data_dir);
     let template_cfg = match crate::config::load_team_config(&layout.team_config_path(template)) {
         Ok(cfg) => cfg,
         Err(err) => {
@@ -696,7 +1329,7 @@ pub(crate) async fn form_team(
               handles; a bundling struct would add indirection at one call site"
 )]
 fn dissolve_team(
-    deps: &TeamOpsDeps,
+    deps: &EstateOpsDeps,
     audit: &AuditLog,
     sender_id: reeve_types::IdentityId,
     name: &str,
@@ -779,7 +1412,7 @@ fn dissolve_team(
 }
 
 fn retire_teamless_agent(
-    deps: &TeamOpsDeps,
+    deps: &EstateOpsDeps,
     audit: &AuditLog,
     sender_id: reeve_types::IdentityId,
     name: &str,
@@ -1083,6 +1716,13 @@ role_label = "helper"
         operator_id: reeve_types::IdentityId,
         registry_path: PathBuf,
         addr: actix::Addr<EstateCoordinator>,
+        /// Same collaborators the running `EstateCoordinator` holds — a
+        /// second handle, not a separate instance (every field is either
+        /// `Arc`-backed or reopens the same on-disk path). Lets tests call
+        /// functions like `reincarnate_member` directly against the live
+        /// system instead of only through the async `EstateOp` dispatch.
+        deps: EstateOpsDeps,
+        audit: Arc<AuditLog>,
     }
 
     /// Full stack: real spawn coordinator (mock adapter), real registries,
@@ -1104,11 +1744,12 @@ role_label = "helper"
         let adapters: Vec<Arc<dyn reeve_adapter::Adapter>> = vec![Arc::new(MockAdapter::new(
             "claude-opus-4-7@anthropic-direct",
         ))];
+        let watcher_for_deps = Arc::clone(&watcher);
         let coordinator = SpawnCoordinator::new(
             root.to_path_buf(),
             registry_path.clone(),
-            identity_registry,
-            adapters,
+            Arc::clone(&identity_registry),
+            adapters.clone(),
             Arc::clone(&audit),
             watcher,
             NullInboxStarter.start().recipient(),
@@ -1122,21 +1763,30 @@ role_label = "helper"
 
         let engagements = EngagementRegistry::open(root.join("engagements")).unwrap();
         let teams = TeamRegistry::open(root.join("rosters")).unwrap();
-        let deps = TeamOpsDeps {
+        let deps = EstateOpsDeps {
             spawner: coord_addr.recipient(),
             teams,
+            engagements: engagements.clone(),
             control_routes,
             agent_registry_path: registry_path.clone(),
             data_dir: root.to_path_buf(),
+            identity_registry,
+            adapters,
+            watcher: watcher_for_deps,
+            inbox_starter: NullInboxStarter.start().recipient(),
+            dispatcher: NullDispatcher.start().recipient(),
+            blacklist: None,
         };
         let addr = EstateCoordinator::new(operator_id, engagements, Arc::clone(&audit))
-            .with_team_ops(deps)
+            .with_team_ops(deps.clone())
             .start();
         TeamBed {
             data_dir,
             operator_id,
             registry_path,
             addr,
+            deps,
+            audit,
         }
     }
 
@@ -1411,6 +2061,458 @@ role_label = "helper"
                 agent_status(&bed.registry_path, "crew-helper-1") == Some(AgentStatus::Retired)
             })
             .await;
+        });
+    }
+
+    // ── Staffing operation tests ─────────────────────────────────────────────
+
+    fn read_snapshot(data_dir: &Path, name: &str) -> SpawnSnapshot {
+        let dirs = AgentDirs::open(data_dir, name).unwrap();
+        let text = fs::read_to_string(dirs.agent_toml_path()).unwrap();
+        toml::from_str(&text).unwrap()
+    }
+
+    async fn staff_team_op(bed: &TeamBed, engagement: &str, team: &str) {
+        send_op(
+            bed,
+            &EstateOp::StaffTeam {
+                engagement: engagement.to_owned(),
+                team: team.to_owned(),
+            },
+        )
+        .await;
+    }
+
+    async fn open_engagement(bed: &TeamBed, name: &str, root: Option<PathBuf>) {
+        send_op(
+            bed,
+            &EstateOp::OpenEngagement {
+                name: name.to_owned(),
+                purpose: "test".to_owned(),
+                root,
+            },
+        )
+        .await;
+        let engagements =
+            EngagementRegistry::open(bed.data_dir.path().join("engagements")).unwrap();
+        wait_until("engagement to open", || engagements.get(name).is_ok()).await;
+    }
+
+    #[test]
+    fn staff_agent_writes_context_and_audits_staffed_and_reincarnated() {
+        actix::System::new().block_on(async {
+            let bed = start_team_bed();
+            let root = bed.data_dir.path().join("work");
+            fs::create_dir_all(&root).unwrap();
+            let canonical_root = fs::canonicalize(&root).unwrap();
+
+            send_op(
+                &bed,
+                &EstateOp::MintAgent {
+                    name: "librarian".to_owned(),
+                    persona: "worker".to_owned(),
+                },
+            )
+            .await;
+            wait_until("librarian running", || {
+                agent_status(&bed.registry_path, "librarian") == Some(AgentStatus::Running)
+            })
+            .await;
+            // Unstaffed at mint: no root, no engagement — no daemon-cwd
+            // fallback anywhere.
+            let minted = read_snapshot(bed.data_dir.path(), "librarian");
+            assert_eq!(minted.engagement_name, None);
+            assert_eq!(minted.working_root, None);
+
+            open_engagement(&bed, "billing", Some(root.clone())).await;
+            send_op(
+                &bed,
+                &EstateOp::StaffAgent {
+                    engagement: "billing".to_owned(),
+                    agent: "librarian".to_owned(),
+                },
+            )
+            .await;
+
+            wait_until("librarian staffed snapshot", || {
+                read_snapshot(bed.data_dir.path(), "librarian")
+                    .engagement_name
+                    .as_deref()
+                    == Some("billing")
+            })
+            .await;
+            let staffed = read_snapshot(bed.data_dir.path(), "librarian");
+            assert_eq!(staffed.working_root, Some(canonical_root));
+
+            let engagements =
+                EngagementRegistry::open(bed.data_dir.path().join("engagements")).unwrap();
+            let record = engagements.get("billing").unwrap();
+            assert_eq!(
+                record.staffed_unit,
+                Some(StaffedUnit::Agent {
+                    name: "librarian".to_owned()
+                })
+            );
+
+            assert!(audit_has(bed.data_dir.path(), "staffing.staffed", |v| {
+                v["engagement"] == "billing"
+                    && v["unit_kind"] == "agent"
+                    && v["unit_name"] == "librarian"
+            }));
+            assert!(audit_has(
+                bed.data_dir.path(),
+                "staffing.reincarnated",
+                |v| { v["name"] == "librarian" && v["engagement"] == "billing" }
+            ));
+        });
+    }
+
+    #[test]
+    fn staff_team_writes_context_to_every_member() {
+        actix::System::new().block_on(async {
+            let bed = start_team_bed();
+            let root = bed.data_dir.path().join("work");
+            fs::create_dir_all(&root).unwrap();
+            let canonical_root = fs::canonicalize(&root).unwrap();
+
+            send_op(
+                &bed,
+                &EstateOp::FormTeam {
+                    name: "crew".to_owned(),
+                    template: "default".to_owned(),
+                },
+            )
+            .await;
+            let teams = TeamRegistry::open(bed.data_dir.path().join("rosters")).unwrap();
+            wait_until("crew roster", || teams.get("crew").is_ok()).await;
+
+            open_engagement(&bed, "billing", Some(root)).await;
+            staff_team_op(&bed, "billing", "crew").await;
+
+            for member in ["crew-lead", "crew-helper-1", "crew-helper-2"] {
+                wait_until(&format!("{member} staffed snapshot"), || {
+                    read_snapshot(bed.data_dir.path(), member)
+                        .engagement_name
+                        .as_deref()
+                        == Some("billing")
+                })
+                .await;
+                assert_eq!(
+                    read_snapshot(bed.data_dir.path(), member).working_root,
+                    Some(canonical_root.clone())
+                );
+            }
+
+            let engagements =
+                EngagementRegistry::open(bed.data_dir.path().join("engagements")).unwrap();
+            assert_eq!(
+                engagements.get("billing").unwrap().staffed_unit,
+                Some(StaffedUnit::Team {
+                    name: "crew".to_owned()
+                })
+            );
+            assert!(audit_has(bed.data_dir.path(), "staffing.staffed", |v| {
+                v["unit_kind"] == "team" && v["unit_name"] == "crew"
+            }));
+        });
+    }
+
+    #[test]
+    fn unstaff_clears_context_and_engagement_state() {
+        actix::System::new().block_on(async {
+            let bed = start_team_bed();
+            let root = bed.data_dir.path().join("work");
+            fs::create_dir_all(&root).unwrap();
+
+            send_op(
+                &bed,
+                &EstateOp::MintAgent {
+                    name: "librarian".to_owned(),
+                    persona: "worker".to_owned(),
+                },
+            )
+            .await;
+            wait_until("librarian running", || {
+                agent_status(&bed.registry_path, "librarian") == Some(AgentStatus::Running)
+            })
+            .await;
+            open_engagement(&bed, "billing", Some(root)).await;
+            send_op(
+                &bed,
+                &EstateOp::StaffAgent {
+                    engagement: "billing".to_owned(),
+                    agent: "librarian".to_owned(),
+                },
+            )
+            .await;
+            wait_until("librarian staffed", || {
+                read_snapshot(bed.data_dir.path(), "librarian")
+                    .engagement_name
+                    .is_some()
+            })
+            .await;
+
+            send_op(
+                &bed,
+                &EstateOp::Unstaff {
+                    engagement: "billing".to_owned(),
+                },
+            )
+            .await;
+
+            wait_until("librarian rootless again", || {
+                read_snapshot(bed.data_dir.path(), "librarian")
+                    .engagement_name
+                    .is_none()
+            })
+            .await;
+            let rootless = read_snapshot(bed.data_dir.path(), "librarian");
+            assert_eq!(rootless.working_root, None);
+
+            let engagements =
+                EngagementRegistry::open(bed.data_dir.path().join("engagements")).unwrap();
+            assert_eq!(engagements.get("billing").unwrap().staffed_unit, None);
+            assert!(audit_has(bed.data_dir.path(), "staffing.unstaffed", |v| {
+                v["engagement"] == "billing" && v["unit_name"] == "librarian"
+            }));
+        });
+    }
+
+    #[test]
+    fn restaffing_after_unstaff_moves_the_team_to_the_new_root() {
+        actix::System::new().block_on(async {
+            let bed = start_team_bed();
+            let root_a = bed.data_dir.path().join("a");
+            let root_b = bed.data_dir.path().join("b");
+            fs::create_dir_all(&root_a).unwrap();
+            fs::create_dir_all(&root_b).unwrap();
+            let canonical_b = fs::canonicalize(&root_b).unwrap();
+
+            send_op(
+                &bed,
+                &EstateOp::FormTeam {
+                    name: "crew".to_owned(),
+                    template: "default".to_owned(),
+                },
+            )
+            .await;
+            let teams = TeamRegistry::open(bed.data_dir.path().join("rosters")).unwrap();
+            wait_until("crew roster", || teams.get("crew").is_ok()).await;
+
+            open_engagement(&bed, "engagement-a", Some(root_a)).await;
+            staff_team_op(&bed, "engagement-a", "crew").await;
+            wait_until("crew-lead staffed to A", || {
+                read_snapshot(bed.data_dir.path(), "crew-lead")
+                    .engagement_name
+                    .as_deref()
+                    == Some("engagement-a")
+            })
+            .await;
+
+            // A team already serving an engagement cannot be staffed directly
+            // to a second one — unstaff first, matching the strict
+            // 1:1-at-a-time contract.
+            open_engagement(&bed, "engagement-b", Some(root_b)).await;
+            staff_team_op(&bed, "engagement-b", "crew").await;
+            wait_until("double-staff refusal", || {
+                audit_has(bed.data_dir.path(), "estate.op_refused", |v| {
+                    v["op"] == "staff-team" && v["reason"] == "unit_already_staffed"
+                })
+            })
+            .await;
+
+            send_op(
+                &bed,
+                &EstateOp::Unstaff {
+                    engagement: "engagement-a".to_owned(),
+                },
+            )
+            .await;
+            wait_until("crew-lead rootless", || {
+                read_snapshot(bed.data_dir.path(), "crew-lead")
+                    .engagement_name
+                    .is_none()
+            })
+            .await;
+
+            staff_team_op(&bed, "engagement-b", "crew").await;
+            wait_until("crew-lead staffed to B", || {
+                read_snapshot(bed.data_dir.path(), "crew-lead")
+                    .engagement_name
+                    .as_deref()
+                    == Some("engagement-b")
+            })
+            .await;
+            assert_eq!(
+                read_snapshot(bed.data_dir.path(), "crew-lead").working_root,
+                Some(canonical_b)
+            );
+        });
+    }
+
+    #[test]
+    fn staffing_refuses_second_unit_to_an_already_staffed_engagement() {
+        actix::System::new().block_on(async {
+            let bed = start_team_bed();
+            let root = bed.data_dir.path().join("work");
+            fs::create_dir_all(&root).unwrap();
+
+            send_op(
+                &bed,
+                &EstateOp::MintAgent {
+                    name: "first".to_owned(),
+                    persona: "worker".to_owned(),
+                },
+            )
+            .await;
+            send_op(
+                &bed,
+                &EstateOp::MintAgent {
+                    name: "second".to_owned(),
+                    persona: "worker".to_owned(),
+                },
+            )
+            .await;
+            wait_until("both minted", || {
+                agent_status(&bed.registry_path, "first") == Some(AgentStatus::Running)
+                    && agent_status(&bed.registry_path, "second") == Some(AgentStatus::Running)
+            })
+            .await;
+
+            open_engagement(&bed, "billing", Some(root)).await;
+            send_op(
+                &bed,
+                &EstateOp::StaffAgent {
+                    engagement: "billing".to_owned(),
+                    agent: "first".to_owned(),
+                },
+            )
+            .await;
+            wait_until("first staffed", || {
+                read_snapshot(bed.data_dir.path(), "first")
+                    .engagement_name
+                    .is_some()
+            })
+            .await;
+
+            send_op(
+                &bed,
+                &EstateOp::StaffAgent {
+                    engagement: "billing".to_owned(),
+                    agent: "second".to_owned(),
+                },
+            )
+            .await;
+            wait_until("second staffing refused", || {
+                audit_has(bed.data_dir.path(), "estate.op_refused", |v| {
+                    v["op"] == "staff-agent" && v["reason"] == "engagement_already_staffed"
+                })
+            })
+            .await;
+            assert_eq!(
+                read_snapshot(bed.data_dir.path(), "second").engagement_name,
+                None,
+                "the refused agent's snapshot must not have been touched"
+            );
+        });
+    }
+
+    #[test]
+    fn staff_agent_refuses_a_team_member_offered_as_a_top_level_unit() {
+        actix::System::new().block_on(async {
+            let bed = start_team_bed();
+            let root = bed.data_dir.path().join("work");
+            fs::create_dir_all(&root).unwrap();
+
+            send_op(
+                &bed,
+                &EstateOp::FormTeam {
+                    name: "crew".to_owned(),
+                    template: "default".to_owned(),
+                },
+            )
+            .await;
+            let teams = TeamRegistry::open(bed.data_dir.path().join("rosters")).unwrap();
+            wait_until("crew roster", || teams.get("crew").is_ok()).await;
+
+            open_engagement(&bed, "billing", Some(root)).await;
+            send_op(
+                &bed,
+                &EstateOp::StaffAgent {
+                    engagement: "billing".to_owned(),
+                    agent: "crew-helper-1".to_owned(),
+                },
+            )
+            .await;
+
+            wait_until("team-member staffing refused", || {
+                audit_has(bed.data_dir.path(), "estate.op_refused", |v| {
+                    v["op"] == "staff-agent" && v["reason"] == "team_member"
+                })
+            })
+            .await;
+        });
+    }
+
+    // Regression (Copilot review, PR staffing-moves-teams): a concurrent
+    // RetireAgent can land while a staffing wind-down is draining —
+    // retire_identity's control-route lookup finds nothing (the
+    // reincarnation already unregistered it) and writes Retired directly
+    // to the registry. reincarnate_member's entry-point registry read
+    // doesn't gate on status, so without the post-wind-down check it would
+    // relaunch straight over an already-retired identity. Calling it
+    // directly against a fully-retired agent exercises the same code path
+    // a mid-call race would: the entry read still finds the (now stale)
+    // record, and the new check is what actually refuses.
+    #[test]
+    fn reincarnate_member_refuses_to_relaunch_an_already_retired_agent() {
+        actix::System::new().block_on(async {
+            let bed = start_team_bed();
+            send_op(
+                &bed,
+                &EstateOp::MintAgent {
+                    name: "librarian".to_owned(),
+                    persona: "worker".to_owned(),
+                },
+            )
+            .await;
+            wait_until("librarian running", || {
+                agent_status(&bed.registry_path, "librarian") == Some(AgentStatus::Running)
+            })
+            .await;
+
+            send_op(
+                &bed,
+                &EstateOp::RetireAgent {
+                    name: "librarian".to_owned(),
+                },
+            )
+            .await;
+            wait_until("librarian retired", || {
+                agent_status(&bed.registry_path, "librarian") == Some(AgentStatus::Retired)
+            })
+            .await;
+
+            let result = reincarnate_member(
+                &bed.deps,
+                &bed.audit,
+                bed.operator_id,
+                "librarian",
+                Some("billing"),
+                None,
+                OffsetDateTime::now_utc(),
+            )
+            .await;
+
+            assert!(
+                result.is_err(),
+                "must refuse to relaunch a retired identity, got: {result:?}"
+            );
+            assert_eq!(
+                agent_status(&bed.registry_path, "librarian"),
+                Some(AgentStatus::Retired),
+                "retirement must survive the aborted relaunch attempt"
+            );
         });
     }
 }

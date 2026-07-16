@@ -29,12 +29,15 @@
 //! stays the operator's anchor identity instead of fanning a single message
 //! out across every recipient's row.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use time::OffsetDateTime;
 
-use reeve_runtime::{audit_log_path, AgentDirs, AgentRegistry};
+use reeve_runtime::{
+    audit_log_path, AgentDirs, AgentRegistry, EngagementRegistry, EngagementState, RuntimeLayout,
+    StaffedUnit,
+};
 use reeve_types::IdentityId;
 
 use crate::reader::{
@@ -213,10 +216,24 @@ pub struct PendingDecision {
     pub rationale: String,
 }
 
+/// One row in the panopticon's engagement table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngagementRow {
+    /// Unique-per-estate engagement name.
+    pub name: String,
+    /// Lifecycle state (open/closed).
+    pub state: EngagementState,
+    /// Working root, when the engagement is repo- or directory-bound.
+    pub root: Option<PathBuf>,
+    /// The team or lone agent currently staffed here, if any.
+    pub staffed_unit: Option<StaffedUnit>,
+}
+
 /// Everything the panopticon renderer needs in a single snapshot.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PanopticonSnapshot {
     pub agents: Vec<AgentRow>,
+    pub engagements: Vec<EngagementRow>,
     pub recent_events: Vec<RecentEvent>,
     pub queue_counts: QueueCounts,
     /// Sum of every agent's `cost_usd`. Surfaced in the title bar.
@@ -275,9 +292,17 @@ pub struct AgentInputs {
 /// `decisions` are the audit log's parsed authority decisions (allows and
 /// refuses); the builder keeps only refusals for the pending panel and joins
 /// each one's `agent_id` to a display name via `inputs`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "each argument is an independently-sourced input the builder merges into one \
+              snapshot (agents, engagements, decisions, quarantine count, operator identity, \
+              now); bundling them into a struct would just move the same count into a \
+              constructor callers still have to fill in field by field"
+)]
 #[must_use]
 pub fn build_snapshot(
     inputs: &[AgentInputs],
+    engagements: &[EngagementRow],
     decisions: &[AuthorityDecision],
     quarantine_count: usize,
     operator_id: Option<IdentityId>,
@@ -340,8 +365,15 @@ pub fn build_snapshot(
     pending_decisions.sort_by_key(|d| std::cmp::Reverse(d.timestamp));
     pending_decisions.truncate(MAX_PENDING_DECISIONS);
 
+    // Open engagements first (the ones an operator cares about day-to-day),
+    // then alphabetically within each group so the list is stable across
+    // snapshots instead of reflecting directory-read order.
+    let mut engagements = engagements.to_vec();
+    engagements.sort_by_key(|e| (e.state != EngagementState::Open, e.name.clone()));
+
     PanopticonSnapshot {
         agents,
+        engagements,
         recent_events: events,
         queue_counts: QueueCounts {
             memory: 0,
@@ -482,7 +514,7 @@ pub fn read_snapshot(
     // stay renderable during transient outages or startup races. An empty
     // snapshot is the right "I don't know yet" presentation.
     let Ok(registry) = AgentRegistry::open(agent_registry_path.to_path_buf()) else {
-        return build_snapshot(&[], &[], 0, operator_id, now);
+        return build_snapshot(&[], &[], &[], 0, operator_id, now);
     };
 
     let mut inputs: Vec<AgentInputs> = Vec::new();
@@ -523,7 +555,31 @@ pub fn read_snapshot(
     // not per-agent), filtered to authority decisions by the reader.
     let decisions = read_authority_decisions_tail(&audit_log_path(data_dir), AUDIT_TAIL_BYTES);
 
-    build_snapshot(&inputs, &decisions, quarantine_count, operator_id, now)
+    // Engagement records are opened fresh every snapshot, same as the agent
+    // registry above — a failed open (root not yet provisioned) or a failed
+    // list (parse error, torn record) is absorbed into an empty list rather
+    // than surfaced as an error; the "always renderable" contract this
+    // module's doc comment describes covers both failure points equally.
+    let engagements = EngagementRegistry::open(RuntimeLayout::new(data_dir).engagements_root())
+        .and_then(|registry| registry.list())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|record| EngagementRow {
+            name: record.name,
+            state: record.state,
+            root: record.root,
+            staffed_unit: record.staffed_unit,
+        })
+        .collect::<Vec<_>>();
+
+    build_snapshot(
+        &inputs,
+        &engagements,
+        &decisions,
+        quarantine_count,
+        operator_id,
+        now,
+    )
 }
 
 /// Read the status file's mtime as an approximate time-in-state anchor.
@@ -654,6 +710,7 @@ mod tests {
 
         let snap = build_snapshot(
             &[inputs("lead", 0, true, 0.0), worker],
+            &[],
             &decisions,
             0,
             None,
@@ -689,7 +746,7 @@ mod tests {
             ..refusal(stranger, "X()", 1)
         }];
 
-        let snap = build_snapshot(&[], &decisions, 0, None, now);
+        let snap = build_snapshot(&[], &[], &decisions, 0, None, now);
         assert_eq!(snap.pending_decisions.len(), 1);
         assert_eq!(snap.pending_decisions[0].agent_name, "ghost-persona");
     }
@@ -702,7 +759,7 @@ mod tests {
         let id = IdentityId::new().unwrap();
         let decisions: Vec<AuthorityDecision> = (0..8).map(|i| refusal(id, "X()", i)).collect();
 
-        let snap = build_snapshot(&[], &decisions, 0, None, now);
+        let snap = build_snapshot(&[], &[], &decisions, 0, None, now);
         assert_eq!(snap.refusal_count, 8);
         assert_eq!(
             snap.pending_decisions.len(),
@@ -724,7 +781,7 @@ mod tests {
             inputs_with_status("lead", 30_000, true, 0.50, AgentStatus::Idle),
         ];
 
-        let snap = build_snapshot(&inputs, &[], 0, None, now);
+        let snap = build_snapshot(&inputs, &[], &[], 0, None, now);
 
         let order: Vec<&str> = snap.agents.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
@@ -744,7 +801,7 @@ mod tests {
             inputs_with_status("worker-old", 1_000, true, 0.20, AgentStatus::Working),
         ];
 
-        let snap = build_snapshot(&inputs, &[], 0, None, now);
+        let snap = build_snapshot(&inputs, &[], &[], 0, None, now);
         let order: Vec<&str> = snap.agents.iter().map(|a| a.name.as_str()).collect();
         assert_eq!(
             order,
@@ -764,7 +821,7 @@ mod tests {
             inputs("worker-b", 90_000, false, 0.05),
         ];
 
-        let snap = build_snapshot(&inputs, &[], 0, None, now);
+        let snap = build_snapshot(&inputs, &[], &[], 0, None, now);
         assert!((snap.total_cost_usd - 0.65).abs() < 1e-9);
         assert_eq!(
             snap.session_elapsed,
@@ -795,7 +852,7 @@ mod tests {
             },
         ];
 
-        let snap = build_snapshot(&[a, b], &[], 0, None, now);
+        let snap = build_snapshot(&[a, b], &[], &[], 0, None, now);
 
         let order: Vec<(&str, EventKind)> = snap
             .recent_events
@@ -839,7 +896,7 @@ mod tests {
             },
         ];
 
-        let snap = build_snapshot(&[worker], &[], 0, Some(operator), now);
+        let snap = build_snapshot(&[worker], &[], &[], 0, Some(operator), now);
 
         let attribution: Vec<(&str, &str)> = snap
             .recent_events
@@ -870,7 +927,7 @@ mod tests {
             sender_id: Some(op_id()),
         }];
 
-        let snap = build_snapshot(&[worker], &[], 0, None, now);
+        let snap = build_snapshot(&[worker], &[], &[], 0, None, now);
         assert_eq!(snap.recent_events.len(), 1);
         assert_eq!(
             snap.recent_events[0].source,
@@ -882,7 +939,7 @@ mod tests {
     #[test]
     fn build_snapshot_threads_quarantine_count() {
         let now = now_at(1_700_100_000);
-        let snap = build_snapshot(&[inputs("lead", 0, true, 0.0)], &[], 7, None, now);
+        let snap = build_snapshot(&[inputs("lead", 0, true, 0.0)], &[], &[], 7, None, now);
         assert_eq!(snap.queue_counts.quarantine, 7);
         assert_eq!(snap.queue_counts.memory, 0);
         assert_eq!(snap.queue_counts.config, 0);
@@ -897,7 +954,7 @@ mod tests {
         let changed = OffsetDateTime::from_unix_timestamp(1_700_099_988).unwrap();
         let mut row = inputs("lead", 0, true, 0.0);
         row.state_changed_at = Some(changed);
-        let snap = build_snapshot(&[row], &[], 0, None, now);
+        let snap = build_snapshot(&[row], &[], &[], 0, None, now);
         assert_eq!(snap.agents[0].state_changed_at, Some(changed));
     }
 
@@ -1015,5 +1072,57 @@ mod tests {
         let snap = read_snapshot(Path::new("/nonexistent"), Path::new("/nonexistent"), None);
         assert!(snap.agents.is_empty());
         assert_eq!(snap.queue_counts.quarantine, 0);
+    }
+
+    // P13: read_snapshot sources engagements from the on-disk registry,
+    // carrying name, state, root, and staffed unit through untouched.
+    #[test]
+    fn read_snapshot_reads_engagements_from_registry() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().unwrap();
+        let data_dir = tmp.path().to_path_buf();
+        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let agents_dir = data_dir.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::set_permissions(&agents_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let registry_path = agents_dir.join("registry.toml");
+        AgentRegistry::open(registry_path.clone()).unwrap();
+
+        let engagements =
+            EngagementRegistry::open(RuntimeLayout::new(&data_dir).engagements_root()).unwrap();
+        engagements
+            .open_engagement(
+                "billing",
+                "reconcile ledgers",
+                Some(PathBuf::from("/repo/billing")),
+                OffsetDateTime::now_utc(),
+            )
+            .unwrap();
+        engagements
+            .set_staffed_unit(
+                "billing",
+                Some(StaffedUnit::Team {
+                    name: "core-eng".to_owned(),
+                }),
+            )
+            .unwrap();
+
+        let snap = read_snapshot(&data_dir, &registry_path, None);
+
+        assert_eq!(snap.engagements.len(), 1);
+        let row = &snap.engagements[0];
+        assert_eq!(row.name, "billing");
+        assert_eq!(row.state, EngagementState::Open);
+        assert_eq!(row.root, Some(PathBuf::from("/repo/billing")));
+        assert_eq!(
+            row.staffed_unit,
+            Some(StaffedUnit::Team {
+                name: "core-eng".to_owned()
+            })
+        );
     }
 }

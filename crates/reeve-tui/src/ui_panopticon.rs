@@ -41,8 +41,11 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 use time::{Duration, OffsetDateTime};
 
+use reeve_runtime::{EngagementState, StaffedUnit};
+
 use crate::panopticon::{
-    AgentRow, EventKind, PanopticonSnapshot, PendingDecision, QueueCounts, RecentEvent, Source,
+    AgentRow, EngagementRow, EventKind, PanopticonSnapshot, PendingDecision, QueueCounts,
+    RecentEvent, Source,
 };
 use crate::state::AgentStatus;
 use crate::ui_common::{format_time_hhmm, no_color, pad_right, truncate};
@@ -80,10 +83,19 @@ const EVENT_KIND_COL_WIDTH: usize = 6;
 const EVENT_PANEL_MIN_ROWS: u16 = 6;
 
 /// Rows the layout consumes outside the agents and events panels (title bar,
-/// pending-decisions header, agents header, events header, queues strip,
-/// footer — six fixed-length-1 chunks). Used to compute the agents-region
-/// cap so a long agent list cannot starve the events panel.
-const NON_AGENT_FIXED_ROWS: u16 = 6;
+/// pending-decisions header, engagements header, agents header, events
+/// header, queues strip, footer — seven fixed-length-1 chunks). Used to
+/// compute the agents-region cap so a long agent list cannot starve the
+/// events panel.
+const NON_AGENT_FIXED_ROWS: u16 = 7;
+
+/// Ceiling on visible engagement rows. Agents and pending decisions are
+/// self-limiting (bounded by how many actors run, or capped upstream);
+/// engagements are not — an estate accumulates closed engagements over time
+/// with no expiry. Cap the panel so a long history cannot starve the events
+/// region the same way a chatty agent list could before the agents cap
+/// existed; the header still reports the true total.
+const MAX_ENGAGEMENT_ROWS: u16 = 4;
 
 // ── Title bar ────────────────────────────────────────────────────────────────
 
@@ -166,6 +178,58 @@ fn build_pending_row(decision: &PendingDecision, width: u16) -> Line<'static> {
         Span::raw(" "),
         Span::styled(body, style),
     ])
+}
+
+/// Build the engagements header. Mirrors [`build_pending_header`]'s
+/// none/count convention so the two upper sections read consistently.
+fn build_engagements_header(count: usize, width: u16) -> Line<'static> {
+    let label = if count == 0 {
+        "\u{2500} engagements \u{2500}\u{2500}\u{2500}\u{2500} none ".to_owned()
+    } else {
+        format!("\u{2500} engagements \u{2500}\u{2500}\u{2500}\u{2500} {count} ")
+    };
+    let pad = usize::from(width).saturating_sub(label.chars().count());
+    let rule: String = "\u{2500}".repeat(pad);
+    Line::from(format!("{label}{rule}"))
+}
+
+/// Build one engagement row: `name  state  root  staffed-unit`, truncated to
+/// the width. Unstaffed engagements render dim — staffed ones are the
+/// operator's current context and should read first.
+fn build_engagement_row(row: &EngagementRow, width: u16) -> Line<'static> {
+    let name = pad_right(&row.name, AGENT_COL_WIDTH);
+    let state = pad_right(
+        match row.state {
+            EngagementState::Open => "open",
+            EngagementState::Closed => "closed",
+        },
+        7,
+    );
+    let root = row
+        .root
+        .as_ref()
+        .map_or_else(|| "-".to_owned(), |p| p.display().to_string());
+    let staffed = match &row.staffed_unit {
+        Some(StaffedUnit::Team { name }) => format!("team:{name}"),
+        Some(StaffedUnit::Agent { name }) => format!("agent:{name}"),
+        None => "unstaffed".to_owned(),
+    };
+
+    let prefix = format!("{name} {state} ");
+    let body = format!("{root}  {staffed}");
+    let body_budget = usize::from(width).saturating_sub(prefix.len());
+    let body = truncate(&body, body_budget);
+
+    let style = if row.staffed_unit.is_none() {
+        if no_color() {
+            Style::default().add_modifier(Modifier::DIM)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        }
+    } else {
+        Style::default()
+    };
+    Line::from(vec![Span::raw(prefix), Span::styled(body, style)])
 }
 
 // ── Status sigil ────────────────────────────────────────────────────────────
@@ -464,6 +528,13 @@ fn build_footer() -> Line<'static> {
 ///
 /// `focus` is the index of the focused agent row in `snap.agents`. The
 /// renderer clamps it on its own side, so an out-of-range index is harmless.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one linear sequence — build every region's rows, compute the shared height \
+              budget, lay out the chunks, render each chunk — splitting the layout math from \
+              the render calls would separate code that has to stay in lockstep (the chunk \
+              index order in `constraints` and the `render_widget` calls below it)"
+)]
 pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
     let area = frame.area();
     let width = area.width;
@@ -486,6 +557,14 @@ pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
     // starvation guard.
     let pending_height = u16::try_from(pending_rows.len()).unwrap_or(u16::MAX);
 
+    let engagement_rows: Vec<Line<'static>> = snap
+        .engagements
+        .iter()
+        .take(usize::from(MAX_ENGAGEMENT_ROWS))
+        .map(|e| build_engagement_row(e, width))
+        .collect();
+    let engagements_height = u16::try_from(engagement_rows.len()).unwrap_or(u16::MAX);
+
     // Region budgets:
     // - Agents region is content-sized BUT capped by the screen budget so
     //   a long agent list cannot push the events, queues, or footer off
@@ -504,22 +583,26 @@ pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
     let raw_agents_height = u16::try_from(agent_rows.len()).unwrap_or(u16::MAX).max(1);
     let agents_height_cap = area
         .height
-        .saturating_sub(NON_AGENT_FIXED_ROWS + EVENT_PANEL_MIN_ROWS + pending_height)
+        .saturating_sub(
+            NON_AGENT_FIXED_ROWS + EVENT_PANEL_MIN_ROWS + pending_height + engagements_height,
+        )
         .max(1);
     let agents_height = raw_agents_height.min(agents_height_cap);
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),                 // title bar
-            Constraint::Length(1),                 // pending decisions header
-            Constraint::Length(pending_height),    // pending decision rows
-            Constraint::Length(1),                 // agents section header
-            Constraint::Length(agents_height),     // agent rows (capped)
-            Constraint::Length(1),                 // recent events header
-            Constraint::Min(EVENT_PANEL_MIN_ROWS), // events fill remaining
-            Constraint::Length(1),                 // queues strip
-            Constraint::Length(1),                 // footer
+            Constraint::Length(1),                  // title bar
+            Constraint::Length(1),                  // pending decisions header
+            Constraint::Length(pending_height),     // pending decision rows
+            Constraint::Length(1),                  // engagements header
+            Constraint::Length(engagements_height), // engagement rows (capped)
+            Constraint::Length(1),                  // agents section header
+            Constraint::Length(agents_height),      // agent rows (capped)
+            Constraint::Length(1),                  // recent events header
+            Constraint::Min(EVENT_PANEL_MIN_ROWS),  // events fill remaining
+            Constraint::Length(1),                  // queues strip
+            Constraint::Length(1),                  // footer
         ])
         .split(area);
 
@@ -530,26 +613,34 @@ pub fn draw(frame: &mut Frame<'_>, snap: &PanopticonSnapshot, focus: usize) {
     );
     frame.render_widget(Paragraph::new(Text::from(pending_rows)), chunks[2]);
     frame.render_widget(
-        Paragraph::new(build_section_header("agents", width)),
+        Paragraph::new(build_engagements_header(snap.engagements.len(), width)),
         chunks[3],
     );
     frame.render_widget(
-        Paragraph::new(Text::from(agent_rows)).wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(engagement_rows)).wrap(Wrap { trim: false }),
         chunks[4],
     );
     frame.render_widget(
-        Paragraph::new(build_section_header("recent events", width)),
+        Paragraph::new(build_section_header("agents", width)),
         chunks[5],
     );
     frame.render_widget(
-        Paragraph::new(Text::from(event_rows)).wrap(Wrap { trim: false }),
+        Paragraph::new(Text::from(agent_rows)).wrap(Wrap { trim: false }),
         chunks[6],
     );
     frame.render_widget(
-        Paragraph::new(build_queues_strip(snap.queue_counts)),
+        Paragraph::new(build_section_header("recent events", width)),
         chunks[7],
     );
-    frame.render_widget(Paragraph::new(build_footer()), chunks[8]);
+    frame.render_widget(
+        Paragraph::new(Text::from(event_rows)).wrap(Wrap { trim: false }),
+        chunks[8],
+    );
+    frame.render_widget(
+        Paragraph::new(build_queues_strip(snap.queue_counts)),
+        chunks[9],
+    );
+    frame.render_widget(Paragraph::new(build_footer()), chunks[10]);
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -759,6 +850,80 @@ mod tests {
         );
     }
 
+    // U9d: the engagements header follows the same none/count convention as
+    // pending decisions.
+    #[test]
+    fn build_engagements_header_renders_none_at_zero_and_count_when_nonzero() {
+        let render = |count| -> String {
+            build_engagements_header(count, 80)
+                .spans
+                .iter()
+                .map(|s| s.content.clone())
+                .collect()
+        };
+        let zero = render(0);
+        assert!(zero.contains("engagements"), "label missing: {zero:?}");
+        assert!(zero.contains("none"), "empty-state missing: {zero:?}");
+
+        let two = render(2);
+        assert!(two.contains('2'), "count missing: {two:?}");
+        assert!(!two.contains("none"), "non-zero header drops `none`");
+    }
+
+    // U9e: an engagement row carries name, state, root, and staffed unit.
+    #[test]
+    fn build_engagement_row_includes_name_state_root_and_staffed_unit() {
+        let row = EngagementRow {
+            name: "billing".to_owned(),
+            state: EngagementState::Open,
+            root: Some(std::path::PathBuf::from("/repo/billing")),
+            staffed_unit: Some(StaffedUnit::Team {
+                name: "core-eng".to_owned(),
+            }),
+        };
+        let rendered: String = build_engagement_row(&row, 120)
+            .spans
+            .iter()
+            .map(|s| s.content.clone())
+            .collect();
+        assert!(rendered.contains("billing"), "name missing: {rendered:?}");
+        assert!(rendered.contains("open"), "state missing: {rendered:?}");
+        assert!(
+            rendered.contains("/repo/billing"),
+            "root missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("team:core-eng"),
+            "staffed unit missing: {rendered:?}"
+        );
+    }
+
+    // U9f: an unstaffed engagement renders "unstaffed" rather than a blank
+    // cell, so the operator can tell "no unit" from "failed to read".
+    #[test]
+    fn build_engagement_row_reports_unstaffed_explicitly() {
+        let row = EngagementRow {
+            name: "solo".to_owned(),
+            state: EngagementState::Closed,
+            root: None,
+            staffed_unit: None,
+        };
+        let rendered: String = build_engagement_row(&row, 120)
+            .spans
+            .iter()
+            .map(|s| s.content.clone())
+            .collect();
+        assert!(rendered.contains("closed"), "state missing: {rendered:?}");
+        assert!(
+            rendered.contains("unstaffed"),
+            "unstaffed marker missing: {rendered:?}"
+        );
+        assert!(
+            rendered.contains('-'),
+            "rootless placeholder missing: {rendered:?}"
+        );
+    }
+
     // U10: the agent-rows builder inserts a `─ workers ─` separator
     // between the lead row and the first non-lead row, but not when there
     // are no non-lead agents.
@@ -778,6 +943,7 @@ mod tests {
                 state_changed_at: None,
                 conversation_tail: Vec::new(),
             }],
+            &[],
             &[],
             0,
             None,
@@ -816,6 +982,7 @@ mod tests {
                     conversation_tail: Vec::new(),
                 },
             ],
+            &[],
             &[],
             0,
             None,
@@ -858,7 +1025,7 @@ mod tests {
                 conversation_tail: Vec::new(),
             })
             .collect();
-        let snap = build_snapshot(&inputs, &[], 0, None, now);
+        let snap = build_snapshot(&inputs, &[], &[], 0, None, now);
 
         let backend = TestBackend::new(80, 24);
         let mut terminal = Terminal::new(backend).unwrap();
@@ -936,6 +1103,7 @@ mod tests {
                     conversation_tail: Vec::new(),
                 },
             ],
+            &[],
             &[],
             0,
             None,
