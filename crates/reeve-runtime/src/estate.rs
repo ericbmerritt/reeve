@@ -14,10 +14,13 @@
 //! durable engagement record is the operation's observable effect, and the
 //! audit log is its receipt.
 //!
-//! The coordinator occupies the reserved agent name `estate` in the agent
-//! registry so name→(identity, inbox) resolution works with the same lookup
-//! every other sender uses. It is not a model-backed agent: the daemon's
-//! resume pass skips it, and it never makes model calls.
+//! The coordinator's identity and inbox are registered in
+//! [`crate::system_registry::SystemRegistry`] under the reserved name
+//! `estate`, not in `AgentRegistry` — it is not a model-backed agent, has no
+//! persona, and never has an incarnation. `estate` stays a reserved *agent*
+//! name too (see the `mint-agent`/`retire-agent` refusals below): an
+//! operator must not be able to mint a real agent that shadows the
+//! coordinator's name in a different registry.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

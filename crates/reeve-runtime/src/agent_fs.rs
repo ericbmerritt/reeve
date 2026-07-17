@@ -171,6 +171,17 @@ impl RuntimeLayout {
     pub fn blacklist_path(&self) -> PathBuf {
         self.root.join("blacklist.toml")
     }
+
+    // ── System actors ─────────────────────────────────────────────────────────
+
+    /// System-actor registry file: `<root>/system/registry.toml`.
+    ///
+    /// Distinct from `agents/registry.toml`: system actors (e.g. the estate
+    /// coordinator) are runtime-internal, not model-backed, and have no
+    /// incarnation — see [`crate::system_registry::SystemRegistry`].
+    pub fn system_registry_path(&self) -> PathBuf {
+        self.root.join("system").join("registry.toml")
+    }
 }
 
 /// Error resolving the default reeve data root from the environment.

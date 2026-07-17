@@ -117,12 +117,15 @@ fn send_and_await(
         reeve_runtime::IdentityRegistry::default_data_dir()?,
     )?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
+    let system_registry_path =
+        RuntimeLayout::new(reeve_runtime::default_data_root()?).system_registry_path();
     let keychain = keychain::open_platform_keystore()?;
     let body = serde_json::to_vec(op)?;
     let mut sent_line = Vec::new();
     send::send(
         &id_registry,
         &agent_registry_path,
+        &system_registry_path,
         &keychain,
         ESTATE_AGENT_NAME,
         &body,
