@@ -35,7 +35,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use reeve_runtime::capability::{CapabilityProfile, Thresholds};
-use reeve_runtime::{audit_log_path, AgentDirs, AgentRegistry, RuntimeLayout, TeamRegistry};
+use reeve_runtime::{
+    audit_log_path, AgentDirs, AgentRegistry, RuntimeLayout, SystemRegistry, TeamRegistry,
+};
 
 use crate::panopticon::read_snapshot as read_panopticon_snapshot;
 use crate::panopticon::AUDIT_TAIL_BYTES;
@@ -1079,6 +1081,10 @@ fn submit_quarantine_compose(
     if recipient.is_empty() {
         return Ok(());
     }
+    if !is_registered_agent(data_dir, &recipient)? {
+        state.notice = Some(format!("'{recipient}' is not a chattable agent"));
+        return Ok(());
+    }
     let dirs = AgentDirs::open(data_dir, &recipient).map_err(|err| {
         TuiError::Submit(crate::submit::SubmitError::Io {
             path: data_dir.to_path_buf(),
@@ -1145,8 +1151,8 @@ fn submit_engagement_command(
         }
     };
 
-    let agent_registry_path = RuntimeLayout::new(data_dir).agent_registry_path();
-    let estate_record = AgentRegistry::open(agent_registry_path)
+    let system_registry_path = RuntimeLayout::new(data_dir).system_registry_path();
+    let estate_record = SystemRegistry::open(system_registry_path)
         .ok()
         .and_then(|r| r.lookup(reeve_runtime::ESTATE_AGENT_NAME).cloned());
     let Some(estate_record) = estate_record else {
@@ -1361,6 +1367,28 @@ fn submit_inspect_input(
     submit_to_agent(state, data_dir, &agent_name, registry, keystore)
 }
 
+/// `true` when `name` is a registered agent — i.e. has an `agent.toml` a
+/// chat-style submit can read. Chat targets that resolve some other way
+/// (a system actor like `estate`, a mistyped or stale name) have no
+/// snapshot; treating "name not in the registry" as a recoverable "not
+/// chattable" notice instead of an `AgentDirs`/`agent.toml` IO error is
+/// what keeps a bad chat target from killing the whole TUI.
+///
+/// Failing to *open* the registry at all (wrong directory mode, symlink
+/// refusal, parse error) is a different, real problem — that case is
+/// propagated as an error rather than folded into "not chattable", so it
+/// surfaces instead of silently masquerading as a missing name.
+fn is_registered_agent(data_dir: &Path, name: &str) -> Result<bool, TuiError> {
+    let registry = AgentRegistry::open(RuntimeLayout::new(data_dir).agent_registry_path())
+        .map_err(|err| {
+            TuiError::Submit(crate::submit::SubmitError::Io {
+                path: data_dir.to_path_buf(),
+                source: io::Error::other(err.to_string()),
+            })
+        })?;
+    Ok(registry.lookup(name).is_some())
+}
+
 fn submit_to_agent(
     state: &mut AppState,
     data_dir: &Path,
@@ -1370,6 +1398,10 @@ fn submit_to_agent(
 ) -> Result<(), TuiError> {
     let payload = state.input.trim().to_owned();
     if payload.is_empty() {
+        return Ok(());
+    }
+    if !is_registered_agent(data_dir, agent_name)? {
+        state.notice = Some(format!("'{agent_name}' is not a chattable agent"));
         return Ok(());
     }
     let dirs = AgentDirs::open(data_dir, agent_name).map_err(|err| {
@@ -2423,6 +2455,64 @@ mod tests {
         let notice = state.notice.as_deref().expect("timeout must set a notice");
         assert!(notice.contains("no confirmation"), "notice: {notice}");
         assert!(state.pending_engagement.is_none());
+    }
+
+    // Regression: chat-submitting to `estate` (or any name absent from the
+    // agent registry) used to propagate an IO NotFound reading a
+    // nonexistent `agent.toml`, which killed the whole TUI (handle_key's
+    // `?` unwinds run()'s event loop). It must instead surface as a
+    // recoverable notice, with the operator's typed input preserved for
+    // correction.
+    #[test]
+    fn submit_to_agent_refuses_unregistered_name_instead_of_crashing() {
+        let tmp = tempfile::tempdir().unwrap();
+        chmod_700(tmp.path());
+        let mut state = AppState::default();
+        state.set_input("are you there?".to_owned());
+        let (registry, keystore) = test_registry_and_keystore();
+
+        let result = submit_to_agent(&mut state, tmp.path(), "estate", &registry, &keystore);
+
+        assert!(result.is_ok(), "must not propagate an error: {result:?}");
+        let notice = state.notice.as_deref().expect("must set a notice");
+        assert!(notice.contains("estate"), "notice: {notice}");
+        assert_eq!(
+            state.input, "are you there?",
+            "input is preserved for correction, not sent"
+        );
+    }
+
+    // Regression (Copilot review, PR estate-non-agent): is_registered_agent
+    // must not fold a genuine registry-open failure (wrong directory mode,
+    // symlink refusal, parse error) into the same "not chattable" bucket as
+    // a plain missing name — that would misreport a real filesystem-safety
+    // problem as if the operator had just mistyped a name.
+    #[test]
+    fn submit_to_agent_propagates_real_registry_open_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        chmod_700(tmp.path());
+        let agents_dir = tmp.path().join("agents");
+        std::fs::create_dir_all(&agents_dir).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&agents_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut state = AppState::default();
+        state.set_input("hello".to_owned());
+        let (registry, keystore) = test_registry_and_keystore();
+
+        let result = submit_to_agent(&mut state, tmp.path(), "lead", &registry, &keystore);
+
+        assert!(
+            result.is_err(),
+            "a real registry-open failure must propagate as an error, not a notice"
+        );
+        assert!(
+            state.notice.is_none(),
+            "must not misreport a real registry error as 'not chattable': {:?}",
+            state.notice
+        );
     }
 
     // IK6: Tab on the inspect screen is screen-local — it cycles tabs,

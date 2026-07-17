@@ -324,10 +324,14 @@ fn parse_identity_id(s: &str) -> Result<IdentityId, Box<dyn std::error::Error>> 
 fn cmd_send(to: &str, body: &str) -> Result<(), Box<dyn std::error::Error>> {
     let id_registry = IdentityRegistry::open(IdentityRegistry::default_data_dir()?)?;
     let agent_registry_path = reeve_runtime::AgentRegistry::default_registry_path()?;
+    let system_registry_path =
+        reeve_runtime::RuntimeLayout::new(reeve_runtime::default_data_root()?)
+            .system_registry_path();
     let keychain = keychain::open_platform_keystore()?;
     send::send(
         &id_registry,
         &agent_registry_path,
+        &system_registry_path,
         &keychain,
         to,
         body.as_bytes(),

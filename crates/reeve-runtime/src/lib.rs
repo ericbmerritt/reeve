@@ -26,6 +26,7 @@ pub mod model_resolution;
 pub mod runtime_lock;
 pub mod spawn_coordinator;
 pub mod supervisor;
+pub mod system_registry;
 pub mod team;
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -68,6 +69,7 @@ pub use model_resolution::{resolve_model, write_spawn_snapshot, ModelResolveErro
 pub use runtime_lock::{default_log_path, default_state_dir, RuntimeLock, RuntimeLockError};
 pub use spawn_coordinator::{SpawnCoordinator, SpawnRequestError, SpawnResponse};
 pub use supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
+pub use system_registry::{SystemActorRecord, SystemRegistry, SystemRegistryError};
 pub use team::{
     MemberDisposition, TeamError, TeamMemberRecord, TeamRecord, TeamRegistry, TeamState,
 };

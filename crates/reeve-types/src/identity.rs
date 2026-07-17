@@ -36,6 +36,12 @@ pub enum IdentityType {
     Agent,
     /// A process outside the runtime. Created via operator-approved enrollment.
     External,
+    /// A runtime-internal actor that is not model-backed and has no
+    /// incarnation — e.g. the estate coordinator. Created at daemon
+    /// bootstrap, not at spawn. Distinct from `Agent` so nothing that
+    /// resolves "every agent" (the panopticon, `attach`, resume-on-restart)
+    /// picks it up by accident.
+    System,
 }
 
 impl fmt::Display for IdentityType {
@@ -44,6 +50,7 @@ impl fmt::Display for IdentityType {
             Self::Operator => f.write_str("Operator"),
             Self::Agent => f.write_str("Agent"),
             Self::External => f.write_str("External"),
+            Self::System => f.write_str("System"),
         }
     }
 }
@@ -203,6 +210,28 @@ impl Identity {
             created_at: OffsetDateTime::now_utc(),
             lifecycle: IdentityLifecycle::Active,
             allowed_targets,
+            allowed_message_kinds: Vec::new(),
+            capability_scope: None,
+        })
+    }
+
+    /// Construct a fresh system-actor identity: a runtime-internal actor
+    /// (e.g. the estate coordinator) that is not model-backed and never has
+    /// an incarnation. Minted by the daemon at bootstrap, under the
+    /// operator, the same as `new_agent` — but callers must not treat this
+    /// identity as an agent (no persona, no spawn snapshot, no resume pass).
+    pub fn new_system(
+        display_name: String,
+        created_by: IdentityId,
+    ) -> Result<Self, IdentityIdError> {
+        Ok(Self {
+            identity_id: IdentityId::new()?,
+            identity_type: IdentityType::System,
+            display_name,
+            created_by: Some(created_by),
+            created_at: OffsetDateTime::now_utc(),
+            lifecycle: IdentityLifecycle::Active,
+            allowed_targets: Vec::new(),
             allowed_message_kinds: Vec::new(),
             capability_scope: None,
         })
@@ -417,6 +446,20 @@ mod tests {
     }
 
     #[test]
+    fn new_system_sets_expected_initial_values() {
+        let creator = IdentityId::new().unwrap();
+        let identity = Identity::new_system("estate".to_owned(), creator).unwrap();
+
+        assert_eq!(identity.identity_type, IdentityType::System);
+        assert_eq!(identity.display_name, "estate");
+        assert_eq!(identity.created_by, Some(creator));
+        assert_eq!(identity.lifecycle, IdentityLifecycle::Active);
+        assert!(identity.allowed_targets.is_empty());
+        assert!(identity.allowed_message_kinds.is_empty());
+        assert!(identity.capability_scope.is_none());
+    }
+
+    #[test]
     fn two_identities_have_distinct_ids() {
         let a = Identity::new_operator("a".to_owned()).unwrap();
         let b = Identity::new_operator("b".to_owned()).unwrap();
@@ -586,6 +629,8 @@ mod tests {
         assert_eq!(json, "\"agent\"");
         let json = serde_json::to_string(&IdentityType::External).unwrap();
         assert_eq!(json, "\"external\"");
+        let json = serde_json::to_string(&IdentityType::System).unwrap();
+        assert_eq!(json, "\"system\"");
     }
 
     #[test]
@@ -593,5 +638,6 @@ mod tests {
         assert_eq!(IdentityType::Operator.to_string(), "Operator");
         assert_eq!(IdentityType::Agent.to_string(), "Agent");
         assert_eq!(IdentityType::External.to_string(), "External");
+        assert_eq!(IdentityType::System.to_string(), "System");
     }
 }

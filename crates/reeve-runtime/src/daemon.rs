@@ -20,9 +20,7 @@ use tracing::{debug, info, warn};
 
 use crate::agent::Agent;
 use crate::agent_fs::{AgentDirs, RuntimeLayout};
-use crate::agent_registry::{
-    generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
-};
+use crate::agent_registry::{generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus};
 use crate::audit::AuditLog;
 use crate::blacklist::BlacklistRegistry;
 use crate::capability::{load_capability_profile, write_capability_profile, ProfileError};
@@ -35,6 +33,7 @@ use crate::model_resolution::SpawnSnapshot;
 use crate::runtime_lock::{RuntimeLock, RuntimeLockError};
 use crate::spawn_coordinator::{build_subagent_tools, SpawnCoordinator, SpawnRequest};
 use crate::supervisor::{HeartbeatActor, WatchInbox, WatcherActor};
+use crate::system_registry::{SystemActorRecord, SystemRegistry};
 use crate::tool::BlacklistHandle;
 use crate::watcher::Watcher;
 
@@ -527,7 +526,6 @@ fn run_actor_system(
         adapters,
         agent_registry_path,
     )?;
-    let agent_registry_path = startup.agent_registry_path.clone();
 
     #[cfg(unix)]
     {
@@ -593,20 +591,10 @@ fn run_actor_system(
         }
     }
 
-    // On clean shutdown, mark the estate coordinator Stopped — it is the
-    // one identity the daemon bootstraps directly rather than through the
-    // ordinary spawn path, so nothing else marks it on the way down.
-    // Failure here is non-fatal: the registry will show Running at next
-    // startup and be corrected then. (Every other agent, including the
-    // default team's lead role, is an ordinary spawned agent; its status
-    // going stale across a SIGTERM shutdown is the same pre-existing gap
-    // every other spawned agent already has, not something new here.)
-    if let Ok(mut registry) = AgentRegistry::open(agent_registry_path) {
-        let name = crate::estate::ESTATE_AGENT_NAME;
-        if let Err(err) = registry.update_status(name, AgentStatus::Stopped) {
-            tracing::warn!(err = %err, name, "failed to mark agent as Stopped on shutdown");
-        }
-    }
+    // Unlike an ordinary spawned agent, the estate coordinator has no
+    // `AgentRegistry` status to go stale on shutdown — it lives in
+    // `SystemRegistry`, which carries no lifecycle field. Nothing to mark
+    // here.
 
     Ok(())
 }
@@ -614,11 +602,12 @@ fn run_actor_system(
 /// Pre-computed inputs for [`launch_actors`]; produced by the fallible
 /// [`prepare_agent_startup`] step that runs before the actix system starts.
 ///
-/// No agent identity but the estate coordinator's own is minted here. The
-/// default team's members (including whichever one holds the lead role) are
-/// minted inside [`launch_actors`] through the ordinary spawn-coordinator
-/// path — see `crate::estate::form_team` — once that path exists to mint
-/// through; there is no bespoke lead-agent bootstrap left to precompute.
+/// No agent identity is minted here — only the estate coordinator's
+/// system-actor identity (see [`crate::system_registry`]). The default
+/// team's members (including whichever one holds the lead role) are minted
+/// inside [`launch_actors`] through the ordinary spawn-coordinator path —
+/// see `crate::estate::form_team` — once that path exists to mint through;
+/// there is no bespoke lead-agent bootstrap left to precompute.
 struct AgentStartup {
     /// All adapters available to the daemon; used by the subagent resume path
     /// to match each subagent's snapshotted `adapter_id`, and by the spawn
@@ -640,41 +629,31 @@ struct AgentStartup {
     estate_inbox: AgentInbox,
 }
 
-/// Look up a named agent identity in the agent registry, verifying the
+/// Look up a named system actor in the system registry, verifying the
 /// on-disk keypair against the identity registry; bootstrap a fresh identity
 /// and register both records when the name is unseen. Used for the estate
 /// coordinator's identity — the one identity the daemon itself owns and
 /// bootstraps directly, rather than through the ordinary spawn path every
-/// other agent (including the default team's lead) mints through.
+/// agent (including the default team's lead) mints through. System actors
+/// are deliberately not `AgentRegistry` entries: no persona, no lifecycle
+/// status, no incarnation — see [`crate::system_registry`].
 #[expect(
     clippy::too_many_arguments,
     reason = "the function threads two registries plus the identity fields; \
               bundling into a struct trades clarity for indirection at its \
               one call site"
 )]
-#[expect(
-    clippy::too_many_lines,
-    reason = "linear sequence of verification guards; splitting on line count \
-              would fragment the reuse-vs-bootstrap decision"
-)]
-fn ensure_named_agent_identity(
+fn ensure_named_system_identity(
     name: &str,
     identity_display_name: &str,
-    persona_name: Option<String>,
     inbox_dir: PathBuf,
     keypair: &reeve_types::Keypair,
-    agent_registry: &mut AgentRegistry,
+    system_registry: &mut SystemRegistry,
     identity_registry: &IdentityRegistry,
     operator_id: reeve_types::IdentityId,
 ) -> Result<reeve_types::IdentityId, DaemonError> {
-    if let Some(record) = agent_registry.lookup(name) {
+    if let Some(record) = system_registry.lookup(name) {
         let id = record.identity_id;
-        agent_registry
-            .update_status(name, AgentStatus::Running)
-            .map_err(|e| DaemonError::Resource {
-                component: "agent registry update",
-                source: Box::new(e),
-            })?;
         // Halt if the key file was replaced without updating the registry —
         // proceeding would produce envelopes that fail signature verification
         // at every counterparty.
@@ -704,7 +683,7 @@ fn ensure_named_agent_identity(
                 return Err(DaemonError::Resource {
                     component: "identity registry lookup",
                     source: Box::new(io::Error::other(
-                        "agent_id found in agent registry but no entry in identity registry",
+                        "agent_id found in system registry but no entry in identity registry",
                     )),
                 });
             }
@@ -715,18 +694,18 @@ fn ensure_named_agent_identity(
                 });
             }
         }
-        debug!(agent_id = %id, name, "reusing existing identity");
+        debug!(identity_id = %id, name, "reusing existing identity");
         Ok(id)
     } else {
         let identity =
-            reeve_types::Identity::new_agent(identity_display_name.to_owned(), operator_id)
+            reeve_types::Identity::new_system(identity_display_name.to_owned(), operator_id)
                 .map_err(|e| DaemonError::Resource {
-                    component: "agent identity",
+                    component: "system identity",
                     source: Box::new(e),
                 })?;
-        let agent_id = identity.identity_id;
+        let system_id = identity.identity_id;
         let public_key = *keypair.public();
-        let key_record = reeve_types::KeyRecord::new(agent_id, public_key).map_err(|e| {
+        let key_record = reeve_types::KeyRecord::new(system_id, public_key).map_err(|e| {
             DaemonError::Resource {
                 component: "key record",
                 source: Box::new(e),
@@ -743,26 +722,18 @@ fn ensure_named_agent_identity(
                 component: "identity registry write",
                 source: Box::new(e),
             })?;
-        let validated_name = ValidatedAgentName::new(name).map_err(|e| DaemonError::Resource {
-            component: "agent name",
-            source: Box::new(e),
-        })?;
-        agent_registry
-            .register(AgentRecord {
-                name: validated_name,
-                identity_id: agent_id,
+        system_registry
+            .register(SystemActorRecord {
+                name: name.to_owned(),
+                identity_id: system_id,
                 inbox_dir,
-                persona_name,
-                spawned_at: time::OffsetDateTime::now_utc(),
-                status: AgentStatus::Running,
-                stopped_reason: None,
             })
             .map_err(|e| DaemonError::Resource {
-                component: "agent registry register",
+                component: "system registry register",
                 source: Box::new(e),
             })?;
-        debug!(agent_id = %agent_id, name, "registered new identity");
-        Ok(agent_id)
+        debug!(identity_id = %system_id, name, "registered new identity");
+        Ok(system_id)
     }
 }
 
@@ -796,10 +767,12 @@ fn prepare_agent_startup(
         source: Box::new(e),
     })?;
 
-    let mut agent_registry =
-        AgentRegistry::open(agent_registry_path.clone()).map_err(|e| DaemonError::Resource {
-            component: "agent registry",
-            source: Box::new(e),
+    let mut system_registry =
+        SystemRegistry::open(RuntimeLayout::new(data_dir).system_registry_path()).map_err(|e| {
+            DaemonError::Resource {
+                component: "system registry",
+                source: Box::new(e),
+            }
         })?;
 
     // The operator identity anchors the estate coordinator's `created_by`
@@ -826,11 +799,12 @@ fn prepare_agent_startup(
             })?
     };
 
-    // The estate coordinator is addressable exactly like an agent — reserved
-    // name, provisioned inbox, durable identity — so the CLI and TUI resolve
-    // it with the same registry lookup they use for anything else. It is not
-    // model-backed: the resume pass skips it and launch_actors starts the
-    // coordinator actor on this inbox instead of an Agent.
+    // The estate coordinator gets a provisioned inbox and durable identity
+    // like an agent, but is registered in `SystemRegistry`, not
+    // `AgentRegistry` — it is not model-backed, has no persona, and never
+    // has an incarnation. `launch_actors` starts the coordinator actor on
+    // this inbox directly instead of resuming it through the ordinary
+    // agent resume pass.
     let estate_dirs =
         AgentDirs::provision(data_dir, crate::estate::ESTATE_AGENT_NAME).map_err(|e| {
             DaemonError::Resource {
@@ -845,13 +819,12 @@ fn prepare_agent_startup(
                 source: Box::new(e),
             }
         })?;
-    let estate_id = ensure_named_agent_identity(
+    let estate_id = ensure_named_system_identity(
         crate::estate::ESTATE_AGENT_NAME,
         crate::estate::ESTATE_AGENT_NAME,
-        None,
         estate_dirs.inbox_root(),
         &estate_keypair,
-        &mut agent_registry,
+        &mut system_registry,
         identity_registry,
         operator_id,
     )?;
@@ -1060,8 +1033,10 @@ async fn launch_actors(
     Ok(dispatcher_addr)
 }
 
-/// Re-launch every agent in the registry other than the estate coordinator.
-/// Called once on daemon start, before the default team is (re-)formed —
+/// Re-launch every agent in the registry. The estate coordinator is never a
+/// member of this registry (see [`crate::system_registry`]), so it never
+/// needs excluding here. Called once on daemon start, before the default
+/// team is (re-)formed —
 /// see `launch_actors`'s ordering comment. Each record is treated as a
 /// best-effort resume: per-agent failures (missing snapshot, persona
 /// removed, adapter id mismatch, keypair drift) are logged and skipped
@@ -1131,13 +1106,6 @@ fn resume_persisted_subagents(
     };
 
     for record in registry.list() {
-        // The estate coordinator is the daemon's own actor, launched
-        // directly by launch_actors — it is not a resumable model-backed
-        // agent. Every other record, including the default team's lead
-        // role, is an ordinary agent resumed the same way.
-        if record.name.as_str() == crate::estate::ESTATE_AGENT_NAME {
-            continue;
-        }
         // Retirement is the deliberate end of an identity: never resumed,
         // unlike Stopped (which is retried each boot in case the failure
         // was transient).
@@ -1395,7 +1363,7 @@ mod tests {
     #[cfg(unix)]
     use super::wait_for_exit;
     use super::{confirm_started, daemon_status, prepare_agent_startup, DaemonError, DaemonStatus};
-    use crate::agent_fs::AgentDirs;
+    use crate::agent_fs::{AgentDirs, RuntimeLayout};
     use crate::agent_registry::tests::registry_path_for_data_dir;
     use crate::agent_registry::{
         generate_or_load_keypair, AgentRecord, AgentRegistry, AgentStatus, ValidatedAgentName,
@@ -1628,7 +1596,7 @@ mod tests {
             "estate coordinator identity must be stable across restarts"
         );
 
-        // The identity registry must contain exactly one Agent-typed entry
+        // The identity registry must contain exactly one System-typed entry
         // after the second call — the estate coordinator, with no
         // duplication on the second bootstrap. (The other entry is the test
         // operator enrolled before the first call.)
@@ -1641,18 +1609,65 @@ mod tests {
             second.estate_id,
             "stored identity id must match estate_id"
         );
+        assert_eq!(
+            stored.identity().identity_type,
+            reeve_types::IdentityType::System,
+            "estate coordinator identity must be System-typed, not Agent"
+        );
         let all = identity_registry2
             .list()
             .expect("identity registry list must not fail");
-        let agents: Vec<_> = all
+        let system_actors: Vec<_> = all
             .iter()
-            .filter(|s| s.identity().identity_type == reeve_types::IdentityType::Agent)
+            .filter(|s| s.identity().identity_type == reeve_types::IdentityType::System)
             .collect();
         assert_eq!(
-            agents.len(),
+            system_actors.len(),
             1,
-            "identity registry must contain exactly one Agent-typed entry \
-             (estate), not duplicated; got: {agents:?}"
+            "identity registry must contain exactly one System-typed entry \
+             (estate), not duplicated; got: {system_actors:?}"
+        );
+    }
+
+    // A3b: regression for the crash where `estate` appeared in
+    // `AgentRegistry` (no `agent.toml`, so any chat-style submit against it
+    // hit a raw IO NotFound). Estate must be resolvable via `SystemRegistry`
+    // and absent from `AgentRegistry` entirely — not filtered out, just
+    // never there.
+    #[test]
+    fn estate_is_registered_as_system_actor_not_agent_registry_entry() {
+        let tmp = crate::test_support::secure_dir();
+        let data_dir = tmp.path().to_path_buf();
+        let adapter: Arc<dyn reeve_adapter::Adapter> =
+            Arc::new(MockAdapter::new("claude-opus-4-7@anthropic-direct"));
+
+        let (identity_registry, watcher, agent_registry_path) = build_registries(&data_dir);
+        enroll_test_operator(&identity_registry);
+        let startup = prepare_agent_startup(
+            &data_dir,
+            &identity_registry,
+            watcher,
+            std::slice::from_ref(&adapter),
+            agent_registry_path.clone(),
+        )
+        .expect("prepare_agent_startup should succeed");
+
+        let system_registry = crate::system_registry::SystemRegistry::open(
+            RuntimeLayout::new(&data_dir).system_registry_path(),
+        )
+        .unwrap();
+        let record = system_registry
+            .lookup(crate::estate::ESTATE_AGENT_NAME)
+            .expect("estate must be registered in SystemRegistry");
+        assert_eq!(record.identity_id, startup.estate_id);
+
+        let agent_registry = AgentRegistry::open(agent_registry_path).unwrap();
+        assert!(
+            agent_registry
+                .lookup(crate::estate::ESTATE_AGENT_NAME)
+                .is_none(),
+            "estate must not appear in AgentRegistry — that was the root cause \
+             of the chat-submit crash against a non-existent agent.toml"
         );
     }
 
@@ -1660,7 +1675,7 @@ mod tests {
     // key, prepare_agent_startup must return a Resource("keypair mismatch")
     // error. Exercises the mismatch branch at the keypair-verification step,
     // via the estate identity — the one identity this function still
-    // bootstraps directly through `ensure_named_agent_identity`.
+    // bootstraps directly through `ensure_named_system_identity`.
     #[test]
     fn prepare_agent_startup_rejects_mismatched_keypair() {
         let tmp = crate::test_support::secure_dir();
