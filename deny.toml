@@ -108,6 +108,11 @@ skip = [
   # coordinated proc-macro migration we don't control.
   { name = "syn", version = "=2.0.117" },
   { name = "syn", version = "=3.0.3" },
+  # base64 0.23 (our direct dep) vs 0.22 pinned by hyper-util (via
+  # reqwest -> hyper-rustls). Unifying requires a hyper-util release we
+  # don't control.
+  { name = "base64", version = "=0.22.1" },
+  { name = "base64", version = "=0.23.0" },
   # ratatui (via reeve-tui) pins unicode-width 0.2.x; other crates in the
   # workspace use unicode-width 0.1.x. Unifying requires upstream updates.
   { name = "unicode-width", version = "=0.1.14" },
