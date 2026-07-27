@@ -24,7 +24,7 @@ crossterm = { version = "0.29", features = ["event-stream"] }
 tracing = { version = "0.1", default-features = false, features = ["std", "attributes"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter", "ansi"] }
 
-base64 = { version = "0.22", default-features = false, features = ["std"] }
+base64 = { version = "0.23", default-features = false, features = ["std"] }
 notify = { version = "8" }
 ed25519-dalek = { version = "2", default-features = false, features = ["fast", "std", "zeroize", "rand_core"] }
 libc = { version = "0.2", default-features = false }
