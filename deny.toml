@@ -103,6 +103,11 @@ skip = [
   { name = "hashbrown", version = "=0.15.5" },
   { name = "hashbrown", version = "=0.16.1" },
   { name = "hashbrown", version = "=0.17.1" },
+  # async-trait 0.1.90 (and clap derive) moved to syn 3.x; thiserror-impl
+  # and async-recursion still pin syn 2.x. Sharing one version requires a
+  # coordinated proc-macro migration we don't control.
+  { name = "syn", version = "=2.0.117" },
+  { name = "syn", version = "=3.0.3" },
   # ratatui (via reeve-tui) pins unicode-width 0.2.x; other crates in the
   # workspace use unicode-width 0.1.x. Unifying requires upstream updates.
   { name = "unicode-width", version = "=0.1.14" },
